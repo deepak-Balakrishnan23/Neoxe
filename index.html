@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Neouxe — Design Tool</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@100..900&display=swap" rel="stylesheet" />
+    <style>
+      /* ── Dark theme (default) ───────────────────────────────────────── */
+      :root, :root[data-theme="dark"] {
+        --bg-app: #141417;
+        --bg-panel: #1b1b1f;
+        --bg-canvas: #0f0f12;
+        --bg-elevated: #26262d;
+        --bg-elevated-2: #30303a;
+        --bg-inset: #0c0c0f;
+        --border: rgba(255,255,255,0.07);
+        --border-strong: rgba(255,255,255,0.13);
+        --text: #ECECEF;
+        --text-secondary: #9B9BA6;
+        --text-muted: #63636E;
+        --text-faint: #45454E;
+        --accent: #6E72F5;
+        --accent-hover: #8084FF;
+        --accent-soft: rgba(110,114,245,0.16);
+        --accent-soft-hover: rgba(110,114,245,0.26);
+        --teal: #00D1B8;
+        --success: #2DD4A7;
+        --warning: #F5A91B;
+        --danger: #FF4D7D;
+        --comment: #F5C542;
+        --shadow-panel: 0 1px 0 rgba(255,255,255,0.03) inset;
+        --shadow-popover: 0 12px 40px rgba(0,0,0,0.55), 0 0 0 1px rgba(255,255,255,0.06);
+        --shadow-dialog: 0 24px 64px rgba(0,0,0,0.6), 0 0 0 1px rgba(255,255,255,0.07);
+        --shadow-float: 0 8px 32px rgba(0,0,0,0.5), 0 0 0 1px rgba(255,255,255,0.08);
+        --scroll-thumb: rgba(255,255,255,0.10);
+        --scroll-thumb-hover: rgba(255,255,255,0.18);
+        --row-hover: rgba(255,255,255,0.04);
+      }
+
+      /* ── Light theme ────────────────────────────────────────────────── */
+      :root[data-theme="light"] {
+        --bg-app: #FFFFFF;
+        --bg-panel: #F7F8FA;
+        --bg-canvas: #E6E6EC;
+        --bg-elevated: #ECEDF1;
+        --bg-elevated-2: #E0E2E8;
+        --bg-inset: #F0F1F4;
+        --border: rgba(0,0,0,0.09);
+        --border-strong: rgba(0,0,0,0.16);
+        --text: #1A1A20;
+        --text-secondary: #5C5C68;
+        --text-muted: #8C8C98;
+        --text-faint: #B0B0BA;
+        --accent: #5B5FE0;
+        --accent-hover: #4B4FD0;
+        --accent-soft: rgba(91,95,224,0.12);
+        --accent-soft-hover: rgba(91,95,224,0.2);
+        --teal: #00A896;
+        --success: #1FA87E;
+        --warning: #D98A0B;
+        --danger: #E03365;
+        --comment: #E0A800;
+        --shadow-panel: none;
+        --shadow-popover: 0 12px 40px rgba(0,0,0,0.18), 0 0 0 1px rgba(0,0,0,0.08);
+        --shadow-dialog: 0 24px 64px rgba(0,0,0,0.22), 0 0 0 1px rgba(0,0,0,0.08);
+        --shadow-float: 0 8px 32px rgba(0,0,0,0.16), 0 0 0 1px rgba(0,0,0,0.1);
+        --scroll-thumb: rgba(0,0,0,0.14);
+        --scroll-thumb-hover: rgba(0,0,0,0.24);
+        --row-hover: rgba(0,0,0,0.04);
+      }
+
+      *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+      html, body, #root { width: 100%; height: 100%; overflow: hidden; }
+      body {
+        background: var(--bg-canvas);
+        color: var(--text);
+        font-family: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", system-ui, sans-serif;
+        -webkit-font-smoothing: antialiased;
+        text-rendering: optimizeLegibility;
+      }
+      button { font-family: inherit; }
+      button:hover { filter: brightness(1.08); }
+      input, select, textarea { font-family: inherit; }
+
+      .layer-action { transition: opacity .12s; }
+      .layer-row:hover .layer-action { opacity: 0.55 !important; }
+      .layer-row:hover { background: var(--row-hover); }
+
+      ::-webkit-scrollbar { width: 8px; height: 8px; }
+      ::-webkit-scrollbar-track { background: transparent; }
+      ::-webkit-scrollbar-thumb { background: var(--scroll-thumb); border-radius: 4px; border: 2px solid transparent; background-clip: padding-box; }
+      ::-webkit-scrollbar-thumb:hover { background: var(--scroll-thumb-hover); background-clip: padding-box; }
+
+      select option { background: var(--bg-panel); color: var(--text); }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/renderer/main.tsx"></script>
+  </body>
+</html>
