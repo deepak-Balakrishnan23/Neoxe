@@ -7,12 +7,13 @@ import { DesignFile, Page, Shape, makeDefaultShape, makeDefaultPage, Fill } from
 
 function uid() { return Math.random().toString(36).slice(2, 10); }
 
-// Detect format and route.
+// Detect format and route. NATIVE is checked first: our files carry both `pages` and `id`,
+// which also matches the Penpot signature — checking Penpot first misrouted every native
+// file through the Penpot mapper.
 export function importDesignJson(json: any): DesignFile {
+  if (json && Array.isArray(json.pages) && json.activePageId !== undefined) return json as DesignFile;
   if (json && json.document && json.document.type === 'DOCUMENT') return importFigma(json);
   if (json && (json.data || json.pages) && json.id) return importPenpot(json);
-  // Already our format?
-  if (json && json.pages && json.activePageId !== undefined) return json as DesignFile;
   throw new Error('Unrecognized file format');
 }
 

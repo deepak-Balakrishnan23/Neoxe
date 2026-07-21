@@ -216,13 +216,7 @@ export interface Interaction {
   transition: Transition;
 }
 
-// ── Layout (auto-layout: flex & grid) ─────────────────────────────────────────
-
-export type LayoutType = 'flex' | 'grid';
-export type FlexDirection = 'row' | 'column' | 'row-reverse' | 'column-reverse';
-export type FlexWrap = 'nowrap' | 'wrap';
-export type JustifyContent = 'start' | 'center' | 'end' | 'space-between' | 'space-around' | 'space-evenly';
-export type AlignItems = 'start' | 'center' | 'end' | 'stretch';
+// ── Padding (shared by Auto Layout) ───────────────────────────────────────────
 
 export interface Padding {
   top: number;
@@ -230,35 +224,6 @@ export interface Padding {
   bottom: number;
   left: number;
 }
-
-export interface FlexLayout {
-  type: 'flex';
-  direction: FlexDirection;
-  wrap: FlexWrap;
-  justify: JustifyContent;   // main-axis
-  align: AlignItems;         // cross-axis
-  gap: number;               // gap between items (row gap == col gap for now)
-  padding: Padding;
-}
-
-// Grid track: fixed px, fraction (fr), or auto
-export type GridTrack =
-  | { kind: 'fixed'; value: number }
-  | { kind: 'fr'; value: number }
-  | { kind: 'auto' };
-
-export interface GridLayout {
-  type: 'grid';
-  columns: GridTrack[];
-  rows: GridTrack[];
-  columnGap: number;
-  rowGap: number;
-  padding: Padding;
-  // item placement: shapeId → { col, row, colSpan, rowSpan } (1-indexed)
-  areas: Record<string, { col: number; row: number; colSpan: number; rowSpan: number }>;
-}
-
-export type Layout = FlexLayout | GridLayout;
 
 // ── Figma-style Auto Layout settings ───────────────────────────────────────────
 // Stored on a Shape that acts as an auto-layout container. The pure engine in
@@ -274,10 +239,21 @@ export type AutoLayoutAlign = 'start' | 'center' | 'end';
 export interface AutoLayoutSettings {
   direction: 'horizontal' | 'vertical' | 'wrap' | 'grid';
   reversed?: boolean;
-  spacing: number;            // primary-axis gap between children
+  // primary-axis gap between children. undefined = Auto (Figma default: preserves
+  // even distribution without a manually-set fixed value; treated as 0 by the engine).
+  spacing?: number;
   padding: Padding;           // inset on each side
   justifyContent: AutoLayoutJustify;   // primary axis
   alignItems: AutoLayoutAlign;         // cross axis
+  // Wrap only: how the rows are distributed on the cross axis when the container is
+  // taller than its content. Defaults to 'start'.
+  alignContent?: 'start' | 'center' | 'end' | 'space-between';
+  // When true, each child's stroke extent counts toward spacing + hug bounds (Figma's
+  // "Stroke: Included in layout"). Default false (strokes overlap, don't push siblings).
+  strokeInLayout?: boolean;
+  // Grid only: number of equal-width columns. Children flow row-major; rows auto-size to
+  // their tallest child. `spacing` is used for both row and column gaps. Default 2.
+  columns?: number;
 }
 
 export interface VectorChildNode {
@@ -344,17 +320,18 @@ export interface Shape {
   // Clip content (frames only — clips children to frame bounds)
   clipContent: boolean;
 
-  // Auto-layout (frames only). When set, children are positioned by the engine.
-  layout?: Layout | null;
-  // Child grow factor for flex layouts (flex-grow). Default 0.
-  flexGrow?: number;
-
   // Figma-style Auto Layout. When `autoLayout` is set on a shape, the autoLayout
   // engine reflows its children on every change. Sizing fields apply to ANY shape
   // (they say how the shape sizes within its parent if the parent is auto-layout).
   autoLayout?: AutoLayoutSettings | null;
   widthMode?: 'hug' | 'fill' | 'fixed';
   heightMode?: 'hug' | 'fill' | 'fixed';
+  // Excludes this shape from its auto-layout parent's flow (Figma "Absolute position").
+  // The shape keeps its own x/y/size and is not counted in the parent's hug measurement.
+  layoutPositioning?: 'auto' | 'absolute';
+  // Min/Max size clamps (Figma). Applied to hug/fill/fixed resolution. undefined = unbounded.
+  minWidth?: number; maxWidth?: number;
+  minHeight?: number; maxHeight?: number;
 
   // Corner radius per corner (frames and rects). Rendered via roundRect.
   cornerRadii?: { tl: number; tr: number; br: number; bl: number };

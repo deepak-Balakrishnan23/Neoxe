@@ -1,6 +1,6 @@
-import React, { useState } from 'react';
+import React, { useState, useMemo } from 'react';
 import { useDesignStore } from '../store/useDesignStore';
-import { generateCode, CodeFormat, cssClassName } from '../../shared/codegen';
+import { generateCode, CodeFormat } from '../../shared/codegen';
 
 const FORMATS: { id: CodeFormat; label: string }[] = [
   { id: 'css', label: 'CSS' },
@@ -20,11 +20,15 @@ export default function InspectPanel() {
     ? page.objects[[...selectedIds][0]]
     : null;
 
+  // Memoized so the full CSS/SVG/HTML string isn't regenerated on unrelated re-renders
+  // (e.g. the 1.2s `copied` toggle) — only when the shape, page, or format actually change.
+  const code = useMemo(
+    () => (shape && page) ? generateCode(shape, page, format) : '',
+    [shape, page, format]);
+
   if (!shape || !page) {
     return <div style={s.empty}>Select a shape to inspect its code</div>;
   }
-
-  const code = generateCode(shape, page, format);
 
   const copy = () => {
     navigator.clipboard?.writeText(code);
@@ -32,16 +36,21 @@ export default function InspectPanel() {
     setTimeout(() => setCopied(false), 1200);
   };
 
+  // Position relative to the parent container (Figma model) — the page-absolute
+  // canvas coordinate is meaningless for handoff.
+  const parent = shape.parentId ? page.objects[shape.parentId] : null;
+
   return (
     <div style={s.wrap}>
       {/* Measurements */}
       <div style={s.measures}>
         <Measure label="W" value={Math.round(shape.width)} />
         <Measure label="H" value={Math.round(shape.height)} />
-        <Measure label="X" value={Math.round(shape.x)} />
-        <Measure label="Y" value={Math.round(shape.y)} />
+        <Measure label="X" value={Math.round(shape.x - (parent?.x ?? 0))} />
+        <Measure label="Y" value={Math.round(shape.y - (parent?.y ?? 0))} />
         {shape.rotation !== 0 && <Measure label="∠" value={shape.rotation} unit="°" />}
       </div>
+      {parent && <div style={s.relNote}>X/Y relative to “{parent.name}”</div>}
 
       {/* Format tabs */}
       <div style={s.formatTabs}>
@@ -58,16 +67,38 @@ export default function InspectPanel() {
         <pre style={s.code}>{code}</pre>
       </div>
 
-      {/* Fills / measurements details */}
-      {shape.fills.length > 0 && (
+      {/* Typography (text shapes) — font details for handoff, Figma-style */}
+      {shape.type === 'text' && shape.textStyle && (
+        <div style={s.colorList}>
+          <div style={s.colorHeader}>Typography</div>
+          <div style={s.typoGrid}>
+            <span style={s.typoKey}>Font</span><span style={s.typoVal}>{shape.textStyle.fontFamily}</span>
+            <span style={s.typoKey}>Weight</span><span style={s.typoVal}>{shape.textStyle.fontWeight}</span>
+            <span style={s.typoKey}>Size</span><span style={s.typoVal}>{shape.textStyle.fontSize}px</span>
+            <span style={s.typoKey}>Line height</span><span style={s.typoVal}>{shape.textStyle.lineHeight}</span>
+            {!!shape.textStyle.letterSpacing && (<><span style={s.typoKey}>Letter</span><span style={s.typoVal}>{shape.textStyle.letterSpacing}px</span></>)}
+          </div>
+        </div>
+      )}
+
+      {/* Colors — solid fills + stroke colors, click to copy */}
+      {(shape.fills.some(f => f.type === 'solid') || shape.strokes.length > 0) && (
         <div style={s.colorList}>
           <div style={s.colorHeader}>Colors</div>
           {shape.fills.map((f, i) => f.type === 'solid' && (
-            <div key={i} style={s.colorRow}
+            <div key={`f${i}`} style={s.colorRow}
               onClick={() => navigator.clipboard?.writeText(f.color)}>
               <div style={{ ...s.swatch, background: f.color }} />
               <span style={s.colorVal}>{f.color.toUpperCase()}</span>
-              <span style={s.copyHint}>click to copy</span>
+              <span style={s.copyHint}>fill · click to copy</span>
+            </div>
+          ))}
+          {shape.strokes.map((st, i) => (
+            <div key={`s${i}`} style={s.colorRow}
+              onClick={() => navigator.clipboard?.writeText(st.color)}>
+              <div style={{ ...s.swatch, background: st.color }} />
+              <span style={s.colorVal}>{st.color.toUpperCase()}</span>
+              <span style={s.copyHint}>stroke · click to copy</span>
             </div>
           ))}
         </div>
@@ -88,7 +119,11 @@ function Measure({ label, value, unit }: { label: string; value: number; unit?: 
 const s: Record<string, React.CSSProperties> = {
   wrap: { flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden', fontFamily: 'system-ui' },
   empty: { padding: 16, color: 'var(--text-secondary)', fontSize: 12, fontFamily: 'system-ui' },
-  measures: { display: 'flex', gap: 6, padding: '10px 12px', flexWrap: 'wrap', borderBottom: '1px solid var(--border)' },
+  measures: { display: 'flex', gap: 6, padding: '10px 12px 6px', flexWrap: 'wrap' },
+  relNote: { fontSize: 10, color: 'var(--text-muted)', padding: '0 12px 8px', borderBottom: '1px solid var(--border)' },
+  typoGrid: { display: 'grid', gridTemplateColumns: 'auto 1fr', gap: '3px 10px', fontSize: 11 },
+  typoKey: { color: 'var(--text-secondary)' },
+  typoVal: { color: 'var(--text)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
   measure: { background: 'var(--border)', borderRadius: 4, padding: '4px 8px', minWidth: 42 },
   measureLabel: { fontSize: 9, color: 'var(--text-secondary)', textTransform: 'uppercase' },
   measureValue: { fontSize: 12, color: 'var(--text)', fontVariantNumeric: 'tabular-nums' },

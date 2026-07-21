@@ -1,11 +1,21 @@
 import React, { useState } from 'react';
 import { useDesignStore } from '../store/useDesignStore';
+import { cancelAutosave, clearAutosave } from '../persistence';
 
 // Shown when a tab with unsaved changes is closed. Save / Don't Save / Cancel.
 // Styled to match the existing dialog chrome (ExportDialog / PreferencesDialog).
 export default function UnsavedWarningModal() {
   const { pendingCloseTabId, tabs, closeTab, saveTab, showToast, set } = useStoreSlice();
   const [busy, setBusy] = useState(false);
+
+  // Escape = Cancel (the non-destructive choice) so the confirm is keyboard-dismissable.
+  // Effect runs before the early return (rules of hooks); no-ops while closed.
+  React.useEffect(() => {
+    if (!pendingCloseTabId) return;
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') set({ pendingCloseTabId: null }); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [pendingCloseTabId, set]);
 
   if (!pendingCloseTabId) return null;
   const tab = tabs.find(t => t.id === pendingCloseTabId);
@@ -26,7 +36,15 @@ export default function UnsavedWarningModal() {
       setBusy(false);
     }
   };
-  const onDontSave = () => { void closeTab(tab.id); };
+  const onDontSave = () => {
+    // The user explicitly discarded this document's changes — drop its autosave so the
+    // next launch doesn't offer to "recover" work they chose to throw away (Figma-style).
+    const fileId = useDesignStore.getState().activeTabId === tab.id
+      ? useDesignStore.getState().file?.id
+      : tab.session?.file?.id;
+    if (fileId) { cancelAutosave(); clearAutosave(fileId); }
+    void closeTab(tab.id);
+  };
   const onCancel = () => set({ pendingCloseTabId: null });
 
   return (

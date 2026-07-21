@@ -1,7 +1,6 @@
 import React from 'react';
 import { useDesignStore } from '../store/useDesignStore';
 import { usePrefs } from '../store/usePrefs';
-import { api } from '../ipc/api';
 import { openDesignFile } from '../io/fileIO';
 import { generatePrototypeHtml } from '../../shared/prototype';
 import Icon from './Icon';
@@ -21,6 +20,12 @@ export default function Toolbar() {
   const handlePresent = () => {
     const page = activePage();
     if (!file || !page) return;
+    // Only top-level FRAMES become screens (Figma model) — with none, the generated
+    // HTML is an empty shell that opens as a blank tab with zero explanation. This is
+    // the most prominent Present entry point (visible on every tab), so it needs the
+    // same guard as the Prototype panel's own Present/Export HTML buttons.
+    const hasFrame = page.childIds.some(id => page.objects[id]?.type === 'frame');
+    if (!hasFrame) { showToast('Add a frame before presenting — content outside a frame can’t be shown'); return; }
     const html = generatePrototypeHtml(file, page);
     const url = URL.createObjectURL(new Blob([html], { type: 'text/html' }));
     window.open(url, '_blank');
@@ -94,35 +99,33 @@ function IconBtn({ children, title, onClick, disabled }: {
 
 function Sep() { return <div style={styles.sep} />; }
 
-const noDrag = { WebkitAppRegion: 'no-drag' } as React.CSSProperties;
 
 const styles: Record<string, React.CSSProperties> = {
   toolbar: {
     height: 48, background: T.bgApp, borderBottom: `1px solid ${T.border}`,
     display: 'flex', alignItems: 'center', padding: '0 12px', gap: 8, flexShrink: 0,
-    WebkitAppRegion: 'drag' as React.CSSProperties['WebkitAppRegion'],
   },
   left: { display: 'flex', alignItems: 'center', gap: 3, flex: '0 0 auto' },
   center: { display: 'flex', alignItems: 'center', flex: '1 1 0', minWidth: 0, height: '100%' },
   right: { display: 'flex', alignItems: 'center', gap: 3, flex: '0 0 auto', justifyContent: 'flex-end' },
   logo: {
     display: 'flex', alignItems: 'center', gap: 6, color: T.text, fontWeight: 700, fontSize: 15,
-    fontFamily: T.font, letterSpacing: '-0.3px', marginRight: 6, ...noDrag,
+    fontFamily: T.font, letterSpacing: '-0.3px', marginRight: 6,
   },
   iconBtn: {
     border: 'none', width: 34, height: 34, borderRadius: T.rMd, cursor: 'pointer',
     display: 'flex', alignItems: 'center', justifyContent: 'center',
-    transition: 'background .12s, color .12s', ...noDrag,
+    transition: 'background .12s, color .12s',
   },
   sep: { width: 1, height: 22, background: T.border, margin: '0 5px' },
   exportBtn: {
     display: 'flex', alignItems: 'center', gap: 6, background: T.accent, border: 'none', color: '#fff',
     fontSize: 13, padding: '7px 14px', borderRadius: T.rMd, cursor: 'pointer',
-    fontFamily: T.font, fontWeight: 600, ...noDrag,
+    fontFamily: T.font, fontWeight: 600,
   },
   presentBtn: {
     display: 'flex', alignItems: 'center', gap: 6, background: T.bgElevated, border: 'none', color: T.text,
     fontSize: 13, padding: '7px 13px', borderRadius: T.rMd, cursor: 'pointer',
-    fontFamily: T.font, fontWeight: 500, ...noDrag,
+    fontFamily: T.font, fontWeight: 500,
   },
 };

@@ -3,6 +3,7 @@ import { DesignFile, Page, PathSegment, AnchorPoint, SvgPathEdit, SvgPointRef, G
 export type { Guide };
 import { api } from '../ipc/api';
 import { persistFile, serializeFile } from '../io/fileIO';
+import { markSavePoint, clearAutosave, cancelAutosave } from '../persistence';
 import type { EngineSession } from '../mockEngine';
 
 export type ToolType = 'select' | 'rect' | 'ellipse' | 'frame' | 'text' | 'pen' | 'image';
@@ -101,6 +102,10 @@ interface DesignStore {
   // Save a tab to disk (native dialog on first save, silent overwrite after). Returns
   // whether it saved and whether this was the first save (for toast wording).
   saveTab: (id: string) => Promise<{ saved: boolean; firstSave: boolean }>;
+  // Inline rename (double-click the tab). Trims; empty falls back to 'Untitled'. Updates the
+  // document name + tab label (and the parked session for inactive tabs). Display-only — does
+  // not rename the on-disk file; the new name is used as the suggested name on the next Save.
+  renameTab: (id: string, name: string) => Promise<void>;
 
   activePage: () => Page | null;
 }
@@ -348,15 +353,12 @@ export const useDesignStore = create<DesignStore>((set, get) => ({
     }
 
     if (remaining.length === 0) {
-      // Last tab closed → auto-create a fresh untitled tab.
-      await api.newFile();
-      const renamed = await api.renameFile('Untitled');
-      const file = (renamed?.ok ? renamed.data : null) ?? (await api.getState()).data ?? null;
-      const newId = genTabId();
+      // Last tab closed → no document open, so drop back to the landing / start page
+      // (file === null makes App render LandingPage instead of the editor).
       set({
-        file,
-        tabs: [{ id: newId, filename: 'Untitled', isDirty: false, session: null, selectedIds: [], savedFilePath: null }],
-        activeTabId: newId,
+        file: null,
+        tabs: [],
+        activeTabId: null,
         selectedIds: new Set<string>(),
         pendingCloseTabId: null,
         editingTextId: null,
@@ -369,6 +371,7 @@ export const useDesignStore = create<DesignStore>((set, get) => ({
         svgEditShapeId: null,
         svgEditingPaths: [],
         svgSelectedPoints: [],
+        livePreviewSvg: null,
         guidesPerPage: {},
       });
       return;
@@ -423,16 +426,47 @@ export const useDesignStore = create<DesignStore>((set, get) => ({
       filename: tab.filename,
       fileId: file.id,
     });
-    if (!res.saved) {
-      if (res.unsupported) get().showToast('Saving needs the desktop app or a Chromium browser');
-      return { saved: false, firstSave: res.firstSave };
-    }
+    // saved:false now only means the user cancelled the OS save dialog — stay silent.
+    if (!res.saved) return { saved: false, firstSave: res.firstSave };
 
+    // Saved → mark clean and run the shared persistence side-effects so every save path
+    // (button, ⌘S, close-modal) behaves identically: record a clean save point and drop the
+    // autosave so it can't be offered for recovery. (The recent-files entry is recorded by
+    // the disk save path in io/fileIO.ts, which owns the file handle.)
     set((s) => ({
       tabs: s.tabs.map(t =>
         t.id === id ? { ...t, savedFilePath: res.targetLabel ?? t.savedFilePath, isDirty: false } : t),
     }));
+    // Mark THIS file saved and drop only ITS autosave — other dirty tabs stay recoverable.
+    markSavePoint(file.id);
+    cancelAutosave();
+    clearAutosave(file.id);
     return { saved: true, firstSave: res.firstSave };
+  },
+
+  renameTab: async (id, raw) => {
+    const name = raw.trim() || 'Untitled';
+    const state = get();
+    if (id === state.activeTabId) {
+      // Active tab → rename the live document in the engine, then sync file + tab label.
+      const res = await api.renameFile(name);
+      const f = res?.ok ? res.data : null;
+      set((s) => ({
+        file: f ?? (s.file ? { ...s.file, name } : s.file),
+        tabs: s.tabs.map(t => t.id === id ? { ...t, filename: name, isDirty: true } : t),
+      }));
+    } else {
+      // Inactive tab → update the label and the parked session's document name.
+      // (EngineSession.file is nullable — only rename it when it exists.)
+      set((s) => ({
+        tabs: s.tabs.map(t => t.id === id
+          ? { ...t, filename: name, isDirty: true,
+              session: t.session && t.session.file
+                ? { ...t.session, file: { ...t.session.file, name } }
+                : t.session }
+          : t),
+      }));
+    }
   },
 
   activePage: () => {

@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { useDesignStore } from '../store/useDesignStore';
 import { exportRaster, exportSvg, exportPdf, exportPdfMultiPage, RasterFormat } from '../export/exporters';
 import { imageCache } from '../canvas/imageCache';
@@ -17,6 +17,17 @@ export default function ExportDialog() {
   const [target, setTarget] = useState<'page' | 'selection'>('selection');
   const [pdfMode, setPdfMode] = useState<'single' | 'frames'>('single');
   const [busy, setBusy] = useState(false);
+  // True only when the mousedown began on the backdrop itself — a drag that starts
+  // inside the dialog and releases on the backdrop must not dismiss it.
+  const downOnOverlay = React.useRef(false);
+
+  // Escape closes the dialog (same behaviour as PreferencesDialog).
+  useEffect(() => {
+    if (!exportOpen) return;
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setExportOpen(false); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [exportOpen, setExportOpen]);
 
   if (!exportOpen) return null;
   const page = activePage();
@@ -29,7 +40,7 @@ export default function ExportDialog() {
   const doExport = async () => {
     setBusy(true);
     try {
-      let res: { saved: boolean; unsupported?: boolean } | undefined;
+      let res: { saved: boolean } | undefined;
       if (isRaster) {
         res = await exportRaster(file, page, scale, ids, imageCache, format as RasterFormat);
       } else if (format === 'svg') {
@@ -40,8 +51,7 @@ export default function ExportDialog() {
           : await exportPdf(file, page, ids, imageCache);
       }
       if (res?.saved) showToast(`Exported ${FMT_LABEL[format]}`);
-      else if (res?.unsupported) showToast('Saving not supported in this browser — use the desktop app');
-      // cancelled (saved:false, not unsupported) → no toast
+      // cancelled (saved:false) → no toast
     } catch (e) {
       showToast(`Export failed: ${(e as Error)?.message ?? e}`);
     } finally {
@@ -51,8 +61,14 @@ export default function ExportDialog() {
   };
 
   return (
-    <div style={s.overlay} onMouseDown={() => setExportOpen(false)}>
-      <div style={s.dialog} onMouseDown={e => e.stopPropagation()}>
+    // Close only when the press started AND ended on the backdrop — a drag that starts
+    // inside the dialog and releases on the backdrop must not dismiss it.
+    <div
+      style={s.overlay}
+      onMouseDown={e => { downOnOverlay.current = e.target === e.currentTarget; }}
+      onClick={e => { if (downOnOverlay.current && e.target === e.currentTarget) setExportOpen(false); }}
+    >
+      <div style={s.dialog}>
         <div style={s.title}>Export</div>
 
         {/* Target */}

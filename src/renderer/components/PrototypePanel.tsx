@@ -38,20 +38,26 @@ export default function PrototypePanel() {
     if (res.ok && res.data) setFile(res.data);
   };
 
+  // Only top-level FRAMES become screens (Figma model — content outside any frame can't
+  // be presented). With none, generatePrototypeHtml silently returns an empty shell, which
+  // reads as "the export is broken" rather than "there's nothing to export yet". Guard both
+  // entry points so that never happens silently.
   const present = () => {
+    if (frames.length === 0) { showToast('Add a frame before presenting — content outside a frame can’t be shown'); return; }
     const html = generatePrototypeHtml(file, page);
     const url = URL.createObjectURL(new Blob([html], { type: 'text/html' }));
     window.open(url, '_blank');
   };
 
   const exportHtml = async () => {
+    if (frames.length === 0) { showToast('Add a frame before exporting — content outside a frame can’t be shown'); return; }
     const res = await exportTextFile({
       content: generatePrototypeHtml(file, page),
       suggestedName: file.name || 'prototype',
       extension: 'html', description: 'HTML Prototype', mime: 'text/html',
     });
     if (res.saved) showToast('Prototype exported');
-    else if (res.unsupported) showToast('Saving not supported in this browser');
+    // cancelled → no toast
   };
 
   return (
@@ -69,8 +75,8 @@ export default function PrototypePanel() {
         <div style={s.label}>Connections ({links.length})</div>
         {links.length === 0 ? (
           <div style={s.empty}>
-            No connections yet. Drag the <span style={s.inlineDot}>◗</span> handle from a selected layer
-            onto a frame to link them — or add one from the Design tab.
+            No connections yet. Hover a frame's edge or corner to reveal its <span style={s.inlineDot}>⊕</span> connect
+            handle, then drag it onto another frame to link them — or select a layer and add an interaction below.
           </div>
         ) : (
           <div style={s.list}>

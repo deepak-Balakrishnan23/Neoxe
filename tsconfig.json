@@ -1,7 +1,7 @@
 {
   "compilerOptions": {
     "target": "ES2022",
-    "module": "CommonJS",
+    "module": "ESNext",
     "moduleResolution": "bundler",
     "lib": ["ES2022", "DOM"],
     "jsx": "react-jsx",
@@ -9,14 +9,13 @@
     "esModuleInterop": true,
     "skipLibCheck": true,
     "ignoreDeprecations": "6.0",
-    "outDir": "dist/main",
-    "rootDir": "src",
+    "noEmit": true,
     "baseUrl": ".",
     "paths": {
       "@shared/*": ["src/shared/*"],
       "@renderer/*": ["src/renderer/*"]
     }
   },
-  "include": ["src/main", "src/shared"],
+  "include": ["src/renderer", "src/shared"],
   "exclude": ["node_modules", "dist"]
 }

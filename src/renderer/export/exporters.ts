@@ -1,4 +1,4 @@
-import { Page, DesignFile, Shape } from '../../shared/types';
+import { Page, DesignFile } from '../../shared/types';
 import { pageToSvg, exportShapeSvg } from '../../shared/codegen';
 import { renderPage } from '../canvas/renderer';
 import { saveExportFile } from '../io/fileIO';
@@ -11,7 +11,10 @@ import { saveExportFile } from '../io/fileIO';
 function computeBounds(page: Page, ids?: string[]): { x: number; y: number; w: number; h: number } {
   if (ids && ids.length === 1) {
     const s = page.objects[ids[0]];
-    if (s) return { x: s.x, y: s.y, w: Math.round(s.width), h: Math.round(s.height) };
+    // Unrotated: use exact W/H (matches the right panel to the pixel). Rotated: fall back to
+    // the AABB (selrect) so the export covers the whole rotated shape instead of clipping it.
+    if (s && !s.rotation) return { x: s.x, y: s.y, w: Math.round(s.width), h: Math.round(s.height) };
+    if (s) return { x: s.selrect.x, y: s.selrect.y, w: Math.round(s.selrect.width), h: Math.round(s.selrect.height) };
   }
   const shapes = ids && ids.length > 0
     ? ids.map(id => page.objects[id]).filter(Boolean)
@@ -179,7 +182,7 @@ export async function exportPdf(
 
   const bytes = await pdf.save();
   return saveExportFile({
-    blob: new Blob([bytes], { type: 'application/pdf' }),
+    blob: new Blob([new Uint8Array(bytes)], { type: 'application/pdf' }),
     suggestedName: exportBaseName(page, ids),
     extension: 'pdf', description: 'PDF Document', mime: 'application/pdf',
   });
@@ -217,7 +220,7 @@ export async function exportPdfMultiPage(
 
   const bytes = await pdf.save();
   return saveExportFile({
-    blob: new Blob([bytes], { type: 'application/pdf' }),
+    blob: new Blob([new Uint8Array(bytes)], { type: 'application/pdf' }),
     suggestedName: `${page.name || 'export'}-frames`,
     extension: 'pdf', description: 'PDF Document', mime: 'application/pdf',
   });

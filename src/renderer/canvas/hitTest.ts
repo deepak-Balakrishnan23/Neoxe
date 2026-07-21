@@ -13,8 +13,10 @@ export function screenToDoc(x: number, y: number, vp: Viewport): { x: number; y:
 
 // Hit-test a point against the page, front-to-back.
 // Returns the deepest shape id hit, or null.
+// Accepts any object carrying the shape map + root order (not just a full Page) so
+// callers holding partial page views can hit-test without fabricating unused fields.
 export function hitTestPoint(
-  page: Page,
+  page: Pick<Page, 'objects' | 'childIds'>,
   docX: number,
   docY: number,
 ): string | null {
@@ -32,7 +34,7 @@ export function hitTestPoint(
 
 function hitTestShape(
   shape: Shape,
-  page: Page,
+  page: Pick<Page, 'objects' | 'childIds'>,
   x: number,
   y: number,
 ): string | null {
@@ -108,6 +110,11 @@ export function getHandleAt(
 ): { shapeId: string; handleIndex: number } | null {
   const HIT_RADIUS = 7; // screen pixels
 
+  // Multi-selection uses a single union box whose handles are DOM elements in the overlay
+  // (they own their own mousedown). Skip per-shape hit-testing so a click inside the group
+  // doesn't grab one shape's handle.
+  if (selectedIds.size > 1) return null;
+
   for (const id of selectedIds) {
     const shape = page.objects[id];
     if (!shape) continue;
@@ -121,11 +128,23 @@ export function getHandleAt(
       height: sr.height * viewport.zoom,
     };
 
+    // The overlay draws handles rotated around the shape's centre. Un-rotate the test point
+    // into that same (axis-aligned) frame so every test below works for rotated shapes too.
+    const ccx = screenSelrect.x + screenSelrect.width / 2;
+    const ccy = screenSelrect.y + screenSelrect.height / 2;
+    let px = screenX, py = screenY;
+    if (shape.rotation) {
+      const a = (-shape.rotation * Math.PI) / 180;
+      const dx = screenX - ccx, dy = screenY - ccy;
+      px = ccx + dx * Math.cos(a) - dy * Math.sin(a);
+      py = ccy + dx * Math.sin(a) + dy * Math.cos(a);
+    }
+
     // Rotate handle — fixed offset above TC in screen space
     const rotateSX = screenSelrect.x + screenSelrect.width / 2;
     const rotateSY = screenSelrect.y - ROTATE_OFFSET;
-    const rdx = screenX - rotateSX;
-    const rdy = screenY - rotateSY;
+    const rdx = px - rotateSX;
+    const rdy = py - rotateSY;
     if (rdx * rdx + rdy * rdy <= HIT_RADIUS * HIT_RADIUS) {
       return { shapeId: id, handleIndex: ROTATE_HANDLE };
     }
@@ -134,10 +153,32 @@ export function getHandleAt(
     const handles = getHandlePositions(screenSelrect);
     for (let i = 0; i < handles.length; i++) {
       const [hx, hy] = handles[i];
-      const dx = screenX - hx;
-      const dy = screenY - hy;
+      const dx = px - hx;
+      const dy = py - hy;
       if (dx * dx + dy * dy <= HIT_RADIUS * HIT_RADIUS) {
         return { shapeId: id, handleIndex: i };
+      }
+    }
+
+    // Rotate zones — just OUTSIDE each corner (Figma-style: hover a corner from outside to
+    // rotate). Only when the point is beyond the resize handle but within ROTATE_ZONE, and
+    // outside the selection box, so it never competes with resize or moving the shape.
+    const ROTATE_ZONE = 18;
+    const inBox = px >= screenSelrect.x && px <= screenSelrect.x + screenSelrect.width
+               && py >= screenSelrect.y && py <= screenSelrect.y + screenSelrect.height;
+    if (!inBox) {
+      const corners = [
+        [screenSelrect.x, screenSelrect.y],
+        [screenSelrect.x + screenSelrect.width, screenSelrect.y],
+        [screenSelrect.x + screenSelrect.width, screenSelrect.y + screenSelrect.height],
+        [screenSelrect.x, screenSelrect.y + screenSelrect.height],
+      ];
+      for (const [cx, cy] of corners) {
+        const dx = px - cx, dy = py - cy;
+        const d2 = dx * dx + dy * dy;
+        if (d2 > HIT_RADIUS * HIT_RADIUS && d2 <= ROTATE_ZONE * ROTATE_ZONE) {
+          return { shapeId: id, handleIndex: ROTATE_HANDLE };
+        }
       }
     }
   }

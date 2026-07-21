@@ -6,6 +6,7 @@
 // heic2any (lazy-loaded only when a HEIC file actually appears).
 
 import { VectorChildNode } from '../../shared/types';
+import { sanitizeSvgMarkup } from '../../shared/sanitizeSvg';
 
 export interface ImportedImage {
   dataUrl: string;
@@ -68,7 +69,7 @@ let _vcCounter = 0;
 function vcId() { return `vc_${++_vcCounter}_${Math.random().toString(36).slice(2, 6)}`; }
 
 function parseSVGChildren(parentEl: Element): VectorChildNode[] {
-  return Array.from(parentEl.children).flatMap(el => {
+  return Array.from(parentEl.children).flatMap((el): VectorChildNode[] => {
     const tag = el.tagName.toLowerCase();
     const get = (attr: string) => el.getAttribute(attr);
     const getF = (attr: string, def = 0) => parseFloat(get(attr) ?? String(def)) || def;
@@ -80,7 +81,7 @@ function parseSVGChildren(parentEl: Element): VectorChildNode[] {
       fill: parseSVGColor(fillAttr),
       stroke: parseSVGColor(strokeAttr),
       strokeWidth: getF('stroke-width'),
-      opacity: parseFloat(get('opacity') ?? '1'),
+      opacity: (v => Number.isFinite(v) ? v : 1)(parseFloat(get('opacity') ?? '1')),
       transform: get('transform') ?? undefined,
     };
 
@@ -135,7 +136,9 @@ export async function importImageFile(file: File): Promise<ImportedImage> {
     const svgEl = svgDoc.querySelector('svg');
     vectorChildren = svgEl ? parseSVGChildren(svgEl) : [];
     if (svgEl) {
-      svgInnerHTML = svgEl.innerHTML;
+      // Strip script-capable content at the door (defense in depth — the overlay
+      // sanitizes again at injection time).
+      svgInnerHTML = sanitizeSvgMarkup(svgEl.innerHTML);
       const vb = svgEl.getAttribute('viewBox');
       if (vb) {
         const parts = vb.trim().split(/[\s,]+/).map(Number);

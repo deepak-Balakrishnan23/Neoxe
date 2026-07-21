@@ -75,4 +75,16 @@ describe('generatePrototypeHtml', () => {
     const f2: DesignFile = { ...file, pages: [empty], activePageId: 'e' };
     expect(() => generatePrototypeHtml(f2, empty)).not.toThrow();
   });
+
+  it('the embedded runtime parses as valid JavaScript (blank-screen regression)', () => {
+    // The runtime lives inside a TS template literal, where a single backslash is
+    // cooked away: the URL-guard regex /^https?:\/\//i was emitted as /^https?:///i —
+    // a mid-expression line comment. The resulting SyntaxError killed the ENTIRE
+    // runtime, so no screen ever got .active and every Present opened blank.
+    const m = html.match(/<script>([\s\S]*?)<\/script>/);
+    expect(m).toBeTruthy();
+    expect(() => new Function(m![1])).not.toThrow();
+    // The guard regex must survive with escaped slashes.
+    expect(m![1]).toContain('/^https?:\\/\\//i');
+  });
 });

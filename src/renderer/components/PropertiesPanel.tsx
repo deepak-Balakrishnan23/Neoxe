@@ -9,6 +9,47 @@ import PrototypePanel from './PrototypePanel';
 import InteractionsSection from './InteractionsSection';
 import Icon, { IconName } from './Icon';
 import { FRAME_PRESETS, FramePreset } from '../constants/framePresets';
+import FontPicker from './FontPicker';
+
+// ── Drag-to-scrub (shared by every numeric field) ─────────────────────────────
+// Figma-style scrubber: pointerdown on a field's label/icon captures the pointer,
+// horizontal drag adjusts the value (step × 1px), release commits. Modifiers are
+// read live from each move event so they can be pressed mid-drag: Shift = ×10
+// (coarse), Alt/Option = ×0.1 (fine). The ew-resize cursor is forced on <body>
+// for the whole drag so it doesn't flicker while crossing other elements.
+function startScrub(
+  e: React.PointerEvent,
+  cfg: { value: number; step?: number; min?: number; max?: number; decimals?: number; onChange: (v: number) => void },
+) {
+  if (e.button !== 0) return;
+  const el = e.currentTarget as HTMLElement;
+  const { value: startVal, step = 1, min, max, decimals = 0, onChange } = cfg;
+  const startX = e.clientX;
+  try { el.setPointerCapture(e.pointerId); } catch { /* capture unsupported — window listeners still work */ }
+  const prevCursor = document.body.style.cursor;
+  document.body.style.cursor = 'ew-resize';
+
+  const clamp = (v: number) => {
+    if (min !== undefined) v = Math.max(min, v);
+    if (max !== undefined) v = Math.min(max, v);
+    return parseFloat(v.toFixed(decimals));
+  };
+  const onMove = (me: PointerEvent) => {
+    const mult = me.shiftKey ? 10 : me.altKey ? 0.1 : 1;
+    onChange(clamp(startVal + (me.clientX - startX) * step * mult));
+  };
+  const end = (pe: PointerEvent) => {
+    el.removeEventListener('pointermove', onMove);
+    el.removeEventListener('pointerup', end);
+    el.removeEventListener('pointercancel', end);
+    try { el.releasePointerCapture(pe.pointerId); } catch { /* already released */ }
+    document.body.style.cursor = prevCursor;
+  };
+  el.addEventListener('pointermove', onMove);
+  el.addEventListener('pointerup', end);
+  el.addEventListener('pointercancel', end);
+  e.preventDefault();
+}
 
 // ── NumInput: scrub-label + editable input ────────────────────────────────────
 
@@ -28,7 +69,6 @@ interface NumInputProps {
 function NumInput({ label, value, unit, min, max, step = 1, decimals = 0, icon, hideLabel, onChange }: NumInputProps) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState('');
-  const scrubStart = useRef<{ x: number; val: number } | null>(null);
 
   const clamp = (v: number) => {
     if (min !== undefined) v = Math.max(min, v);
@@ -42,32 +82,14 @@ function NumInput({ label, value, unit, min, max, step = 1, decimals = 0, icon, 
     setEditing(false);
   };
 
-  const onLabelMouseDown = (e: React.MouseEvent) => {
-    if (e.button !== 0) return;
-    scrubStart.current = { x: e.clientX, val: value };
-    const onMove = (me: MouseEvent) => {
-      if (!scrubStart.current) return;
-      const dx = me.clientX - scrubStart.current.x;
-      onChange(clamp(scrubStart.current.val + dx * step));
-    };
-    const onUp = () => {
-      window.removeEventListener('mousemove', onMove);
-      window.removeEventListener('mouseup', onUp);
-      scrubStart.current = null;
-    };
-    window.addEventListener('mousemove', onMove);
-    window.addEventListener('mouseup', onUp);
-    e.preventDefault();
-  };
-
   return (
     <div style={hideLabel ? numStyles.wrapBare : numStyles.wrap}>
       {!hideLabel && (
         <span
           style={{ ...numStyles.label, ...(icon ? { display: 'flex', alignItems: 'center', justifyContent: 'center' } : {}) }}
-          onMouseDown={onLabelMouseDown}
+          onPointerDown={e => startScrub(e, { value, step, min, max, decimals, onChange })}
           onDoubleClick={() => { setDraft(String(value)); setEditing(true); }}
-          title={`${label} — drag to scrub, double-click to type`}
+          title={`${label} — drag to scrub (Shift = coarse, Alt = fine), double-click to type`}
         >{icon ? <Icon name={icon} size={14} /> : label}</span>
       )}
       {editing ? (
@@ -91,6 +113,75 @@ function NumInput({ label, value, unit, min, max, step = 1, decimals = 0, icon, 
           onClick={() => { setDraft(String(value)); setEditing(true); }}
           title="Click to edit"
         >{decimals > 0 ? value.toFixed(decimals) : Math.round(value)}{unit}</span>
+      )}
+    </div>
+  );
+}
+
+// ── GapInput: auto-layout spacing field with an "Auto" (unset) state ─────────
+// Figma-style: blank = Auto (spacing auto-distributed / treated as 0 by the engine),
+// typing a number pins a fixed gap, clearing the field reverts to Auto. Disabled
+// (greyed, non-editable) whenever the container's distribution mode already
+// auto-distributes spacing (Space between / around / evenly).
+
+function GapInput({ value, disabled, onChange }: {
+  value: number | undefined;
+  disabled?: boolean;
+  onChange: (v: number | undefined) => void;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState('');
+
+  const commit = (raw: string) => {
+    const trimmed = raw.trim();
+    if (trimmed === '') onChange(undefined);
+    else {
+      const n = parseFloat(trimmed);
+      if (!isNaN(n)) onChange(Math.max(-9999, n));
+    }
+    setEditing(false);
+  };
+
+  const startEdit = () => {
+    if (disabled) return;
+    setDraft(value != null ? String(value) : '');
+    setEditing(true);
+  };
+
+  const hint = disabled
+    ? 'Spacing between items — auto-distributed in this mode'
+    : 'Spacing between items — drag to scrub (Shift = coarse, Alt = fine), click to type, clear for Auto';
+
+  return (
+    <div style={{ ...numStyles.wrap, opacity: disabled ? 0.45 : 1 }}>
+      <span
+        style={{ ...numStyles.label, display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: disabled ? 'default' : 'ew-resize' }}
+        title={hint}
+        // Scrubbing from Auto starts at 0 and pins a fixed gap (Figma behavior).
+        onPointerDown={disabled ? undefined : e => startScrub(e, { value: value ?? 0, min: -9999, onChange })}
+      >
+        <Icon name="gap" size={14} />
+      </span>
+      {editing ? (
+        <input
+          autoFocus
+          style={numStyles.input}
+          value={draft}
+          placeholder="Auto"
+          onChange={e => setDraft(e.target.value)}
+          onBlur={e => commit(e.target.value)}
+          onKeyDown={e => {
+            if (e.key === 'Enter') commit(draft);
+            if (e.key === 'Escape') setEditing(false);
+            e.stopPropagation();
+          }}
+        />
+      ) : (
+        <span
+          style={{ ...numStyles.value, color: value == null ? 'var(--text-muted)' : 'var(--text)', cursor: disabled ? 'default' : 'text' }}
+          onClick={startEdit}
+          title={hint}
+        >{value != null ? `${value}px` : 'Auto'}</span>
       )}
     </div>
   );
@@ -173,9 +264,13 @@ const swatchStyles: Record<string, React.CSSProperties> = {
 // ── Section / Row helpers ─────────────────────────────────────────────────────
 
 function Section({ label, children, action }: { label: string; children: React.ReactNode; action?: React.ReactNode }) {
+  // Empty sections (e.g. "Fill" with no fills yet) collapse to a single header row —
+  // no reserved body space (Figma density).
+  // Children.toArray already drops null/undefined/boolean children.
+  const hasContent = React.Children.toArray(children).length > 0;
   return (
     <div style={pStyles.section}>
-      <div style={pStyles.sectionHeader}>
+      <div style={{ ...pStyles.sectionHeader, marginBottom: hasContent ? 10 : 0 }}>
         <span>{label}</span>
         {action}
       </div>
@@ -309,13 +404,12 @@ export default function PropertiesPanel() {
   const addAutoLayout = useCallback((s: Shape) => {
     emit([
       { op: 'set', id: s.id, attr: 'autoLayout', val: {
-        direction: 'horizontal', spacing: 0,
+        direction: 'horizontal', // spacing omitted — starts as Auto (Figma default)
         padding: { top: 0, right: 0, bottom: 0, left: 0 },
         justifyContent: 'start', alignItems: 'start',
       } },
       { op: 'set', id: s.id, attr: 'widthMode', val: 'fixed' },
       { op: 'set', id: s.id, attr: 'heightMode', val: 'fixed' },
-      { op: 'set', id: s.id, attr: 'layout', val: null },
       ...s.childIds.flatMap(cid => ([
         { op: 'set' as const, id: cid, attr: 'widthMode', val: 'fixed' },
         { op: 'set' as const, id: cid, attr: 'heightMode', val: 'fixed' },
@@ -344,10 +438,14 @@ export default function PropertiesPanel() {
   }
 
   if (rightMode === 'prototype') {
+    // Per-layer interaction editing lives HERE, not in the Design tab (Figma model:
+    // the Prototype tab owns everything prototype-related).
+    const protoShape = shapes.length === 1 ? shapes[0] : null;
     return (
       <div style={pStyles.panel}>
         {ModeToggle}
         <PrototypePanel />
+        {protoShape && <InteractionsSection shape={protoShape} />}
       </div>
     );
   }
@@ -472,7 +570,9 @@ export default function PropertiesPanel() {
               );
             })()}
             <div style={pStyles.fieldGrid}>
-              <NumInput label="R" value={shape.rotation} unit="°" min={0} max={360} onChange={v => set(shape.id, 'rotation', v)} />
+              {/* No min/max clamp — rotation wraps (scrubbing 350°→10° or past 0°), matching
+                  the engine's own normalization; a hard 0–360 clamp trapped the value at the ends. */}
+              <NumInput label="R" value={shape.rotation} unit="°" onChange={v => set(shape.id, 'rotation', ((v % 360) + 360) % 360)} />
               <NumInput label="O" value={Math.round(shape.opacity * 100)} unit="%" min={0} max={100}
                 onChange={v => set(shape.id, 'opacity', v / 100)} />
             </div>
@@ -507,6 +607,12 @@ export default function PropertiesPanel() {
           const parent = shape.parentId ? page?.objects[shape.parentId] : null;
           return parent?.autoLayout ? <ChildSizingSection shape={shape} set={set} /> : null;
         })()}
+
+        {/* Multi-selection sizing — when every selected shape lives in an auto-layout parent,
+            expose W/H sizing modes applied to all at once (Fixed / Hug / Fill). */}
+        {multi && page && shapes.every(s => s.parentId && page.objects[s.parentId]?.autoLayout) && (
+          <MultiSizingSection shapes={shapes} setAll={setAll} />
+        )}
 
         {/* ── Appearance (frames, rects, groups) — opacity, stroke weight, corner radius */}
         {!multi && (shape.type === 'frame' || shape.type === 'rect' || shape.type === 'group') && (
@@ -564,9 +670,7 @@ export default function PropertiesPanel() {
 
         {/* ── Effects (shadows + blur, Figma-style add menu + popover) ───── */}
         <EffectsSection shape={shape} setAll={setAll} />
-
-        {/* ── Prototype interactions ────────────────────────────────────── */}
-        {!multi && <InteractionsSection shape={shape} />}
+        {/* (Prototype interactions intentionally NOT here — the Prototype tab owns them.) */}
       </div>
     </div>
   );
@@ -585,9 +689,10 @@ function FillRow({ fill, index, shape, setAll }: {
   const replaceFill = (next: Fill) => setAll('fills', shape.fills.map((f, i) => (i === index ? next : f)));
   const removeFill = () => setAll('fills', shape.fills.filter((_, i) => i !== index));
 
+  // Fill = solid | linear-gradient | radial-gradient — the union is exhaustive here.
   const label = fill.type === 'solid'
     ? fill.color.replace('#', '').toUpperCase()
-    : fill.type === 'linear-gradient' ? 'Linear' : fill.type === 'radial-gradient' ? 'Radial' : fill.type;
+    : fill.type === 'linear-gradient' ? 'Linear' : 'Radial';
 
   return (
     <div style={pStyles.fillRow}>
@@ -888,6 +993,9 @@ type SizingMode = 'hug' | 'fill' | 'fixed';
 
 // One W/H field: letter + (editable number when Fixed | mode word when Hug/Fill) + a slim
 // mode dropdown. Matches Figma — the number only takes space when it's meaningful.
+// Compact Figma-style dimension field: `W [ 486      Hug ⌄]` — the live number is always
+// visible (editable when Fixed, muted when derived), the mode word shows for Hug/Fill,
+// and a slim chevron opens the sizing menu.
 function SizingField({ axis, value, mode, onValue, onMode }: {
   axis: 'W' | 'H';
   value: number;
@@ -896,23 +1004,37 @@ function SizingField({ axis, value, mode, onValue, onMode }: {
   onMode: (m: SizingMode) => void;
 }) {
   const title = axis === 'W' ? 'Width' : 'Height';
+  const modeWord = mode === 'hug' ? 'Hug' : mode === 'fill' ? 'Fill' : '';
   return (
     <div style={alStyles.dimField}>
-      <span style={alStyles.dimLetter} title={title}>{axis}</span>
-      {mode === 'fixed' && (
+      <span
+        style={{ ...alStyles.dimLetter, cursor: 'ew-resize' }}
+        title={`${title} — drag to scrub (Shift = coarse, Alt = fine)`}
+        // Scrubbing a Hug/Fill axis pins it to Fixed at the scrubbed size (onValue
+        // sets the mode), matching Figma.
+        onPointerDown={e => startScrub(e, { value, min: 1, onChange: onValue })}
+      >{axis}</span>
+      {mode === 'fixed' ? (
         <div style={{ flex: 1, minWidth: 0 }}>
           <NumInput hideLabel label={title} value={value} min={1} onChange={onValue} />
         </div>
+      ) : (
+        <span style={alStyles.dimDerived} title={`${title} ${value} — ${modeWord === 'Hug' ? 'hugging contents' : 'filling the container'}`}>
+          <span style={{ color: 'var(--text)' }}>{modeWord}</span>
+        </span>
       )}
-      <select
-        style={{ ...alStyles.modeSelect, ...(mode === 'fixed' ? {} : { flex: 1, width: 'auto' }) }}
-        value={mode} title={`${title} sizing`}
-        onChange={e => onMode(e.target.value as SizingMode)}
-      >
-        <option value="fixed">Fixed</option>
-        <option value="hug">Hug</option>
-        <option value="fill">Fill</option>
-      </select>
+      <div style={alStyles.chevWrap}>
+        <span style={alStyles.chev}>▾</span>
+        <select
+          style={alStyles.chevSelect}
+          value={mode} title={`${title} sizing`}
+          onChange={e => onMode(e.target.value as SizingMode)}
+        >
+          <option value="fixed">Fixed</option>
+          <option value="hug">Hug contents</option>
+          <option value="fill">Fill container</option>
+        </select>
+      </div>
     </div>
   );
 }
@@ -934,16 +1056,18 @@ function AutoLayoutSection({ shape, set, setAll }: {
   const hPad = (al.padding.left + al.padding.right) / 2;
   const vPad = (al.padding.top + al.padding.bottom) / 2;
   const [padExpanded, setPadExpanded] = useState(false);
+  // Min/Max fields are tucked away by default (Figma-style) — auto-open when any is set.
+  const hasMM = shape.minWidth != null || shape.maxWidth != null || shape.minHeight != null || shape.maxHeight != null;
+  const [mmOpen, setMmOpen] = useState(hasMM);
 
   const wMode = shape.widthMode ?? 'fixed';
   const hMode = shape.heightMode ?? 'fixed';
 
-  // Grid AL (track sizing) is a separate feature — omitted until implemented rather than
-  // shipping a button that silently behaves like Vertical.
   const DIRS: { key: 'horizontal' | 'vertical' | 'wrap' | 'grid'; icon: Parameters<typeof Icon>[0]['name']; title: string }[] = [
     { key: 'horizontal', icon: 'flex-row', title: 'Horizontal' },
     { key: 'vertical',   icon: 'flex-col', title: 'Vertical' },
     { key: 'wrap',       icon: 'flex-wrap', title: 'Wrap' },
+    { key: 'grid',       icon: 'grid', title: 'Grid' },
   ];
 
   return (
@@ -980,9 +1104,16 @@ function AutoLayoutSection({ shape, set, setAll }: {
         <SizingField axis="H" value={Math.round(shape.height)} mode={hMode}
           onValue={v => { set(shape.id, 'height', v); set(shape.id, 'heightMode', 'fixed'); }}
           onMode={m => set(shape.id, 'heightMode', m)} />
+        <button style={alStyles.mmToggle} title="Min/max size" onClick={() => setMmOpen(o => !o)}>
+          {mmOpen ? '−' : '+'}
+        </button>
       </Row>
 
-      {/* Row 3: 3×3 alignment grid + gap icon + spacing input + mode dropdown */}
+      {/* Min/Max clamps — collapsed by default (Figma-style); auto-open when any is set. */}
+      {mmOpen && <MinMaxRows shape={shape} set={set} />}
+
+      {/* Row 3: 3×3 alignment grid + gap field — gap gets the full remaining row so it's
+          comfortably readable (previously squeezed next to the distribution dropdown too). */}
       <Row>
         <AlignmentGrid
           direction={al.direction === 'horizontal' || al.direction === 'wrap' ? 'horizontal' : 'vertical'}
@@ -991,21 +1122,27 @@ function AutoLayoutSection({ shape, set, setAll }: {
           distributed={distributed}
           onChange={(primary, cross) => updateAL({ justifyContent: primary, alignItems: cross })}
         />
-        <div style={{ display: 'flex', alignItems: 'center', gap: 4, flex: 1, minWidth: 0 }}>
-          <div style={{ flex: 1, minWidth: 0 }}>
-            <NumInput icon="gap" label="Spacing between items" value={al.spacing} min={0}
-              onChange={v => updateAL({ spacing: v })} />
-          </div>
-          <select style={{ ...pStyles.select, flex: 'none', width: 76 }}
-            value={distributed ? 'space-between' : 'packed'} title="Distribution"
-            onChange={e => {
-              if (e.target.value === 'packed') updateAL({ justifyContent: 'start' });
-              else updateAL({ justifyContent: 'space-between' });
-            }}>
-            <option value="packed">Packed</option>
-            <option value="space-between">Space between</option>
-          </select>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <GapInput value={al.spacing} disabled={distributed}
+            onChange={v => updateAL({ spacing: v })} />
         </div>
+      </Row>
+
+      {/* Row 3b: distribution mode — own row so its full label text ("Space between", …)
+          never truncates. Packed + a fixed gap = fixed spacing; any other mode auto-
+          distributes and disables the gap field above (same as Figma). */}
+      <Row>
+        <select style={{ ...pStyles.select, flex: 1 }}
+          value={distributed ? al.justifyContent : 'packed'} title="Distribution"
+          onChange={e => {
+            const v = e.target.value;
+            updateAL({ justifyContent: v === 'packed' ? 'start' : (v as typeof al.justifyContent) });
+          }}>
+          <option value="packed">Packed</option>
+          <option value="space-between">Space between</option>
+          <option value="space-around">Space around</option>
+          <option value="space-evenly">Space evenly</option>
+        </select>
       </Row>
 
       {/* Row 4: Padding — linked (H + V) or expanded (4 values) */}
@@ -1018,7 +1155,7 @@ function AutoLayoutSection({ shape, set, setAll }: {
           <Row>
             <NumInput icon="align-bottom" label="Padding bottom" value={al.padding.bottom} min={0} onChange={v => updatePadding({ bottom: v })} />
             <NumInput icon="align-left"   label="Padding left"   value={al.padding.left}   min={0} onChange={v => updatePadding({ left: v })} />
-            <button title="Collapse padding" style={{ ...segBtnStyle(false), width: 30, height: 30, flex: 'none' }}
+            <button title="Collapse padding" style={alStyles.mmToggle}
               onClick={() => setPadExpanded(false)}>
               <Icon name="minus" size={13} />
             </button>
@@ -1034,14 +1171,39 @@ function AutoLayoutSection({ shape, set, setAll }: {
             <NumInput icon="pad-v" label="Vertical padding" value={Math.round(vPad)} min={0}
               onChange={v => updatePadding({ top: v, bottom: v })} />
           </div>
-          <button title="Separate padding per side" style={{ ...segBtnStyle(false), width: 30, height: 30, flex: 'none' }}
+          <button title="Separate padding per side" style={alStyles.mmToggle}
             onClick={() => setPadExpanded(true)}>
             <Icon name="plus" size={13} />
           </button>
         </Row>
       )}
 
-      {/* Row 5: Clip content checkbox */}
+      {/* Grid only: number of equal columns. */}
+      {al.direction === 'grid' && (
+        <Row>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <NumInput icon="grid" label="Columns" value={al.columns ?? 2} min={1}
+              onChange={v => updateAL({ columns: Math.max(1, Math.round(v)) })} />
+          </div>
+        </Row>
+      )}
+
+      {/* Wrap only: how rows are distributed on the cross axis. */}
+      {al.direction === 'wrap' && (
+        <Row>
+          <span style={pStyles.fieldLabel}>Rows</span>
+          <select style={{ ...pStyles.select, flex: 1 }}
+            value={al.alignContent ?? 'start'} title="Row alignment (cross axis)"
+            onChange={e => updateAL({ alignContent: e.target.value as NonNullable<typeof al.alignContent> })}>
+            <option value="start">Top</option>
+            <option value="center">Center</option>
+            <option value="end">Bottom</option>
+            <option value="space-between">Space between</option>
+          </select>
+        </Row>
+      )}
+
+      {/* Row 5: Clip content + stroke-in-layout checkboxes */}
       <div style={alStyles.checkRow}>
         <input
           type="checkbox"
@@ -1052,21 +1214,41 @@ function AutoLayoutSection({ shape, set, setAll }: {
         />
         <label htmlFor={`clip-${shape.id}`} style={alStyles.checkLabel}>Clip content</label>
       </div>
+      <div style={alStyles.checkRow}>
+        <input
+          type="checkbox"
+          id={`stroke-lay-${shape.id}`}
+          checked={!!al.strokeInLayout}
+          onChange={e => updateAL({ strokeInLayout: e.target.checked })}
+          style={{ margin: 0, cursor: 'pointer' }}
+        />
+        <label htmlFor={`stroke-lay-${shape.id}`} style={alStyles.checkLabel}>Include stroke in layout</label>
+      </div>
     </Section>
   );
 }
 
 const alStyles: Record<string, React.CSSProperties> = {
-  dimLabel: { color: 'var(--text-secondary)', fontSize: 11, flexShrink: 0 },
-  dimInput: { flex: 1, minWidth: 0 },
-  // One compact W/H field: letter + number/mode + slim mode dropdown.
+  // One compact W/H field: letter + pill (number / mode word) + slim chevron menu.
   dimField: { display: 'flex', alignItems: 'center', gap: 6, flex: 1, minWidth: 0 },
   dimLetter: { color: 'var(--text-muted)', fontSize: 11, flexShrink: 0, width: 10, textAlign: 'center' },
-  modeSelect: {
-    flex: 'none', width: 56, minWidth: 0,
-    background: 'var(--bg-inset)', border: '1px solid var(--border)',
-    borderRadius: 7, color: 'var(--text)', fontSize: 11, padding: '0 4px',
-    outline: 'none', cursor: 'pointer', height: 30,
+  dimDerived: {
+    flex: 1, minWidth: 0, display: 'flex', alignItems: 'center', gap: 4,
+    height: 30, background: 'var(--bg-inset)', border: '1px solid transparent', borderRadius: 7,
+    color: 'var(--text-secondary)', fontSize: 12, padding: '0 9px',
+    overflow: 'hidden', whiteSpace: 'nowrap', fontVariantNumeric: 'tabular-nums',
+  },
+  chevWrap: { position: 'relative', width: 20, height: 28, flexShrink: 0 },
+  chev: {
+    position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center',
+    color: 'var(--text-secondary)', fontSize: 9, pointerEvents: 'none',
+  },
+  chevSelect: { position: 'absolute', inset: 0, opacity: 0, cursor: 'pointer', width: '100%', height: '100%' },
+  // Bare inline toggle (min/max, padding expand) — glyph only, consistent with iconAction.
+  mmToggle: {
+    width: 24, height: 24, flexShrink: 0, display: 'flex', alignItems: 'center', justifyContent: 'center',
+    background: 'transparent', border: 'none', padding: 0, borderRadius: 6,
+    color: 'var(--text-secondary)', cursor: 'pointer', fontSize: 12,
   },
   checkRow: {
     display: 'flex', alignItems: 'center', gap: 8, marginTop: 2,
@@ -1077,12 +1259,49 @@ const alStyles: Record<string, React.CSSProperties> = {
   },
 };
 
-function ChildSizingSection({ shape, set }: { shape: Shape; set: (id: string, attr: string, val: unknown) => void }) {
+// Sizing for a multi-selection of auto-layout children. Applies one mode to all selected
+// shapes; shows "Mixed" when they currently differ.
+function MultiSizingSection({ shapes, setAll }: { shapes: Shape[]; setAll: (attr: string, val: unknown) => void }) {
+  const common = (key: 'widthMode' | 'heightMode') => {
+    const vals = new Set(shapes.map(s => s[key] ?? 'fixed'));
+    return vals.size === 1 ? [...vals][0] : '';
+  };
+  const wv = common('widthMode');
+  const hv = common('heightMode');
   return (
     <Section label="Sizing">
       <Row>
         <span style={pStyles.fieldLabel}>W</span>
-        <select style={{ ...pStyles.select, flex: 1 }}
+        <select style={{ ...pStyles.select, flex: 1 }} value={wv}
+          onChange={e => setAll('widthMode', e.target.value as SizingMode)}>
+          {wv === '' && <option value="" disabled>Mixed</option>}
+          <option value="hug">Hug contents</option>
+          <option value="fill">Fill container</option>
+          <option value="fixed">Fixed</option>
+        </select>
+        <span style={pStyles.fieldLabel}>H</span>
+        <select style={{ ...pStyles.select, flex: 1 }} value={hv}
+          onChange={e => setAll('heightMode', e.target.value as SizingMode)}>
+          {hv === '' && <option value="" disabled>Mixed</option>}
+          <option value="hug">Hug contents</option>
+          <option value="fill">Fill container</option>
+          <option value="fixed">Fixed</option>
+        </select>
+      </Row>
+    </Section>
+  );
+}
+
+function ChildSizingSection({ shape, set }: { shape: Shape; set: (id: string, attr: string, val: unknown) => void }) {
+  const abs = shape.layoutPositioning === 'absolute';
+  // Min/Max tucked away by default (Figma-style) — auto-open when any bound is set.
+  const hasMM = shape.minWidth != null || shape.maxWidth != null || shape.minHeight != null || shape.maxHeight != null;
+  const [mmOpen, setMmOpen] = useState(hasMM);
+  return (
+    <Section label="Sizing">
+      <Row>
+        <span style={pStyles.fieldLabel}>W</span>
+        <select style={{ ...pStyles.select, flex: 1 }} disabled={abs}
           value={shape.widthMode ?? 'fixed'}
           onChange={e => set(shape.id, 'widthMode', e.target.value as SizingMode)}>
           <option value="hug">Hug contents</option>
@@ -1090,17 +1309,60 @@ function ChildSizingSection({ shape, set }: { shape: Shape; set: (id: string, at
           <option value="fixed">Fixed width</option>
         </select>
         <span style={pStyles.fieldLabel}>H</span>
-        <select style={{ ...pStyles.select, flex: 1 }}
+        <select style={{ ...pStyles.select, flex: 1 }} disabled={abs}
           value={shape.heightMode ?? 'fixed'}
           onChange={e => set(shape.id, 'heightMode', e.target.value as SizingMode)}>
           <option value="hug">Hug contents</option>
           <option value="fill">Fill container</option>
           <option value="fixed">Fixed height</option>
         </select>
+        {!abs && (
+          <button style={alStyles.mmToggle} title="Min/max size" onClick={() => setMmOpen(o => !o)}>
+            {mmOpen ? '−' : '+'}
+          </button>
+        )}
       </Row>
+      {!abs && mmOpen && <MinMaxRows shape={shape} set={set} />}
+      <div style={alStyles.checkRow}>
+        <input type="checkbox" id={`abs-${shape.id}`} checked={abs}
+          onChange={e => set(shape.id, 'layoutPositioning', e.target.checked ? 'absolute' : 'auto')}
+          style={{ margin: 0, cursor: 'pointer' }} />
+        <label htmlFor={`abs-${shape.id}`} style={alStyles.checkLabel}>Absolute position (ignore auto layout)</label>
+      </div>
     </Section>
   );
 }
+
+// Compact Min/Max width & height inputs. Empty / 0 clears the bound (unbounded).
+function MinMaxRows({ shape, set }: { shape: Shape; set: (id: string, attr: string, val: unknown) => void }) {
+  type MMKey = 'minWidth' | 'maxWidth' | 'minHeight' | 'maxHeight';
+  const setNum = (attr: MMKey, raw: string) => {
+    const v = parseFloat(raw);
+    set(shape.id, attr, Number.isFinite(v) && v > 0 ? v : undefined);
+  };
+  const cell = (label: string, attr: MMKey) => (
+    <div style={mmStyles.cell}>
+      <span style={mmStyles.label}>{label}</span>
+      <input type="number" min={0} placeholder="–" style={mmStyles.input}
+        value={shape[attr] ?? ''} onChange={e => setNum(attr, e.target.value)} />
+    </div>
+  );
+  return (
+    <>
+      <Row>{cell('Min W', 'minWidth')}{cell('Max W', 'maxWidth')}</Row>
+      <Row>{cell('Min H', 'minHeight')}{cell('Max H', 'maxHeight')}</Row>
+    </>
+  );
+}
+
+const mmStyles: Record<string, React.CSSProperties> = {
+  cell: { display: 'flex', alignItems: 'center', gap: 6, flex: 1, minWidth: 0 },
+  label: { color: 'var(--text-muted)', fontSize: 11, flexShrink: 0, width: 34 },
+  input: {
+    flex: 1, minWidth: 0, background: 'var(--bg-inset)', border: '1px solid var(--border)',
+    borderRadius: 7, color: 'var(--text)', fontSize: 12, padding: '0 8px', outline: 'none', height: 30,
+  },
+};
 
 // ── AppearanceSection ─────────────────────────────────────────────────────────
 // Shown for frame and rect shapes: opacity, stroke weight + align, corner radius.
@@ -1273,22 +1535,6 @@ const alignGridStyles: Record<string, React.CSSProperties> = {
 
 // ── TypographySection ─────────────────────────────────────────────────────────
 
-// Curated, render-safe font stacks (system + web-safe). Picking one actually applies.
-const FONTS: { name: string; stack: string }[] = [
-  { name: 'System UI', stack: 'system-ui, -apple-system, sans-serif' },
-  { name: 'Inter', stack: 'Inter, system-ui, sans-serif' },
-  { name: 'Helvetica', stack: 'Helvetica, Arial, sans-serif' },
-  { name: 'Arial', stack: 'Arial, Helvetica, sans-serif' },
-  { name: 'Verdana', stack: 'Verdana, Geneva, sans-serif' },
-  { name: 'Tahoma', stack: 'Tahoma, sans-serif' },
-  { name: 'Trebuchet MS', stack: '"Trebuchet MS", sans-serif' },
-  { name: 'Georgia', stack: 'Georgia, serif' },
-  { name: 'Times New Roman', stack: '"Times New Roman", Times, serif' },
-  { name: 'Garamond', stack: 'Garamond, serif' },
-  { name: 'Courier New', stack: '"Courier New", monospace' },
-  { name: 'Menlo', stack: 'Menlo, Monaco, monospace' },
-];
-
 const WEIGHTS: { v: number; label: string }[] = [
   { v: 100, label: 'Thin' }, { v: 300, label: 'Light' }, { v: 400, label: 'Regular' },
   { v: 500, label: 'Medium' }, { v: 600, label: 'Semibold' }, { v: 700, label: 'Bold' },
@@ -1313,9 +1559,6 @@ function TypographySection({ shape, set, emit }: {
     if (shape.textAutoWidth) ops.push({ op: 'set', id: shape.id, attr: 'width', val: fitted.width });
     emit(ops);
   };
-  // Match the current family against the known list (compare first family token)
-  const currentFamily = FONTS.find(f => f.stack.split(',')[0].trim().toLowerCase() === ts.fontFamily.split(',')[0].trim().toLowerCase())?.stack ?? ts.fontFamily;
-
   const align = shape.paragraphs?.[0]?.align ?? 'left';
   const setAlign = (a: 'left' | 'center' | 'right' | 'justify') => {
     const paras = (shape.paragraphs ?? [{ spans: [{ text: '' }] }]).map(p => ({ ...p, align: a }));
@@ -1326,14 +1569,7 @@ function TypographySection({ shape, set, emit }: {
     <Section label="Typography">
       {/* Font family — full width, no label (Figma style) */}
       <Row>
-        <select
-          style={{ ...pStyles.select, flex: 1 }}
-          value={currentFamily}
-          onChange={e => updateTs({ fontFamily: e.target.value })}
-        >
-          {!FONTS.some(f => f.stack === currentFamily) && <option value={currentFamily}>{currentFamily.split(',')[0]}</option>}
-          {FONTS.map(f => <option key={f.name} value={f.stack} style={{ fontFamily: f.stack }}>{f.name}</option>)}
-        </select>
+        <FontPicker value={ts.fontFamily} onChange={fontFamily => updateTs({ fontFamily })} />
       </Row>
       {/* Weight (wide) + Size (narrow) — no labels */}
       <Row>
@@ -1342,7 +1578,7 @@ function TypographySection({ shape, set, emit }: {
           {WEIGHTS.map(w => <option key={w.v} value={w.v}>{w.label}</option>)}
         </select>
         <div style={{ flex: 1 }}>
-          <NumInput label="" value={ts.fontSize} min={1} onChange={v => updateTs({ fontSize: v })} />
+          <NumInput icon="text" label="Font size" value={ts.fontSize} min={1} onChange={v => updateTs({ fontSize: v })} />
         </div>
       </Row>
       {/* Line height + Letter spacing — icons (hover for full name) */}
@@ -1671,14 +1907,17 @@ const pStyles: Record<string, React.CSSProperties> = {
   modeActive: {
     color: 'var(--text)',
     background: 'var(--bg-elevated)',
-    borderColor: 'var(--border-strong)',
+    // Full shorthand (not borderColor) — mixing shorthand + longhand across rerenders
+    // triggers React's conflicting-style warning when the tab toggles.
+    border: '1px solid var(--border-strong)',
   },
   scroll: { flex: 1, overflowY: 'auto', paddingBottom: 18 },
-  section: { padding: '16px 16px', borderTop: '1px solid var(--border)' },
+  // Tight vertical rhythm (Figma density): slim padding; empty sections are one short row.
+  section: { padding: '9px 14px', borderTop: '1px solid var(--border)' },
   sectionHeader: {
     fontSize: 11, fontWeight: 700, color: 'var(--text-secondary)',
-    letterSpacing: '0.02em',
-    marginBottom: 12, display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+    letterSpacing: '0.02em', minHeight: 24,
+    display: 'flex', justifyContent: 'space-between', alignItems: 'center',
   },
   fieldGrid: {
     display: 'grid',
@@ -1702,15 +1941,6 @@ const pStyles: Record<string, React.CSSProperties> = {
     padding: '5px 7px', minWidth: 0,
   },
   empty: { padding: 14, color: 'var(--text-secondary)', fontSize: 12 },
-  empty2: {
-    color: 'var(--text-muted)', fontSize: 12, padding: '8px 10px',
-    background: 'var(--bg-inset)', border: '1px solid var(--border)', borderRadius: 7,
-  },
-  addInline: {
-    display: 'flex', alignItems: 'center', gap: 5,
-    background: 'transparent', border: 'none', cursor: 'pointer',
-    color: 'var(--text-muted)', fontSize: 12, padding: '4px 2px', fontFamily: 'inherit',
-  },
   segGroup: { display: 'flex', gap: 3, flex: 1, background: 'var(--bg-inset)', borderRadius: 8, padding: 3 },
   effectRow: { display: 'flex', alignItems: 'center', gap: 8, padding: '3px 0' },
   effectGlyph: {
@@ -1730,9 +1960,11 @@ const pStyles: Record<string, React.CSSProperties> = {
     color: 'var(--text-secondary)', cursor: 'pointer',
     display: 'flex', alignItems: 'center', justifyContent: 'center',
   },
+  // Bare icon action (section header + / − / etc.): no box chrome — just the glyph,
+  // with a 24px hit area. Hover tint comes from the global button:hover brightness.
   iconAction: {
-    width: 28, height: 28, borderRadius: 7,
-    background: 'var(--bg-elevated)', border: '1px solid var(--border)',
+    width: 24, height: 24, borderRadius: 6,
+    background: 'transparent', border: 'none', padding: 0,
     color: 'var(--text-secondary)', cursor: 'pointer',
     display: 'flex', alignItems: 'center', justifyContent: 'center',
   },
@@ -1752,10 +1984,6 @@ const pStyles: Record<string, React.CSSProperties> = {
     background: 'var(--bg-inset)', border: '1px solid var(--border)',
     borderRadius: 7, color: 'var(--text)', fontSize: 12, padding: '0 8px',
     outline: 'none', cursor: 'pointer', height: 30,
-  },
-  alignBtn: {
-    background: 'var(--bg-elevated)', border: '1px solid var(--border)', borderRadius: 6,
-    color: 'var(--text)', fontSize: 11, cursor: 'pointer', padding: '5px 8px',
   },
   alignIconBtn: {
     background: 'var(--bg-inset)', border: '1px solid var(--border)', borderRadius: 6,

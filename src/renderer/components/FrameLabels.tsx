@@ -107,6 +107,9 @@ export default function FrameLabels({ viewport, onDragChange }: Props) {
     const origY = f.y;
     const { zoom: z } = viewport;
     const labelEl = e.currentTarget as HTMLElement; // the dragged label — moved imperatively
+    // The label carries a rotation/offset transform — prepend the drag translation to it
+    // instead of replacing it, so a rotated frame's label doesn't snap flat mid-drag.
+    const baseTransform = labelEl.style.transform;
     lastDeltaRef.current = null;
 
     // Set preview for all descendants so the canvas draws them at offset positions too.
@@ -123,7 +126,7 @@ export default function FrameLabels({ viewport, onDragChange }: Props) {
       lastDeltaRef.current = { dx, dy };
       // Move the label by the same screen delta the canvas uses — same mouse event, no
       // setState, so it stays locked to the frame instead of trailing it.
-      labelEl.style.transform = `translate(${dx * z}px, ${dy * z}px)`;
+      labelEl.style.transform = `translate(${dx * z}px, ${dy * z}px) ${baseTransform}`;
       for (const id of allIds) {
         const orig = originals[id];
         if (orig) externalDragPreview.set(id, { x: orig.x + dx, y: orig.y + dy });
@@ -136,18 +139,15 @@ export default function FrameLabels({ viewport, onDragChange }: Props) {
       const ld = lastDeltaRef.current;
       lastDeltaRef.current = null;
       for (const id of allIds) externalDragPreview.delete(id);
-      labelEl.style.transform = '';
+      labelEl.style.transform = baseTransform;
       onDragChange?.(false);
       if (!ld || (Math.abs(ld.dx) < 1 && Math.abs(ld.dy) < 1)) return;
-      const ops: { op: 'set' | 'move'; id: string; attr?: string; val?: unknown; parentId?: string | null; index?: number }[] =
-        allIds.flatMap(id => {
-          const orig = originals[id];
-          if (!orig) return [];
-          return [
-            { op: 'set' as const, id, attr: 'x', val: Math.round(orig.x + ld.dx) },
-            { op: 'set' as const, id, attr: 'y', val: Math.round(orig.y + ld.dy) },
-          ];
-        });
+      // Commit only the frame's own x/y — the engine's rigid-body cascade translates the
+      // whole subtree (explicit descendant ops here would be applied twice).
+      const ops: { op: 'set' | 'move'; id: string; attr?: string; val?: unknown; parentId?: string | null; index?: number }[] = [
+        { op: 'set' as const, id: f.id, attr: 'x', val: Math.round(origX + ld.dx) },
+        { op: 'set' as const, id: f.id, attr: 'y', val: Math.round(origY + ld.dy) },
+      ];
 
       // Re-parent the dragged frame into whatever frame its new center lands over (or the
       // page root on empty canvas). Coords stay absolute, so position is preserved.
@@ -172,9 +172,24 @@ export default function FrameLabels({ viewport, onDragChange }: Props) {
   return (
     <div style={{ position: 'absolute', inset: 0, pointerEvents: 'none', zIndex: 16, overflow: 'hidden' }}>
       {frames.map(f => {
-        const left = f.x * zoom + panX;
-        const top = f.y * zoom + panY - 22;
         const selected = selectedIds.has(f.id);
+        // Anchor the label to the frame's (possibly rotated) top-left corner and rotate it
+        // with the frame, so it stays glued to the top edge like Figma.
+        const rot = f.rotation || 0;
+        let cornerX = f.x, cornerY = f.y;
+        if (rot) {
+          const rad = (rot * Math.PI) / 180, cos = Math.cos(rad), sin = Math.sin(rad);
+          const cxd = f.x + f.width / 2, cyd = f.y + f.height / 2;
+          cornerX = cxd + (f.x - cxd) * cos - (f.y - cyd) * sin;
+          cornerY = cyd + (f.x - cxd) * sin + (f.y - cyd) * cos;
+        }
+        const left = cornerX * zoom + panX;
+        const top = cornerY * zoom + panY;
+        // One transform for every angle: rotate FIRST so the upward offset is applied in
+        // the label's local (rotated) frame — the gap above the frame's top edge then
+        // stays a constant 8px at any rotation. (translate-before-rotate composes the
+        // offset in screen axes instead, which made the gap drift with the angle.)
+        const labelTransform = `rotate(${rot}deg) translateY(calc(-100% - 8px))`;
 
         if (editingId === f.id) {
           return (
@@ -191,7 +206,10 @@ export default function FrameLabels({ viewport, onDragChange }: Props) {
                 e.stopPropagation();
                 if (e.key === 'Enter' || e.key === 'Escape') { e.preventDefault(); finish(f.id, true); }
               }}
-              style={renameInputStyle(left, top)}
+              // Same anchor + transform as the static label so entering rename swaps
+              // text→input in place (above the frame's top-left corner) instead of the
+              // input dropping down onto the canvas.
+              style={renameInputStyle(left, top, labelTransform)}
             />
           );
         }
@@ -210,6 +228,9 @@ export default function FrameLabels({ viewport, onDragChange }: Props) {
               color: selected ? 'var(--accent)' : 'var(--text-secondary)',
               whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
               padding: '0 2px',
+              transform: labelTransform,
+              // Rotation pivots on the anchor point itself (the frame's rotated corner).
+              transformOrigin: 'left top',
             }}
           >
             {f.name}
@@ -220,9 +241,16 @@ export default function FrameLabels({ viewport, onDragChange }: Props) {
   );
 }
 
-function renameInputStyle(left: number, top: number): React.CSSProperties {
+function renameInputStyle(left: number, top: number, transform: string): React.CSSProperties {
   return {
     position: 'absolute', left, top,
+    // Match the static label's anchoring EXACTLY (same transform + origin) so rename
+    // swaps in place: anchored at the frame's top-left corner, lifted above the top edge
+    // by translateY(calc(-100% - 8px)), rotating around the same corner. Both use -100%
+    // of their own height, so each sits 8px above the corner and the input never drops
+    // onto the canvas.
+    transform,
+    transformOrigin: 'left top',
     pointerEvents: 'all',
     font: '600 11px system-ui, sans-serif',
     color: 'var(--text)',

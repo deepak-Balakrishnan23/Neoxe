@@ -1,6 +1,7 @@
 import { Shape, Page, Fill, GradientStop, TextStyle, TextParagraph, DesignFile } from '../../shared/types';
 import { canvasColors as CC } from '../theme';
 import { wrapLines } from './textLayout';
+import { ensureFontLoaded } from './fontLoader';
 
 // Module-level editing id — set per render frame so drawText can see it without
 // threading the value through every function signature.
@@ -13,6 +14,42 @@ let _overlayHiddenIds: Set<string> = new Set();
 // External drag preview — written by FrameLabels during label-initiated drag, read on
 // every rAF tick by draw(). Keyed by shape id; values override the stored position.
 export const externalDragPreview: Map<string, ShapePreview> = new Map();
+
+// Visible document rect for viewport culling — set per render frame by renderPage.
+// Shapes whose (rotated, effect-padded) AABB misses this rect are skipped, so a frame's
+// cost scales with what's on screen instead of the whole document. Derived from device-px
+// canvas dims, so in the app it's ~dpr× larger than the true viewport — conservative:
+// never wrongly culls, and exports (exact-size canvas, no DPR transform) stay exact.
+let _cullRect: { x: number; y: number; w: number; h: number } | null = null;
+
+function isOffscreen(shape: Shape): boolean {
+  const r = _cullRect;
+  if (!r) return false;
+  // Pad by everything that can paint outside the shape's box.
+  let pad = 0;
+  for (const s of shape.shadows) {
+    if (!s.hidden) pad = Math.max(pad, Math.abs(s.offsetX) + s.blur + (s.spread ?? 0), Math.abs(s.offsetY) + s.blur + (s.spread ?? 0));
+  }
+  for (const st of shape.strokes) pad = Math.max(pad, st.width);
+  if (shape.blur && !shape.blur.hidden) pad = Math.max(pad, shape.blur.value * 2);
+  // Rotated AABB half-extents about the shape's center.
+  const cx = shape.x + shape.width / 2, cy = shape.y + shape.height / 2;
+  let hw = shape.width / 2, hh = shape.height / 2;
+  if (shape.rotation) {
+    const rad = (shape.rotation * Math.PI) / 180;
+    const cos = Math.abs(Math.cos(rad)), sin = Math.abs(Math.sin(rad));
+    [hw, hh] = [hw * cos + hh * sin, hw * sin + hh * cos];
+  }
+  hw += pad; hh += pad;
+  return cx + hw < r.x || cx - hw > r.x + r.w || cy + hh < r.y || cy - hh > r.y + r.h;
+}
+
+// A shape can be skipped wholesale only when nothing outside its own box depends on it:
+// leaves always; clipping frames (children can't escape the clip). Groups and non-clipping
+// frames still recurse so each child gets its own cull test.
+function canCullSubtree(shape: Shape): boolean {
+  return shape.childIds.length === 0 || (shape.type === 'frame' && shape.clipContent);
+}
 
 export interface Viewport {
   x: number;      // canvas-space translation
@@ -67,9 +104,11 @@ export function renderPage(
   _overlayHiddenIds = hiddenOverlayIds ?? new Set();
   const { width, height } = ctx.canvas;
 
-  ctx.clearRect(0, 0, width, height);
-
-  if (!skipBackground) {
+  // Opaque background fill already overwrites the whole canvas, so clearRect is only needed
+  // for the transparent (export) path.
+  if (skipBackground) {
+    ctx.clearRect(0, 0, width, height);
+  } else {
     ctx.fillStyle = page.background || CC.backdrop;
     ctx.fillRect(0, 0, width, height);
   }
@@ -77,6 +116,14 @@ export function renderPage(
   ctx.save();
   ctx.translate(viewport.x, viewport.y);
   ctx.scale(viewport.zoom, viewport.zoom);
+
+  // Visible doc rect (device-px dims → conservative in the app, exact for exports).
+  _cullRect = {
+    x: -viewport.x / viewport.zoom,
+    y: -viewport.y / viewport.zoom,
+    w: width / viewport.zoom,
+    h: height / viewport.zoom,
+  };
 
   // Draw root shapes in order (with preview overrides + instance resolution)
   for (const id of page.childIds) {
@@ -105,6 +152,7 @@ export function renderPage(
 
   _editingTextId = null;
   _overlayHiddenIds = new Set();
+  _cullRect = null;
 }
 
 function drawShape(
@@ -115,6 +163,10 @@ function drawShape(
   preview?: Map<string, ShapePreview>,
   file?: DesignFile,
 ) {
+  // Viewport culling: skip everything the viewport can't see. Groups/non-clipping
+  // frames fall through even when their own box is off-screen — their children carry
+  // absolute coords and are culled individually on recursion.
+  if (isOffscreen(shape) && canCullSubtree(shape)) return;
   ctx.save();
   ctx.globalAlpha = shape.opacity;
   ctx.globalCompositeOperation = blendModeToComposite(shape.blendMode);
@@ -187,13 +239,20 @@ function drawRect(
   const { width, height } = shape;
   const radii = shape.cornerRadii ?? undefined;
 
-  applyFills(ctx, shape.fills, 0, 0, width, height, radii);
-
-  for (const stroke of shape.strokes) {
-    applyStroke(ctx, stroke, 0, 0, width, height, 'rect', radii);
+  // A non-clipping frame reaches here with its own box off-screen (children may still be
+  // visible) — skip its fill/stroke, which can't be seen, and only recurse.
+  if (!isOffscreen(shape)) {
+    applyFills(ctx, shape.fills, 0, 0, width, height, radii);
+    for (const stroke of shape.strokes) {
+      applyStroke(ctx, stroke, 0, 0, width, height, 'rect', radii);
+    }
   }
 
-  // Draw frame children — children use absolute document coords, so undo the frame's translation
+  // Draw frame children. FLAT coordinate model: children carry absolute document coords
+  // and their OWN rotation (a parent rotation is baked into each child by the engine's
+  // rotation cascade). So escape this frame's full local transform — translation AND
+  // rotation — before drawing them; staying inside the parent's rotation would rotate
+  // them twice. (The clip path above intentionally stays in the frame's rotated space.)
   const drawChildren = () => {
     for (const childId of shape.childIds) {
       let child = page.objects[childId];
@@ -201,7 +260,10 @@ function drawRect(
       if (preview?.has(childId)) child = { ...child, ...preview.get(childId) };
       if (file && child.masterId) child = resolveInstance(child, file);
       ctx.save();
-      ctx.translate(-shape.x, -shape.y);
+      // Inverse of drawShape's translate(cx,cy)·rotate(θ)·translate(-w/2,-h/2).
+      ctx.translate(shape.width / 2, shape.height / 2);
+      if (shape.rotation) ctx.rotate((-shape.rotation * Math.PI) / 180);
+      ctx.translate(-(shape.x + shape.width / 2), -(shape.y + shape.height / 2));
       drawShape(ctx, child, page, images, preview, file);
       ctx.restore();
     }
@@ -279,14 +341,17 @@ function drawText(ctx: CanvasRenderingContext2D, shape: Shape) {
     // single span; per-span overrides only affect color/transform, applied below).
     const span = para.spans[0] ?? { text: '' };
     const s: TextStyle = { ...style, ...(span.style ?? {}) };
+    // Kick off loading for not-yet-available fonts; when one arrives, the canvas
+    // redraws via FONT_LOADED_EVENT (see Canvas.tsx) instead of staying on fallback.
+    ensureFontLoaded(s.fontFamily, s.fontWeight);
     ctx.font = `${s.fontWeight} ${s.fontSize}px ${s.fontFamily}`;
     ctx.fillStyle = s.color;
-    ctx.letterSpacing = `${s.letterSpacing}px`;
+    ctx.letterSpacing = `${s.letterSpacing ?? 0}px`;
 
     let text = para.spans.map(sp => sp.text).join('');
     if (s.textTransform === 'uppercase') text = text.toUpperCase();
     else if (s.textTransform === 'lowercase') text = text.toLowerCase();
-    else if (s.textTransform === 'capitalize') text = text.replace(/\b\w/g, c => c.toUpperCase());
+    else if (s.textTransform === 'capitalize') text = text.replace(/(^|\s)(\p{L})/gu, (_m, sp, ch) => sp + ch.toUpperCase());
 
     const lineH = s.fontSize * s.lineHeight;
     const ax = anchorX(para.align);
@@ -352,6 +417,18 @@ function drawImage(
 // SVG nodes: cache HTMLImageElement by shape id to avoid re-creating per frame.
 const svgImageCache = new Map<string, HTMLImageElement>();
 
+// Fired when a lazily-rasterized SVG/vector image finishes decoding. Canvas listens and
+// requests one repaint — otherwise a freshly-cached image (first draw, or after
+// invalidateSvgCache) draws blank until some unrelated repaint happens, which is why an
+// imported SVG could "vanish" until the next click.
+export const SVG_DECODED_EVENT = 'neouxe:svg-decoded';
+function newSvgImage(markup: string): HTMLImageElement {
+  const img = new Image();
+  img.onload = () => { try { window.dispatchEvent(new Event(SVG_DECODED_EVENT)); } catch { /* SSR/no window */ } };
+  img.src = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(markup);
+  return img;
+}
+
 export function invalidateSvgCache(id: string) {
   svgImageCache.delete(id);
 }
@@ -360,9 +437,7 @@ function drawSVG(ctx: CanvasRenderingContext2D, shape: Shape) {
   if (!shape.svgContent) return;
   let img = svgImageCache.get(shape.id);
   if (!img) {
-    img = new Image();
-    const url = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(shape.svgContent);
-    img.src = url;
+    img = newSvgImage(shape.svgContent);
     svgImageCache.set(shape.id, img);
   }
   if (img.complete && img.naturalWidth > 0) {
@@ -383,8 +458,7 @@ function drawVector(ctx: CanvasRenderingContext2D, shape: Shape) {
   if (!markup) return;
   let img = svgImageCache.get(shape.id);
   if (!img) {
-    img = new Image();
-    img.src = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(markup);
+    img = newSvgImage(markup);
     svgImageCache.set(shape.id, img);
   }
   if (img.complete && img.naturalWidth > 0) {
@@ -446,7 +520,10 @@ function drawGroup(
     if (preview?.has(childId)) child = { ...child, ...preview.get(childId) };
     if (file && child.masterId) child = resolveInstance(child, file);
     ctx.save();
-    ctx.translate(-shape.x, -shape.y);
+    // Flat model: escape the group's full local transform (see drawRect.drawChildren).
+    ctx.translate(shape.width / 2, shape.height / 2);
+    if (shape.rotation) ctx.rotate((-shape.rotation * Math.PI) / 180);
+    ctx.translate(-(shape.x + shape.width / 2), -(shape.y + shape.height / 2));
     drawShape(ctx, child, page, images, preview, file);
     ctx.restore();
   }
@@ -570,55 +647,6 @@ function applyStroke(
   ctx.restore();
 }
 
-// Draws selection overlay in SCREEN space so handles are always 8px regardless of zoom
-function drawSelectionOverlay(ctx: CanvasRenderingContext2D, shape: Shape, viewport: Viewport) {
-  // Use live x/y/w/h (preview overrides these during drag; selrect is not updated mid-drag)
-  const sr = { x: shape.x, y: shape.y, width: shape.width, height: shape.height };
-
-  // Convert to screen coords
-  const sx = sr.x * viewport.zoom + viewport.x;
-  const sy = sr.y * viewport.zoom + viewport.y;
-  const sw = sr.width * viewport.zoom;
-  const sh = sr.height * viewport.zoom;
-
-  ctx.save();
-  ctx.strokeStyle = CC.accent;
-  ctx.lineWidth = 1.5;
-  ctx.setLineDash([]);
-  ctx.strokeRect(sx, sy, sw, sh);
-
-  // Rotate handle (line + circle above TC)
-  const tcx = sx + sw / 2;
-  const tcy = sy;
-  ctx.beginPath();
-  ctx.moveTo(tcx, tcy);
-  ctx.lineTo(tcx, tcy - 24);
-  ctx.strokeStyle = CC.accentLine;
-  ctx.lineWidth = 1;
-  ctx.stroke();
-
-  ctx.beginPath();
-  ctx.arc(tcx, tcy - 28, 5, 0, Math.PI * 2);
-  ctx.fillStyle = CC.handleFill;
-  ctx.fill();
-  ctx.strokeStyle = CC.accent;
-  ctx.lineWidth = 1.5;
-  ctx.stroke();
-
-  // 8 resize handles
-  const screenSelrect = { x: sx, y: sy, width: sw, height: sh };
-  const handles = getHandlePositions(screenSelrect);
-  for (const [hx, hy] of handles) {
-    ctx.fillStyle = CC.handleFill;
-    ctx.strokeStyle = CC.accent;
-    ctx.lineWidth = 1.5;
-    ctx.fillRect(hx - 4, hy - 4, 8, 8);
-    ctx.strokeRect(hx - 4, hy - 4, 8, 8);
-  }
-
-  ctx.restore();
-}
-
 export function getHandlePositions(r: { x: number; y: number; width: number; height: number }) {
   const { x, y, width: w, height: h } = r;
   return [
@@ -633,24 +661,25 @@ export function getHandlePositions(r: { x: number; y: number; width: number; hei
   ] as [number, number][];
 }
 
+// Hoisted to module scope — this was re-allocated once per shape per frame in the draw loop.
+const BLEND_COMPOSITE: Partial<Record<Shape['blendMode'], GlobalCompositeOperation>> = {
+  normal: 'source-over',
+  multiply: 'multiply',
+  screen: 'screen',
+  overlay: 'overlay',
+  darken: 'darken',
+  lighten: 'lighten',
+  'color-dodge': 'color-dodge',
+  'color-burn': 'color-burn',
+  'hard-light': 'hard-light',
+  'soft-light': 'soft-light',
+  difference: 'difference',
+  exclusion: 'exclusion',
+  hue: 'hue',
+  saturation: 'saturation',
+  color: 'color',
+  luminosity: 'luminosity',
+};
 function blendModeToComposite(mode: Shape['blendMode']): GlobalCompositeOperation {
-  const map: Partial<Record<Shape['blendMode'], GlobalCompositeOperation>> = {
-    normal: 'source-over',
-    multiply: 'multiply',
-    screen: 'screen',
-    overlay: 'overlay',
-    darken: 'darken',
-    lighten: 'lighten',
-    'color-dodge': 'color-dodge',
-    'color-burn': 'color-burn',
-    'hard-light': 'hard-light',
-    'soft-light': 'soft-light',
-    difference: 'difference',
-    exclusion: 'exclusion',
-    hue: 'hue',
-    saturation: 'saturation',
-    color: 'color',
-    luminosity: 'luminosity',
-  };
-  return map[mode] ?? 'source-over';
+  return BLEND_COMPOSITE[mode] ?? 'source-over';
 }

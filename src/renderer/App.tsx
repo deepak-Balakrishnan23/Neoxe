@@ -13,44 +13,46 @@ import { usePrefs } from './store/usePrefs';
 import { setThemeMode } from './theme';
 import { api } from './ipc/api';
 import { openDesignFile } from './io/fileIO';
-import { makeDefaultShape, Page, Shape } from '../shared/types';
 import {
-  scheduleAutosave, hasRecoverableSession, clearAutosave,
-  markSavePoint, addRecent, getRecents, RecentFile,
+  scheduleAutosave, flushAutosave, getRecoverableSessions, clearAutosave,
 } from './persistence';
 import { DesignFile } from '../shared/types';
 
 export default function App() {
   const {
-    setFile, file, setExportOpen, selectedIds, setSelectedIds, activePage, clearSelection,
-    initFirstTab, openNewTab, openFileInNewTab, saveTab, activeTabId, showToast,
+    setFile, file, setExportOpen, activePage,
+    openNewTab, openFileInNewTab, saveTab, activeTabId, tabs, showToast,
   } = useDesignStore();
   const { autosaveInterval, setPrefsOpen, theme, leftPanelCollapsed } = usePrefs();
-  const [recovery, setRecovery] = useState<DesignFile | null>(null);
+  const [recoverySessions, setRecoverySessions] = useState<DesignFile[]>([]);
   const bootstrapped = useRef(false);
-  const clipboard = useRef<{ rootIds: string[]; shapes: Shape[] } | null>(null);
 
   // ── Apply saved theme on load ──────────────────────────────────────────────
   useEffect(() => { setThemeMode(theme); }, [theme]);
 
-  // ── Bootstrap: check for crash recovery, else load sample ──────────────────
+  // ── Bootstrap: check for crash recovery only ───────────────────────────────
+  // No file is created on launch — `file` stays null so the landing page shows.
+  // The user enters the editor by creating, opening, or recovering a file.
   useEffect(() => {
     if (bootstrapped.current) return;
     bootstrapped.current = true;
-    const recoverable = hasRecoverableSession();
-    if (recoverable) {
-      setRecovery(recoverable.file);
-    }
-    // The launch document becomes the first tab.
-    api.newFile().then(res => {
-      if (res.ok && res.data) initFirstTab(res.data);
-    });
-  }, [initFirstTab]);
+    const sessions = getRecoverableSessions();
+    if (sessions.length > 0) setRecoverySessions(sessions.map(s => s.file));
+  }, []);
 
-  // ── Autosave on every file change ──────────────────────────────────────────
+  // ── Autosave EVERY dirty tab (not just the active one) ─────────────────────
+  // The active tab's live doc is `file`; inactive tabs' docs live in their parked session.
+  // Debounced, so a burst of edits collapses to one write once you pause. Save-points keep
+  // saved files out of recovery, so this never leaves a nagging banner behind.
   useEffect(() => {
-    if (file) scheduleAutosave(file, autosaveInterval);
-  }, [file, autosaveInterval]);
+    const dirtyFiles: DesignFile[] = [];
+    for (const t of tabs) {
+      if (!t.isDirty) continue;
+      const f = t.id === activeTabId ? file : t.session?.file ?? null;
+      if (f) dirtyFiles.push(f);
+    }
+    if (dirtyFiles.length > 0) scheduleAutosave(dirtyFiles, autosaveInterval);
+  }, [file, autosaveInterval, tabs, activeTabId]);
 
   // ── Global keyboard shortcuts ──────────────────────────────────────────────
   const onKeyDown = useCallback(async (e: KeyboardEvent) => {
@@ -78,7 +80,7 @@ export default function App() {
       if (activeTabId && isDirty) {
         const res = await saveTab(activeTabId);
         if (res.saved) {
-          if (file) { markSavePoint(file.id); addRecent(file); }
+          // saveTab handles persistence side-effects (save point + autosave clear).
           showToast(res.firstSave ? 'Saved' : 'Latest changes updated');
         }
       }
@@ -88,10 +90,7 @@ export default function App() {
       e.preventDefault();
       try {
         const opened = await openDesignFile();
-        if (opened) {
-          await openFileInNewTab(opened);
-          addRecent(opened);
-        }
+        if (opened) await openFileInNewTab(opened);
       } catch (err) {
         alert('Open failed: ' + (err as Error).message);
       }
@@ -108,70 +107,10 @@ export default function App() {
       return;
     }
 
-    // Shortcuts below need an active page + don't fire while typing
-    const typing = e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement;
-    if (typing) return;
-    const page = activePage();
-    if (!page) return;
-    const sel = [...selectedIds];
-
-    // ⌘A — select all root shapes
-    if (meta && e.key === 'a') {
-      e.preventDefault();
-      setSelectedIds(page.childIds.slice());
-      return;
-    }
-
-    // ⌘C / ⌘X — copy / cut selection to in-memory clipboard
-    if (meta && (e.key === 'c' || e.key === 'x') && sel.length) {
-      e.preventDefault();
-      const rootIds = topLevelSelection(page, sel);
-      clipboard.current = {
-        rootIds,
-        shapes: collectSubtree(page, rootIds).map(shape => structuredClone(shape)),
-      };
-      if (e.key === 'x') {
-        const res = await api.applyChanges({ pageId: page.id, ops: rootIds.map(id => ({ op: 'del' as const, id })) });
-        if (res.ok && res.data) { setFile(res.data); clearSelection(); }
-      }
-      return;
-    }
-
-    // ⌘V — paste clipboard (offset by 16px)
-    if (meta && e.key === 'v' && clipboard.current?.shapes.length) {
-      e.preventDefault();
-      const { ops, rootIds } = cloneShapesForInsert(page, clipboard.current.rootIds, clipboard.current.shapes, 16, 16);
-      const res = await api.applyChanges({ pageId: page.id, ops });
-      if (res.ok && res.data) { setFile(res.data); setSelectedIds(rootIds); }
-      return;
-    }
-
-    // ⌘D — duplicate in place (+16,+16)
-    if (meta && e.key === 'd' && sel.length) {
-      e.preventDefault();
-      const rootSourceIds = topLevelSelection(page, sel);
-      const sourceShapes = collectSubtree(page, rootSourceIds).map(shape => structuredClone(shape));
-      const { ops, rootIds } = cloneShapesForInsert(page, rootSourceIds, sourceShapes, 16, 16);
-      const res = await api.applyChanges({ pageId: page.id, ops });
-      if (res.ok && res.data) { setFile(res.data); setSelectedIds(rootIds); }
-      return;
-    }
-
-    // [ / ] — send backward / bring forward ; ⌘[ / ⌘] — to back / to front
-    if ((e.key === '[' || e.key === ']') && sel.length) {
-      e.preventDefault();
-      const id = sel[0];
-      const shape = page.objects[id];
-      const siblings = shape.parentId ? (page.objects[shape.parentId]?.childIds ?? []) : page.childIds;
-      const cur = siblings.indexOf(id);
-      let target: number;
-      if (e.key === ']') target = meta ? siblings.length - 1 : Math.min(siblings.length - 1, cur + 1);
-      else target = meta ? 0 : Math.max(0, cur - 1);
-      const res = await api.applyChanges({ pageId: page.id, ops: [{ op: 'move', id, parentId: shape.parentId, index: target }] });
-      if (res.ok && res.data) setFile(res.data);
-      return;
-    }
-  }, [setFile, setExportOpen, setPrefsOpen, file, activePage, selectedIds, setSelectedIds, clearSelection,
+    // NOTE: selection/clipboard/z-order shortcuts (⌘A ⌘C ⌘X ⌘V ⌘D [ ]) are owned
+    // exclusively by Canvas.tsx's keydown handler. They used to be duplicated here,
+    // which made every one of those shortcuts fire twice (e.g. ⌘D produced two clones).
+  }, [setExportOpen, setPrefsOpen, file, activePage,
       openNewTab, openFileInNewTab, saveTab, activeTabId, showToast]);
 
   useEffect(() => {
@@ -179,16 +118,39 @@ export default function App() {
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [onKeyDown]);
 
+  // ── Flush latest edits on exit ─────────────────────────────────────────────
+  // On any close/reload/navigation, synchronously persist the newest state of every dirty
+  // tab so a plain refresh doesn't lose work. We do NOT clear here — whether recovery is
+  // offered is decided by save-points (a saved file won't reappear), not by whether the
+  // app happened to exit cleanly. This is what makes a normal refresh recoverable.
+  useEffect(() => {
+    const onBeforeUnload = () => {
+      const st = useDesignStore.getState();
+      const dirtyFiles: DesignFile[] = [];
+      for (const t of st.tabs) {
+        if (!t.isDirty) continue;
+        const f = t.id === st.activeTabId ? st.file : t.session?.file ?? null;
+        if (f) dirtyFiles.push(f);
+      }
+      flushAutosave(dirtyFiles);
+    };
+    window.addEventListener('beforeunload', onBeforeUnload);
+    return () => window.removeEventListener('beforeunload', onBeforeUnload);
+  }, []);
+
+  // No document open → show the landing / start page instead of the editor.
+  if (!file) {
+    return (
+      <LandingPage
+        recoverySessions={recoverySessions}
+        onRecover={async () => { for (const f of recoverySessions) await openFileInNewTab(f); setRecoverySessions([]); }}
+        onDiscardRecovery={() => { recoverySessions.forEach(f => clearAutosave(f.id)); setRecoverySessions([]); }}
+      />
+    );
+  }
+
   return (
     <div style={styles.root}>
-      {recovery && (
-        <RecoveryBanner
-          file={recovery}
-          onRecover={() => { void openFileInNewTab(recovery); setRecovery(null); }}
-          onDismiss={() => { clearAutosave(); setRecovery(null); }}
-        />
-      )}
-
       <Toolbar />
       <div style={styles.workspace}>
         {!leftPanelCollapsed && <LayersPanel />}
@@ -198,7 +160,6 @@ export default function App() {
         </div>
         <PropertiesPanel />
       </div>
-      {!file && <SplashOverlay />}
       <ExportDialog />
       <PreferencesDialog />
       <UnsavedWarningModal />
@@ -207,27 +168,16 @@ export default function App() {
   );
 }
 
-// ── Recovery banner ───────────────────────────────────────────────────────────
+// ── Landing / start page ──────────────────────────────────────────────────────
+// Shown whenever no document is open (i.e. on launch). The editor is only mounted
+// once the user creates, opens, or recovers a file.
 
-function RecoveryBanner({ file, onRecover, onDismiss }: {
-  file: DesignFile; onRecover: () => void; onDismiss: () => void;
+function LandingPage({ recoverySessions, onRecover, onDiscardRecovery }: {
+  recoverySessions: DesignFile[];
+  onRecover: () => void;
+  onDiscardRecovery: () => void;
 }) {
-  return (
-    <div style={styles.recovery}>
-      <span style={styles.recoveryText}>
-        ⚠ Unsaved changes from a previous session were recovered — "{file.name}"
-      </span>
-      <button style={styles.recoveryBtn} onClick={onRecover}>Restore</button>
-      <button style={styles.recoveryDismiss} onClick={onDismiss}>Discard</button>
-    </div>
-  );
-}
-
-// ── Splash with recent files ────────────────────────────────────────────────
-
-function SplashOverlay() {
   const { openNewTab, openFileInNewTab } = useDesignStore();
-  const [recents] = useState<RecentFile[]>(() => getRecents());
 
   const handleOpen = async () => {
     try {
@@ -239,92 +189,42 @@ function SplashOverlay() {
   };
 
   return (
-    <div style={styles.splash}>
-      <div style={styles.splashCard}>
-        <div style={styles.splashLogo}>✦ Neouxe</div>
-        <div style={styles.splashSub}>A local-first design tool</div>
-        <button style={styles.splashBtn} onClick={() => { void openNewTab(); }}>
-          New File
-        </button>
-        <button style={{ ...styles.splashBtn, background: 'rgba(255,255,255,0.05)' }} onClick={handleOpen}>
-          Open File…
-        </button>
-        {recents.length > 0 && (
-          <div style={styles.recents}>
-            <div style={styles.recentsHeader}>Recent</div>
-            {recents.slice(0, 5).map(r => (
-              <div key={r.id} style={styles.recentRow} onClick={() => { void openFileInNewTab(r.file); }}>
-                <span style={styles.recentName}>{r.name}</span>
-                <span style={styles.recentTime}>{new Date(r.timestamp).toLocaleDateString()}</span>
-              </div>
-            ))}
-          </div>
-        )}
+    <div style={styles.landing}>
+      {recoverySessions.length > 0 && (
+        <div style={styles.recovery}>
+          <span style={styles.recoveryText}>
+            {recoverySessions.length === 1
+              ? `⚠ Unsaved changes from your last session — "${recoverySessions[0].name}"`
+              : `⚠ ${recoverySessions.length} unsaved sessions from your last session`}
+          </span>
+          <button style={styles.recoveryBtn} onClick={onRecover}>
+            {recoverySessions.length === 1 ? 'Restore' : 'Restore all'}
+          </button>
+          <button style={styles.recoveryDismiss} onClick={onDiscardRecovery}>Discard</button>
+        </div>
+      )}
+
+      <div style={styles.landingInner}>
+        <div style={styles.landingHeader}>
+          <div style={styles.landingLogo}>✦ Neouxe</div>
+          <div style={styles.landingSub}>A local-first design tool</div>
+        </div>
+
+        <div style={styles.landingActions}>
+          <button style={styles.actionCard} onClick={() => { void openNewTab(); }}>
+            <span style={styles.actionPlus}>+</span>
+            <span style={styles.actionTitle}>New design</span>
+            <span style={styles.actionDesc}>Start with a blank canvas</span>
+          </button>
+          <button style={{ ...styles.actionCard, ...styles.actionCardGhost }} onClick={handleOpen}>
+            <span style={styles.actionPlus}>↥</span>
+            <span style={styles.actionTitle}>Open file…</span>
+            <span style={styles.actionDesc}>Open a .design file from disk</span>
+          </button>
+        </div>
       </div>
     </div>
   );
-}
-
-function topLevelSelection(page: Page, ids: string[]): string[] {
-  const selected = new Set(ids);
-  return ids.filter(id => {
-    let parentId = page.objects[id]?.parentId ?? null;
-    while (parentId) {
-      if (selected.has(parentId)) return false;
-      parentId = page.objects[parentId]?.parentId ?? null;
-    }
-    return true;
-  });
-}
-
-function collectSubtree(page: Page, rootIds: string[]): Shape[] {
-  const out: Shape[] = [];
-  const seen = new Set<string>();
-  const visit = (id: string) => {
-    const shape = page.objects[id];
-    if (!shape || seen.has(id)) return;
-    seen.add(id);
-    out.push(shape);
-    for (const childId of shape.childIds) visit(childId);
-  };
-  rootIds.forEach(visit);
-  return out;
-}
-
-function cloneShapesForInsert(
-  page: Page,
-  sourceRootIds: string[],
-  sourceShapes: Shape[],
-  offsetX: number,
-  offsetY: number,
-): { ops: Parameters<typeof api.applyChanges>[0]['ops']; rootIds: string[] } {
-  const idMap = new Map(sourceShapes.map(shape => [shape.id, Math.random().toString(36).slice(2, 10)]));
-  const newRootIds = sourceRootIds.map(id => idMap.get(id)).filter((id): id is string => !!id);
-  const ops = sourceShapes.map(orig => {
-    const id = idMap.get(orig.id)!;
-    const parentId = orig.parentId && idMap.has(orig.parentId)
-      ? idMap.get(orig.parentId)!
-      : orig.parentId && page.objects[orig.parentId]
-        ? orig.parentId
-        : null;
-    const frameId = orig.type === 'frame'
-      ? id
-      : idMap.get(orig.frameId) ?? (page.objects[orig.frameId] ? orig.frameId : page.id);
-    const x = orig.x + offsetX;
-    const y = orig.y + offsetY;
-    const copy = makeDefaultShape({
-      ...structuredClone(orig),
-      id,
-      parentId,
-      frameId,
-      x,
-      y,
-      childIds: orig.childIds.map(childId => idMap.get(childId)).filter((childId): childId is string => !!childId),
-      selrect: { x, y, width: orig.width, height: orig.height },
-    });
-    return { op: 'add' as const, shape: copy };
-  });
-  return { ops, rootIds: newRootIds };
 }
 
 const styles: Record<string, React.CSSProperties> = {
@@ -333,33 +233,32 @@ const styles: Record<string, React.CSSProperties> = {
   canvasWrap: { flex: 1, position: 'relative', display: 'flex', overflow: 'hidden' },
   recovery: {
     position: 'fixed', top: 0, left: 0, right: 0, zIndex: 300,
-    background: '#45403a', borderBottom: '1px solid rgba(245,197,66,0.4)',
+    background: 'var(--bg-elevated)', borderBottom: '1px solid var(--comment)',
     display: 'flex', alignItems: 'center', gap: 10, padding: '8px 16px',
     fontFamily: 'system-ui', fontSize: 13,
   },
-  recoveryText: { color: '#F5C542', flex: 1 },
-  recoveryBtn: { background: '#6E72F5', color: '#fff', border: 'none', borderRadius: 6, padding: '5px 14px', fontSize: 12, cursor: 'pointer' },
-  recoveryDismiss: { background: 'transparent', color: '#C8C8D0', border: 'none', padding: '5px 10px', fontSize: 12, cursor: 'pointer' },
-  splash: {
-    position: 'fixed', inset: 0, background: 'rgba(8,8,10,0.8)',
-    display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 100, backdropFilter: 'blur(8px)',
+  recoveryText: { color: 'var(--comment)', flex: 1 },
+  recoveryBtn: { background: 'var(--accent)', color: '#fff', border: 'none', borderRadius: 6, padding: '5px 14px', fontSize: 12, cursor: 'pointer' },
+  recoveryDismiss: { background: 'transparent', color: 'var(--text-secondary)', border: 'none', padding: '5px 10px', fontSize: 12, cursor: 'pointer' },
+
+  // ── Landing page ────────────────────────────────────────────────────────────
+  landing: {
+    position: 'fixed', inset: 0, background: 'var(--bg-canvas)',
+    display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
+    fontFamily: 'system-ui', overflow: 'auto',
   },
-  splashCard: {
-    background: '#1b1b1f', border: '1px solid rgba(255,255,255,0.1)', borderRadius: 16,
-    padding: '40px 48px', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 14, minWidth: 300,
+  landingInner: { width: '100%', maxWidth: 720, padding: '32px 24px', display: 'flex', flexDirection: 'column', gap: 32 },
+  landingHeader: { textAlign: 'center' },
+  landingLogo: { fontSize: 44, fontWeight: 800, color: 'var(--accent-hover)', letterSpacing: '-1.5px' },
+  landingSub: { fontSize: 15, color: 'var(--text-secondary)', marginTop: 6 },
+  landingActions: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 },
+  actionCard: {
+    display: 'flex', flexDirection: 'column', alignItems: 'flex-start', gap: 6, textAlign: 'left',
+    background: 'var(--accent)', color: '#fff', border: '1px solid transparent', borderRadius: 14,
+    padding: '22px 24px', cursor: 'pointer', fontFamily: 'system-ui',
   },
-  splashLogo: { fontSize: 36, fontWeight: 800, color: '#8084FF', fontFamily: 'system-ui', letterSpacing: '-1px' },
-  splashSub: { fontSize: 14, color: '#9B9BA6', fontFamily: 'system-ui', marginBottom: 8 },
-  splashBtn: {
-    background: '#6E72F5', color: '#fff', border: 'none', borderRadius: 8,
-    padding: '10px 24px', fontSize: 14, fontFamily: 'system-ui', cursor: 'pointer', width: '100%', fontWeight: 500,
-  },
-  recents: { width: '100%', marginTop: 8, borderTop: '1px solid rgba(255,255,255,0.08)', paddingTop: 12 },
-  recentsHeader: { fontSize: 10, color: '#9B9BA6', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 6, fontFamily: 'system-ui' },
-  recentRow: {
-    display: 'flex', justifyContent: 'space-between', alignItems: 'center',
-    padding: '6px 8px', borderRadius: 6, cursor: 'pointer', fontFamily: 'system-ui',
-  },
-  recentName: { color: '#ECECEF', fontSize: 13 },
-  recentTime: { color: '#9B9BA6', fontSize: 11 },
+  actionCardGhost: { background: 'var(--bg-elevated)', color: 'var(--text)', border: '1px solid var(--border-strong)' },
+  actionPlus: { fontSize: 26, fontWeight: 700, lineHeight: 1, marginBottom: 4 },
+  actionTitle: { fontSize: 16, fontWeight: 600 },
+  actionDesc: { fontSize: 12.5, opacity: 0.8 },
 };

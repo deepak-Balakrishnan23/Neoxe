@@ -1,12 +1,16 @@
 import { DesignFile } from '../shared/types';
 
-// ── Local persistence: autosave, crash recovery, recent files ─────────────────
-// Browser-first (localStorage). In Electron this is mirrored by the main process
-// writing to the app data dir, but localStorage works identically for the renderer.
+// ── Local persistence: autosave + crash recovery (localStorage) ────────────────
+//
+// Autosave is keyed PER FILE (a map of fileId → entry), so every open dirty tab is
+// independently recoverable — not just the active one. Recovery is offered for any file
+// whose autosave is newer than its last clean save point, so a NORMAL refresh/close no
+// longer loses unsaved work (the old design wiped everything on beforeunload, leaving
+// only hard-crash recovery). The save-point comparison is what prevents the recovery
+// banner from nagging after you've actually saved.
 
-const AUTOSAVE_KEY = 'edit-autosave';
-const RECENTS_KEY = 'edit-recent-files';
-const MAX_RECENTS = 8;
+const AUTOSAVE_KEY = 'edit-autosave';   // Record<fileId, AutosaveEntry>
+const SAVEPOINT_KEY = 'edit-savepoint'; // Record<fileId, number (ms)>
 
 interface AutosaveEntry {
   file: DesignFile;
@@ -14,96 +18,85 @@ interface AutosaveEntry {
   fileId: string;
 }
 
-// ── Autosave ──────────────────────────────────────────────────────────────────
+// ── low-level map read/write ────────────────────────────────────────────────
 
-let autosaveTimer: ReturnType<typeof setTimeout> | null = null;
-
-export function scheduleAutosave(file: DesignFile, intervalMs = 2000) {
-  if (autosaveTimer) clearTimeout(autosaveTimer);
-  autosaveTimer = setTimeout(() => writeAutosave(file), intervalMs);
+function readAutosaves(): Record<string, AutosaveEntry> {
+  try {
+    const raw = localStorage.getItem(AUTOSAVE_KEY);
+    const v = raw ? JSON.parse(raw) : null;
+    return v && typeof v === 'object' ? v as Record<string, AutosaveEntry> : {};
+  } catch { return {}; }
 }
 
-export function writeAutosave(file: DesignFile) {
+function writeAutosaves(map: Record<string, AutosaveEntry>) {
   try {
-    const entry: AutosaveEntry = { file, timestamp: Date.now(), fileId: file.id };
-    localStorage.setItem(AUTOSAVE_KEY, JSON.stringify(entry));
+    if (Object.keys(map).length === 0) localStorage.removeItem(AUTOSAVE_KEY);
+    else localStorage.setItem(AUTOSAVE_KEY, JSON.stringify(map));
   } catch (e) {
-    // Quota exceeded or serialization error — non-fatal
+    // Quota exceeded or serialization error — non-fatal (images can be large).
     console.warn('autosave failed', e);
   }
 }
 
-export function getAutosave(): AutosaveEntry | null {
-  try {
-    const raw = localStorage.getItem(AUTOSAVE_KEY);
-    return raw ? JSON.parse(raw) : null;
-  } catch {
-    return null;
-  }
-}
-
-export function clearAutosave() {
-  localStorage.removeItem(AUTOSAVE_KEY);
-}
-
-// Mark a clean save point so recovery only triggers on genuinely-newer autosaves.
-const SAVEPOINT_KEY = 'edit-savepoint';
-export function markSavePoint(fileId: string) {
-  localStorage.setItem(SAVEPOINT_KEY, JSON.stringify({ fileId, timestamp: Date.now() }));
-}
-export function getSavePoint(): { fileId: string; timestamp: number } | null {
+function readSavePoints(): Record<string, number> {
   try {
     const raw = localStorage.getItem(SAVEPOINT_KEY);
-    return raw ? JSON.parse(raw) : null;
-  } catch { return null; }
+    const v = raw ? JSON.parse(raw) : null;
+    return v && typeof v === 'object' ? v as Record<string, number> : {};
+  } catch { return {}; }
 }
 
-// Should we offer recovery? Yes if an autosave exists that is newer than the
-// last clean save point (i.e. unsaved changes survived a crash/refresh).
-export function hasRecoverableSession(): AutosaveEntry | null {
-  const auto = getAutosave();
-  if (!auto) return null;
-  const sp = getSavePoint();
-  if (sp && sp.fileId === auto.fileId && sp.timestamp >= auto.timestamp) return null;
-  return auto;
+// ── Autosave (debounced, multi-file) ────────────────────────────────────────
+
+let autosaveTimer: ReturnType<typeof setTimeout> | null = null;
+
+// Persist the given dirty files immediately (used on beforeunload to capture the very
+// latest edit, and internally by the debounce).
+export function flushAutosave(files: DesignFile[]) {
+  if (files.length === 0) return;
+  const map = readAutosaves();
+  const now = Date.now();
+  for (const f of files) map[f.id] = { file: f, timestamp: now, fileId: f.id };
+  writeAutosaves(map);
 }
 
-// ── Recent files ──────────────────────────────────────────────────────────────
-
-export interface RecentFile {
-  id: string;
-  name: string;
-  timestamp: number;
-  thumbnail?: string;       // optional small data-url
-  file: DesignFile;         // full content (local-first; capped count)
+// Debounced autosave of every currently-dirty file.
+export function scheduleAutosave(files: DesignFile[], intervalMs = 2000) {
+  if (autosaveTimer) clearTimeout(autosaveTimer);
+  autosaveTimer = setTimeout(() => flushAutosave(files), intervalMs);
 }
 
-export function addRecent(file: DesignFile, thumbnail?: string) {
-  try {
-    const recents = getRecents();
-    const filtered = recents.filter(r => r.id !== file.id);
-    filtered.unshift({ id: file.id, name: file.name, timestamp: Date.now(), thumbnail, file });
-    const capped = filtered.slice(0, MAX_RECENTS);
-    localStorage.setItem(RECENTS_KEY, JSON.stringify(capped));
-  } catch (e) {
-    console.warn('addRecent failed', e);
-  }
+// Cancel a pending autosave (e.g. right after an explicit Save) so a stale timer can't
+// re-write a "recoverable" autosave for content that was just saved.
+export function cancelAutosave() {
+  if (autosaveTimer) { clearTimeout(autosaveTimer); autosaveTimer = null; }
 }
 
-export function getRecents(): RecentFile[] {
-  try {
-    const raw = localStorage.getItem(RECENTS_KEY);
-    return raw ? JSON.parse(raw) : [];
-  } catch {
-    return [];
-  }
+// Drop a single file's autosave (after save/discard), or all of them (fileId omitted).
+export function clearAutosave(fileId?: string) {
+  if (!fileId) { localStorage.removeItem(AUTOSAVE_KEY); return; }
+  const map = readAutosaves();
+  delete map[fileId];
+  writeAutosaves(map);
 }
 
-export function removeRecent(id: string) {
-  const recents = getRecents().filter(r => r.id !== id);
-  localStorage.setItem(RECENTS_KEY, JSON.stringify(recents));
+// ── Save points ─────────────────────────────────────────────────────────────
+
+// Mark a clean save for a file so its autosave is no longer offered for recovery.
+export function markSavePoint(fileId: string) {
+  const sp = readSavePoints();
+  sp[fileId] = Date.now();
+  try { localStorage.setItem(SAVEPOINT_KEY, JSON.stringify(sp)); } catch { /* non-fatal */ }
 }
 
-export function clearRecents() {
-  localStorage.removeItem(RECENTS_KEY);
+// ── Recovery ──────────────────────────────────────────────────────────────────
+
+// Every autosaved session whose changes are newer than its last clean save (i.e. genuine
+// unsaved work that survived a refresh/close/crash). Newest first.
+export function getRecoverableSessions(): AutosaveEntry[] {
+  const map = readAutosaves();
+  const sp = readSavePoints();
+  return Object.values(map)
+    .filter(e => !(typeof sp[e.fileId] === 'number' && sp[e.fileId] >= e.timestamp))
+    .sort((a, b) => b.timestamp - a.timestamp);
 }

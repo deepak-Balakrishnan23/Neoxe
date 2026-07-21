@@ -15,10 +15,18 @@ export function aliasTarget(value: string): string | null {
   return m ? m[1] : null;
 }
 
-// Build a fast lookup map of token name → token
+// Build a fast lookup map of token name → token, cached per tokens-array identity. Without
+// the cache, resolveToken rebuilt the whole map on every call AND on every alias-recursion
+// level — and TokensPanel resolves every token per render, making it O(n²). The array's
+// identity changes on each edit, so the WeakMap entry naturally refreshes.
+const _mapCache = new WeakMap<DesignToken[], Map<string, DesignToken>>();
 function tokenMap(tokens: DesignToken[]): Map<string, DesignToken> {
-  const m = new Map<string, DesignToken>();
-  for (const t of tokens) m.set(t.name, t);
+  let m = _mapCache.get(tokens);
+  if (!m) {
+    m = new Map<string, DesignToken>();
+    for (const t of tokens) m.set(t.name, t);
+    _mapCache.set(tokens, m);
+  }
   return m;
 }
 
@@ -54,19 +62,6 @@ export function resolveToken(
     return resolveToken(target, tokens, theme, _seen);
   }
   return raw;
-}
-
-// Resolve ALL tokens to a flat name→value map (for export / display).
-export function resolveAll(
-  tokens: DesignToken[],
-  theme: ThemeSet | null,
-): Record<string, string | number> {
-  const out: Record<string, string | number> = {};
-  for (const t of tokens) {
-    const v = resolveToken(t.name, tokens, theme);
-    if (v !== null) out[t.name] = v;
-  }
-  return out;
 }
 
 // Get the active theme object from a file (or null for default).
@@ -108,6 +103,10 @@ function setByPath(obj: any, path: string, value: string | number): boolean {
     cur = cur[key];
   }
   const last = parts[parts.length - 1];
+  // Only overwrite a property the target ALREADY has. Otherwise a binding like
+  // "fills.0.color" would inject a stray `color` onto a gradient fill (which has `stops`,
+  // not `color`), silently corrupting it.
+  if (!(last in cur)) return false;
   if (cur[last] === value) return false;
   cur[last] = value;
   return true;

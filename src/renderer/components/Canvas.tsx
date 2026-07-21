@@ -1,6 +1,7 @@
 import React, { useRef, useEffect, useCallback, useState } from 'react';
-import { renderPage, Viewport, ShapePreview, invalidateSvgCache, externalDragPreview } from '../canvas/renderer';
+import { renderPage, Viewport, ShapePreview, invalidateSvgCache, externalDragPreview, SVG_DECODED_EVENT } from '../canvas/renderer';
 import { fitTextSize } from '../canvas/textLayout';
+import { FONT_LOADED_EVENT } from '../canvas/fontLoader';
 import { hitTestPoint, screenToDoc, getHandleAt, hitTestMarquee } from '../canvas/hitTest';
 import { applyResizeDelta, applyRotateDelta, handleCursor, shapeCenterDoc, ROTATE_HANDLE } from '../canvas/transform';
 import { useDesignStore, ToolType } from '../store/useDesignStore';
@@ -11,6 +12,38 @@ import FrameLabels from './FrameLabels';
 import { api } from '../ipc/api';
 import { makeDefaultShape, Shape, PathSegment, Page, AnchorPoint } from '../../shared/types';
 import { createAutoLayoutFromSelection } from '../../shared/createAutoLayout';
+import { applyAutoLayoutToPage } from '../../shared/autoLayout';
+
+// During a drag, `preview` overrides the dragged shape(s) box. If the page has any auto-layout
+// container, reflow a throwaway clone with those overrides applied so children reposition/
+// resize LIVE (not just on mouse-up). Returns an augmented preview map with the reflowed child
+// bounds merged in. Cheap no-op when nothing is being dragged or no auto-layout exists.
+function withAutoLayoutPreview(page: Page, preview: Map<string, ShapePreview>): Map<string, ShapePreview> {
+  if (preview.size === 0) return preview;
+  let hasAL = false;
+  for (const id in page.objects) { if (page.objects[id]?.autoLayout) { hasAL = true; break; } }
+  if (!hasAL) return preview;
+
+  const clone: Page = { ...page, objects: {} };
+  for (const id in page.objects) {
+    const s = page.objects[id];
+    const ov = preview.get(id);
+    clone.objects[id] = ov
+      ? { ...s, ...ov, selrect: { ...s.selrect } }
+      : { ...s, selrect: { ...s.selrect } };
+  }
+  applyAutoLayoutToPage(clone);
+
+  const out = new Map(preview);
+  for (const id in clone.objects) {
+    const c = clone.objects[id];
+    const o = page.objects[id];
+    if (c.x !== o.x || c.y !== o.y || c.width !== o.width || c.height !== o.height) {
+      out.set(id, { ...(out.get(id) ?? {}), x: c.x, y: c.y, width: c.width, height: c.height });
+    }
+  }
+  return out;
+}
 import TextEditor from './TextEditor';
 import VectorOverlay from './VectorOverlay';
 import VectorEditOverlay from './VectorEditOverlay';
@@ -21,9 +54,8 @@ import { imageCache, loadImage } from '../canvas/imageCache';
 import { importImageFiles, ImportedImage } from '../io/imageImport';
 import { syncViewport } from '../canvas/viewportBridge';
 
-const MIN_ZOOM = 0.01;  // 1%
+const MIN_ZOOM = 0.002; // 0.2% — lets you zoom out far enough to fit sprawling layouts
 const MAX_ZOOM = 256;   // 25600%
-const CANVAS_BOUNDS = 10000;        // ±doc units from origin (hard pan/zoom limit)
 const SNAP_ENGAGE_PX = 8;           // screen pixels — snap engage threshold
 const SNAP_RELEASE_PX = 12;         // screen pixels — snap release threshold
 const SNAP_COLOR = '#E040FB';       // magenta snap lines
@@ -35,6 +67,18 @@ const PEN_CURSOR = `url("data:image/svg+xml,${encodeURIComponent(
   '<path d="M16.3594 2.74927C17.1797 1.88989 18.5859 1.88989 19.4453 2.74927L21.2422 4.54614C22.1016 5.40552 22.1016 6.81177 21.2422 7.67114L18.4688 10.4446L18.0391 10.8352L16.4766 16.6555C16.2812 17.3586 15.7734 17.9055 15.0703 18.1399L4.75781 21.7727C4.05469 22.0461 3.23438 21.8508 2.6875 21.304C2.14062 20.7571 1.98438 19.9758 2.21875 19.2336L5.85156 8.92114C6.08594 8.25708 6.63281 7.71021 7.33594 7.51489L13.1562 5.95239L13.5469 5.52271L16.3203 2.74927H16.3594ZM13.5469 7.78833L7.84375 9.35083C7.72656 9.35083 7.64844 9.42896 7.60938 9.54614L4.52344 18.3743L8.3125 14.5852C8.23438 14.3899 8.19531 14.1555 8.19531 13.9211C8.19531 12.9055 9.05469 12.0461 10.0703 12.0461C11.125 12.0461 11.9453 12.9055 11.9453 13.9211C11.9453 14.9758 11.125 15.7961 10.0703 15.7961C9.83594 15.7961 9.64062 15.7571 9.40625 15.679L5.61719 19.5071L14.4453 16.3821C14.5625 16.343 14.6406 16.2649 14.6406 16.1868L16.2031 10.4446L13.5469 7.78833Z" fill="black"/>' +
   '</svg>'
 )}") 2 21, default`;
+// Cursor shown while Alt/Option-dragging to duplicate (Figma affordance): arrow +
+// a small "copy" badge. Falls back to the native `copy` cursor if the data URL fails.
+const DUP_CURSOR = `url("data:image/svg+xml,${encodeURIComponent(
+  '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">' +
+  '<path d="M4 2 L4 19 L8.5 14.5 L11.5 21 L13.7 20 L10.8 13.8 L17 13.8 Z" fill="black" stroke="white" stroke-width="1" stroke-linejoin="round"/>' +
+  '<g transform="translate(13 12)">' +
+  '<rect x="0" y="0" width="10" height="10" rx="2" fill="white"/>' +
+  '<rect x="1.5" y="1.5" width="7" height="7" rx="1.5" fill="black"/>' +
+  '<path d="M5 3 L5 7 M3 5 L7 5" stroke="white" stroke-width="1.3" stroke-linecap="round"/>' +
+  '</g>' +
+  '</svg>'
+)}") 4 2, copy`;
 const DEFAULT_TEXT_WIDTH = 180;
 const DEFAULT_TEXT_HEIGHT = 44;
 const DEFAULT_TEXT_STYLE = {
@@ -55,14 +99,19 @@ type DragMode =
   | { mode: 'pan'; lastScreenX: number; lastScreenY: number }
   | { mode: 'move'; startDocX: number; startDocY: number; originals: Record<string, { x: number; y: number }> }
   | { mode: 'resize'; shapeId: string; handleIndex: number; original: Shape; startDocX: number; startDocY: number }
-  | { mode: 'rotate'; shapeId: string; original: Shape; cx: number; cy: number; startDocX: number; startDocY: number }
+  // `nodes` snapshots the WHOLE subtree at drag start so the preview rotates it as one
+  // rigid body every frame; the commit sends only the root's rotation op — the engine's
+  // rotation cascade applies the identical transform to descendants (single source of truth).
+  | { mode: 'rotate'; shapeId: string; original: Shape; nodes: Shape[]; cx: number; cy: number; startDocX: number; startDocY: number }
+  // Multi-selection group transforms operate on the union bounding box: resize scales every
+  // selected shape proportionally; rotate turns the whole set about the union centre.
+  | { mode: 'group-resize'; handleIndex: number; ux: number; uy: number; uw: number; uh: number; originals: Shape[]; startDocX: number; startDocY: number }
+  | { mode: 'group-rotate'; cx: number; cy: number; originals: Shape[]; nodes: Shape[]; startDocX: number; startDocY: number }
   | {
       mode: 'marquee'; startScreenX: number; startScreenY: number; currentScreenX: number; currentScreenY: number;
       // When the marquee was started inside a frame, selection is constrained to that
-      // frame's direct children. clickSelectId: if the marquee never moves (it was a
-      // click), select this id instead (used so a click on a frame body selects the frame).
+      // frame's direct children.
       frameId?: string | null;
-      clickSelectId?: string | null;
     }
   | { mode: 'create'; tool: 'rect' | 'ellipse' | 'frame'; startDocX: number; startDocY: number; currentDocX: number; currentDocY: number }
   | { mode: 'text-create'; startDocX: number; startDocY: number; currentDocX: number; currentDocY: number }
@@ -197,33 +246,50 @@ function alReorderSlot(
   cursorDocX: number,
   cursorDocY: number,
 ): { index: number; indicator: { x1: number; y1: number; x2: number; y2: number } } {
-  const direction = container.autoLayout!.direction;
-  const isH = direction === 'horizontal';
-  const siblings = container.childIds
+  const al0 = container.autoLayout!;
+  const direction = al0.direction;
+  // wrap/grid flow row-major (left→right, top→bottom) — treat their primary axis as
+  // horizontal and fall through to the row-aware comparison below.
+  const isH = direction === 'horizontal' || direction === 'wrap' || direction === 'grid';
+  const rowMajor = direction === 'wrap' || direction === 'grid';
+  const inChildOrder = container.childIds
     .filter(id => id !== draggingId)
     .map(id => page.objects[id])
     .filter((s): s is Shape => !!s);
+  // `reversed` flips the VISUAL order relative to childIds. Compute the slot against the
+  // visual order (that's what the cursor sees), then map back to a childIds index below.
+  const siblings = al0.reversed ? [...inChildOrder].reverse() : inChildOrder;
 
-  const cursor = isH ? cursorDocX : cursorDocY;
-  let index = siblings.length;
+  let visualIndex = siblings.length;
   for (let i = 0; i < siblings.length; i++) {
     const s = siblings[i];
-    const mid = isH ? s.x + s.width / 2 : s.y + s.height / 2;
-    if (cursor < mid) { index = i; break; }
+    if (rowMajor) {
+      // Row-major: before this sibling if the cursor is in an earlier row, or in the same
+      // row band and left of its midpoint.
+      if (cursorDocY < s.y || (cursorDocY <= s.y + s.height && cursorDocX < s.x + s.width / 2)) {
+        visualIndex = i; break;
+      }
+    } else {
+      const cursor = isH ? cursorDocX : cursorDocY;
+      const mid = isH ? s.x + s.width / 2 : s.y + s.height / 2;
+      if (cursor < mid) { visualIndex = i; break; }
+    }
   }
+  // Map visual slot → childIds insertion index (post-removal list, per the `move` op).
+  const index = al0.reversed ? siblings.length - visualIndex : visualIndex;
 
   // Indicator: halfway between the prev sibling's trailing edge and the next sibling's
   // leading edge. At the boundaries, snap to the container's inner edge so the line
   // sits inside the padding box.
-  const al = container.autoLayout!;
+  const al = al0;
   const innerStart = isH
     ? container.x + al.padding.left
     : container.y + al.padding.top;
   const innerEnd = isH
     ? container.x + container.width - al.padding.right
     : container.y + container.height - al.padding.bottom;
-  const prev = index > 0 ? siblings[index - 1] : null;
-  const next = index < siblings.length ? siblings[index] : null;
+  const prev = visualIndex > 0 ? siblings[visualIndex - 1] : null;
+  const next = visualIndex < siblings.length ? siblings[visualIndex] : null;
   const prevEdge = prev ? (isH ? prev.x + prev.width : prev.y + prev.height) : innerStart;
   const nextEdge = next ? (isH ? next.x : next.y) : innerEnd;
   const primaryPos = (prevEdge + nextEdge) / 2;
@@ -305,6 +371,42 @@ interface ClipboardData {
 }
 let canvasClipboard: ClipboardData | null = null;
 
+// Next available "<base> N" name, given the names already on the page. Duplicating or
+// pasting a layer should increment (Figma-style: "Frame 1" → "Frame 2"), not repeat the
+// source name. Strips any trailing number to find the base, then picks the lowest free
+// index above the highest one in use.
+function nextAvailableName(existing: Set<string>, name: string): string {
+  const base = name.replace(/\s*\d+\s*$/, '').trimEnd() || name;
+  const esc = base.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const re = new RegExp('^' + esc + '\\s*(\\d+)?\\s*$');
+  let max = 0;
+  for (const n of existing) {
+    const m = n.match(re);
+    if (m) max = Math.max(max, m[1] ? parseInt(m[1], 10) : 1);
+  }
+  let next = max + 1;
+  let candidate = `${base} ${next}`;
+  while (existing.has(candidate)) candidate = `${base} ${++next}`;
+  return candidate;
+}
+
+// Rename the cloned ROOT shapes (not descendants — Figma keeps child names) to the next
+// free incremented name. Mutates the add-ops in place and seeds the running name set so a
+// multi-root paste/duplicate stays unique within itself too.
+function uniquifyRootNames(
+  page: { objects: Record<string, Shape> },
+  ops: { op: 'add'; shape: Shape }[],
+  rootNewIds: Set<string>,
+): void {
+  const existing = new Set(Object.values(page.objects).map(s => s.name));
+  for (const op of ops) {
+    if (!rootNewIds.has(op.shape.id)) continue;
+    const nn = nextAvailableName(existing, op.shape.name);
+    op.shape.name = nn;
+    existing.add(nn);
+  }
+}
+
 // Deep-clone a shape and its entire subtree, generating fresh IDs for every node.
 function deepCloneSubtree(
   page: { objects: Record<string, Shape> },
@@ -330,6 +432,46 @@ function deepCloneSubtree(
     });
   }
   return { ops, newRootId: idMap.get(rootId)! };
+}
+
+// Gap (doc px) left between a copy and the frame it is placed next to.
+const DUP_GAP = 40;
+
+function rectsOverlap(
+  ax: number, ay: number, aw: number, ah: number,
+  bx: number, by: number, bw: number, bh: number,
+): boolean {
+  return ax < bx + bw && ax + aw > bx && ay < by + bh && ay + ah > by;
+}
+
+// Figma-style placement for paste/duplicate. Given the source bounding box, step the
+// copy to the right by (width + gap) until it clears EVERY existing top-level shape —
+// not just the immediate source — so repeated duplicates never land on top of another
+// frame. Returns the (dx, dy) to add to every cloned shape (root + descendants).
+function clearPlacementOffset(
+  page: { objects: Record<string, Shape>; childIds: string[] },
+  bbox: { x: number; y: number; w: number; h: number },
+): { dx: number; dy: number } {
+  const step = bbox.w + DUP_GAP;
+  const siblings = page.childIds
+    .map(id => page.objects[id])
+    .filter((s): s is Shape => !!s);
+  for (let i = 1; i <= 1000; i++) {
+    const dx = step * i;
+    const collides = siblings.some(o =>
+      rectsOverlap(bbox.x + dx, bbox.y, bbox.w, bbox.h, o.x, o.y, o.width, o.height));
+    if (!collides) return { dx, dy: 0 };
+  }
+  return { dx: step, dy: 0 };
+}
+
+// Bounding box of a set of shapes (absolute doc coords).
+function shapesBBox(shapes: Shape[]): { x: number; y: number; w: number; h: number } {
+  const minX = Math.min(...shapes.map(s => s.x));
+  const minY = Math.min(...shapes.map(s => s.y));
+  const maxX = Math.max(...shapes.map(s => s.x + s.width));
+  const maxY = Math.max(...shapes.map(s => s.y + s.height));
+  return { x: minX, y: minY, w: maxX - minX, h: maxY - minY };
 }
 
 function placementForPoint(
@@ -684,20 +826,12 @@ export default function Canvas() {
   const vpRef = useRef(viewport);
   vpRef.current = viewport;
 
-  // Hard canvas limits (Figma-style): clamp pan + zoom so the viewport can never travel
-  // past the ±CANVAS_BOUNDS working area. Zoom-out is floored at the point where the whole
-  // bounds just fill the viewport (can't zoom out to reveal empty space beyond the canvas),
-  // and pan is clamped so the visible region stays inside the bounds.
+  // Infinite canvas (Figma-style): pan is NEVER clamped — you can scroll forever in any
+  // direction. Only zoom is bounded, to the absolute [MIN_ZOOM, MAX_ZOOM] range. (The old
+  // content-adaptive pan/zoom box fenced scrolling to an invisible boundary; removed.)
   const clampVp = useCallback((vp: Viewport): Viewport => {
-    const cw = containerRef.current?.clientWidth ?? 800;
-    const ch = containerRef.current?.clientHeight ?? 600;
-    const span = 2 * CANVAS_BOUNDS;
-    const zMin = Math.max(MIN_ZOOM, cw / span, ch / span);
-    const zoom = Math.max(zMin, Math.min(MAX_ZOOM, vp.zoom));
-    // Pan range keeping [docL,docR]×[docT,docB] within [-BOUNDS, BOUNDS].
-    const x = Math.min(CANVAS_BOUNDS * zoom, Math.max(cw - CANVAS_BOUNDS * zoom, vp.x));
-    const y = Math.min(CANVAS_BOUNDS * zoom, Math.max(ch - CANVAS_BOUNDS * zoom, vp.y));
-    return { x, y, zoom };
+    const zoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, vp.zoom));
+    return { x: vp.x, y: vp.y, zoom };
   }, []);
   useEffect(() => { syncViewport(viewport); }, [viewport]);
   const groupEditIdRef = useRef(groupEditId);
@@ -712,8 +846,13 @@ export default function Canvas() {
   const dragRef = useRef<DragMode>({ mode: 'none' });
   const previewRef = useRef<Map<string, ShapePreview>>(new Map());
   const images = useRef<Record<string, HTMLImageElement>>(imageCache);
+  // One-shot repaint request for async events (image decodes) while the loop is idle.
+  const redrawOnceRef = useRef(false);
   const didFit = useRef(false);
   const snapLinesRef = useRef<{ axis: 'x' | 'y'; pos: number }[]>([]);
+  // Snap targets (sibling/parent edges) don't move during a drag — cache them per drag
+  // object identity instead of rescanning every mousemove frame.
+  const snapCacheRef = useRef<{ owner: unknown; targets: { x: number[]; y: number[] } } | null>(null);
   const snapStateRef = useRef<{ x: number | null; y: number | null }>({ x: null, y: null });
   const snapOffsetRef = useRef<{ dx: number; dy: number } | null>(null);
   const guideSnapRef = useRef<{
@@ -736,7 +875,8 @@ export default function Canvas() {
   useEffect(() => {
     if (!file) return;
     for (const [id, dataUrl] of Object.entries(file.images)) {
-      loadImage(id, dataUrl);
+      // Ask the (idle-gated) loop for one repaint when the async decode lands.
+      loadImage(id, dataUrl, () => { redrawOnceRef.current = true; });
     }
   }, [file]);
 
@@ -839,6 +979,25 @@ export default function Canvas() {
     return () => window.removeEventListener('tool:images-loaded', handler);
   }, [placeImages]);
 
+  // ── Redraw when a lazily-loaded font becomes available ────────────────────
+  // Canvas text drawn before its font finished loading rendered with a fallback
+  // and would otherwise stay that way; this repaints with the real glyphs.
+  useEffect(() => {
+    // Route through redrawOnceRef (consumed by the rAF loop) instead of calling draw()
+    // directly — a []-deps handler would capture the first-render draw closure (stale
+    // selectedIds/penSegments/etc.) and repaint with outdated state.
+    const handler = () => { redrawOnceRef.current = true; };
+    window.addEventListener(FONT_LOADED_EVENT, handler);
+    // Same idle-loop repaint request when a lazily-rasterized SVG/vector image decodes —
+    // without it an imported SVG draws blank until an unrelated repaint (it "vanishes"
+    // until the next click).
+    window.addEventListener(SVG_DECODED_EVENT, handler);
+    return () => {
+      window.removeEventListener(FONT_LOADED_EVENT, handler);
+      window.removeEventListener(SVG_DECODED_EVENT, handler);
+    };
+  }, []);
+
   const createTextAt = useCallback(async (docX: number, docY: number, fixedWidth?: number) => {
     const page = activePage();
     if (!page) return;
@@ -852,20 +1011,6 @@ export default function Canvas() {
     }
   }, [activePage, setFile, setSelectedIds, setEditingTextId]);
 
-
-  // ── Canvas resize ─────────────────────────────────────────────────────────
-  useEffect(() => {
-    const container = containerRef.current;
-    const canvas = canvasRef.current;
-    if (!container || !canvas) return;
-    const ro = new ResizeObserver(() => {
-      canvas.width = container.clientWidth;
-      canvas.height = container.clientHeight;
-      draw();
-    });
-    ro.observe(container);
-    return () => ro.disconnect();
-  }, []);
 
   // ── Fit to page ───────────────────────────────────────────────────────────
   const fitToPage = useCallback(() => {
@@ -889,12 +1034,52 @@ export default function Canvas() {
     setViewport({ x: PADDING + (cw - dw * zoom) / 2 - minX * zoom, y: PADDING + (ch - dh * zoom) / 2 - minY * zoom, zoom });
   }, [activePage]);
 
+  useEffect(() => { if (!file) didFit.current = false; }, [file]);
+
+  // ── Canvas resize ─────────────────────────────────────────────────────────
   useEffect(() => {
-    if (file && !didFit.current) {
-      requestAnimationFrame(() => { fitToPage(); didFit.current = true; });
-    }
-    if (!file) didFit.current = false;
-  }, [file, fitToPage]);
+    const container = containerRef.current;
+    const canvas = canvasRef.current;
+    if (!container || !canvas) return;
+    const resize = () => {
+      // Backing store in DEVICE pixels, display size in CSS pixels. Without the
+      // devicePixelRatio multiplier the canvas renders at 1x on HiDPI displays and
+      // gets stretched by the browser — text and hairlines go visibly blurry.
+      // draw() compensates with a matching DPR base transform, so all drawing code
+      // keeps working in CSS-pixel coordinates.
+      const dpr = window.devicePixelRatio || 1;
+      canvas.width = Math.round(container.clientWidth * dpr);
+      canvas.height = Math.round(container.clientHeight * dpr);
+      canvas.style.width = `${container.clientWidth}px`;
+      canvas.style.height = `${container.clientHeight}px`;
+      // Run the initial fit-to-page from HERE, not a bare requestAnimationFrame: right
+      // after switching from the landing page the container's first layout pass can
+      // report a transitional (too-small) size, and a one-shot RAF fit would lock in a
+      // wrong zoom permanently (didFit never retried). ResizeObserver only fires once
+      // the container has a real, settled size, so this is the reliable trigger — and
+      // it keeps firing on every resize, so a fit attempted before the panel/canvas
+      // finished animating in self-corrects on the very next callback.
+      if (!didFit.current && activePage() && container.clientWidth > 0 && container.clientHeight > 0) {
+        fitToPage();
+        didFit.current = true;
+      }
+      draw();
+    };
+    const ro = new ResizeObserver(resize);
+    ro.observe(container);
+    // ResizeObserver won't fire when the window moves to a monitor with a different
+    // devicePixelRatio (CSS size unchanged) — re-listen on each DPR change so the
+    // backing store follows the display's density.
+    let mq: MediaQueryList | null = null;
+    const watchDpr = () => {
+      mq?.removeEventListener('change', onDprChange);
+      mq = window.matchMedia(`(resolution: ${window.devicePixelRatio || 1}dppx)`);
+      mq.addEventListener('change', onDprChange);
+    };
+    const onDprChange = () => { resize(); watchDpr(); };
+    watchDpr();
+    return () => { ro.disconnect(); mq?.removeEventListener('change', onDprChange); };
+  }, [activePage, fitToPage]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Draw ─────────────────────────────────────────────────────────────────
   const draw = useCallback(() => {
@@ -902,6 +1087,11 @@ export default function Canvas() {
     if (!canvas) return;
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
+    // DPR base transform: the backing store is device-pixel sized (see the resize
+    // handler); this scale lets every subsequent pass — renderPage and all overlay
+    // drawing below — keep working in CSS pixels while rendering at native density.
+    const dpr = window.devicePixelRatio || 1;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     const page = activePage();
     const vp = vpRef.current;
     const drag = dragRef.current;
@@ -921,10 +1111,62 @@ export default function Canvas() {
     if (svgEditShapeIdRef.current) hiddenOverlayIds.add(svgEditShapeIdRef.current);
     if (pathEditShapeIdRef.current) hiddenOverlayIds.add(pathEditShapeIdRef.current);
     if (vectorEditShapeIdRef.current) hiddenOverlayIds.add(vectorEditShapeIdRef.current);
-    const combinedPreview = externalDragPreview.size > 0
+    const rawPreview = externalDragPreview.size > 0
       ? new Map([...previewRef.current, ...externalDragPreview])
       : previewRef.current;
+    // Reflow auto-layout live so children move/resize with the dragged frame (not just on release).
+    const combinedPreview = withAutoLayoutPreview(page, rawPreview);
     renderPage(ctx, page, vp, selectedIds, images.current, combinedPreview, marquee, file ?? undefined, editingTextId, undefined, hiddenOverlayIds);
+
+    // Live selection outline during a transform drag. The React handle overlay is hidden
+    // while dragging (so it can't lag the preview), so we draw the outline here instead —
+    // it tracks the previewed bounds + rotation every frame, matching Figma.
+    if (drag.mode === 'resize' || drag.mode === 'rotate' || drag.mode === 'move'
+        || drag.mode === 'group-resize' || drag.mode === 'group-rotate') {
+      ctx.save();
+      ctx.translate(vp.x, vp.y);
+      ctx.scale(vp.zoom, vp.zoom);
+      ctx.strokeStyle = '#1a73e8';
+      ctx.lineWidth = 1 / vp.zoom;
+      for (const id of selectedIds) {
+        const s = page.objects[id];
+        if (!s) continue;
+        const ov = combinedPreview.get(id);
+        const x = ov?.x ?? s.x, y = ov?.y ?? s.y;
+        const w = ov?.width ?? s.width, h = ov?.height ?? s.height;
+        const rot = ov?.rotation ?? s.rotation;
+        ctx.save();
+        ctx.translate(x + w / 2, y + h / 2);
+        if (rot) ctx.rotate((rot * Math.PI) / 180);
+        ctx.strokeRect(-w / 2, -h / 2, w, h);
+
+        // Handles stay visible and track the shape THROUGHOUT the drag (Figma-style) —
+        // the DOM overlay is hidden while dragging, so draw them here every frame.
+        // Sizes divide by zoom so they render at constant screen size.
+        const hs = 8 / vp.zoom;
+        const pts: [number, number][] = [
+          [-w / 2, -h / 2], [0, -h / 2], [w / 2, -h / 2], [w / 2, 0],
+          [w / 2, h / 2], [0, h / 2], [-w / 2, h / 2], [-w / 2, 0],
+        ];
+        ctx.fillStyle = '#ffffff';
+        ctx.lineWidth = 1.5 / vp.zoom;
+        for (const [px, py] of pts) {
+          ctx.beginPath();
+          ctx.rect(px - hs / 2, py - hs / 2, hs, hs);
+          ctx.fill(); ctx.stroke();
+        }
+        // Rotate knob above top-centre, connected by its stem.
+        const knobY = -h / 2 - 20 / vp.zoom;
+        ctx.lineWidth = 1 / vp.zoom;
+        ctx.beginPath(); ctx.moveTo(0, -h / 2); ctx.lineTo(0, knobY); ctx.stroke();
+        ctx.lineWidth = 1.5 / vp.zoom;
+        ctx.beginPath(); ctx.arc(0, knobY, 5 / vp.zoom, 0, Math.PI * 2);
+        ctx.fill(); ctx.stroke();
+        ctx.lineWidth = 1 / vp.zoom;
+        ctx.restore();
+      }
+      ctx.restore();
+    }
 
     // ── Creation ghost ────────────────────────────────────────────────────
     if (drag.mode === 'text-create') {
@@ -1002,10 +1244,12 @@ export default function Canvas() {
         ctx.beginPath();
         if (line.axis === 'x') {
           const screenX = line.pos * vp.zoom + vp.x;
-          ctx.moveTo(screenX, 0); ctx.lineTo(screenX, canvas.height);
+          // clientHeight (CSS px) — the ctx runs under the DPR transform, so device-pixel
+          // canvas.height would draw the guide only across the top 1/dpr of the viewport.
+          ctx.moveTo(screenX, 0); ctx.lineTo(screenX, canvas.clientHeight);
         } else {
           const screenY = line.pos * vp.zoom + vp.y;
-          ctx.moveTo(0, screenY); ctx.lineTo(canvas.width, screenY);
+          ctx.moveTo(0, screenY); ctx.lineTo(canvas.clientWidth, screenY);
         }
         ctx.stroke();
       }
@@ -1061,10 +1305,24 @@ export default function Canvas() {
     }
   }, [activePage, selectedIds, penSegments, penCurrentDoc]);
 
-  useEffect(() => { draw(); }, [draw, file, selectedIds, viewport, penSegments, penCurrentDoc]);
+  // State-driven repaint when IDLE. During any drag/pan the rAF loop below already repaints
+  // every frame (busy), so skip here to avoid a redundant second draw per frame.
+  useEffect(() => { if (dragRef.current.mode === 'none') draw(); }, [draw, file, selectedIds, viewport, penSegments, penCurrentDoc]);
   useEffect(() => {
+    // The continuous loop exists for LIVE interaction previews (drags, marquee, snap
+    // lines, external label-drag). When idle, skip the redraw — state-driven renders
+    // are covered by the effect above — so an idle canvas costs ~0 CPU instead of
+    // repainting the whole document at 60fps forever.
     let raf: number;
-    const loop = () => { draw(); raf = requestAnimationFrame(loop); };
+    const loop = () => {
+      const busy = dragRef.current.mode !== 'none'
+        || previewRef.current.size > 0
+        || externalDragPreview.size > 0
+        || snapLinesRef.current.length > 0
+        || redrawOnceRef.current;
+      if (busy) { redrawOnceRef.current = false; draw(); }
+      raf = requestAnimationFrame(loop);
+    };
     raf = requestAnimationFrame(loop);
     return () => cancelAnimationFrame(raf);
   }, [draw]);
@@ -1297,7 +1555,7 @@ export default function Canvas() {
         const c = canvasRef.current;
         if (c) setViewport(vp => {
           const next = ZOOM_STEPS.find(z => z > vp.zoom + 0.001) ?? ZOOM_STEPS[ZOOM_STEPS.length - 1];
-          const cx = c.width / 2; const cy = c.height / 2;
+          const cx = c.clientWidth / 2; const cy = c.clientHeight / 2; // CSS px (viewport math space, not device-px backing store)
           const s = next / vp.zoom;
           return clampVp({ zoom: next, x: cx - s * (cx - vp.x), y: cy - s * (cy - vp.y) });
         });
@@ -1308,7 +1566,7 @@ export default function Canvas() {
         const c = canvasRef.current;
         if (c) setViewport(vp => {
           const prev = [...ZOOM_STEPS].reverse().find(z => z < vp.zoom - 0.001) ?? ZOOM_STEPS[0];
-          const cx = c.width / 2; const cy = c.height / 2;
+          const cx = c.clientWidth / 2; const cy = c.clientHeight / 2;
           const s = prev / vp.zoom;
           return clampVp({ zoom: prev, x: cx - s * (cx - vp.x), y: cy - s * (cy - vp.y) });
         });
@@ -1317,13 +1575,13 @@ export default function Canvas() {
       if (meta && e.key === '0') {
         e.preventDefault();
         const c = canvasRef.current;
-        if (c) setViewport({ zoom: 1, x: c.width / 2 - 400, y: 60 });
+        if (c) setViewport({ zoom: 1, x: c.clientWidth / 2 - 400, y: 60 });
         return;
       }
       if (!meta && e.key === '0') { fitToPage(); return; }
       if (e.key === '1') {
         const c = canvasRef.current;
-        if (c) setViewport({ x: c.width / 2 - 400, y: 60, zoom: 1 });
+        if (c) setViewport({ x: c.clientWidth / 2 - 400, y: 60, zoom: 1 });
         return;
       }
 
@@ -1400,8 +1658,8 @@ export default function Canvas() {
         return;
       }
 
-      // Cut (Cmd+X)
-      if (meta && e.key === 'x') {
+      // Cut (Cmd+X) — plain, no Shift/Alt (matches Copy's guard so Cmd+Shift+X etc. don't cut)
+      if (meta && !e.shiftKey && !e.altKey && e.key === 'x') {
         e.preventDefault();
         if (page && selectedIds.size > 0) {
           const roots = topLevelSelection(page, [...selectedIds]);
@@ -1424,33 +1682,28 @@ export default function Canvas() {
           const rShapes = cb.rootIds.map(id => cb.objects[id]).filter(Boolean);
           const idMap = new Map<string, string>();
           for (const id of Object.keys(cb.objects)) idMap.set(id, genId());
+          // Cmd+Shift+V pastes in place (overlapping). Cmd+V offsets the copy to a
+          // clear, non-overlapping slot right of the source — checked against every
+          // frame currently on the canvas, matching Figma.
           let dx = 0, dy = 0;
-          if (!e.shiftKey && rShapes.length > 0 && canvasRef.current) {
-            const vp = vpRef.current;
-            const cw = canvasRef.current.width; const ch = canvasRef.current.height;
-            const vpCx = (cw / 2 - vp.x) / vp.zoom;
-            const vpCy = (ch / 2 - vp.y) / vp.zoom;
-            const minX = Math.min(...rShapes.map(s => s.x));
-            const minY = Math.min(...rShapes.map(s => s.y));
-            const maxX = Math.max(...rShapes.map(s => s.x + s.width));
-            const maxY = Math.max(...rShapes.map(s => s.y + s.height));
-            dx = Math.round(vpCx - (minX + maxX) / 2);
-            dy = Math.round(vpCy - (minY + maxY) / 2);
+          if (!e.shiftKey && rShapes.length > 0) {
+            const off = clearPlacementOffset(page, shapesBBox(rShapes));
+            dx = off.dx; dy = off.dy;
           }
-          const ops: Parameters<typeof api.applyChanges>[0]['ops'] = [];
+          const ops: { op: 'add'; shape: Shape }[] = [];
           for (const [origId, shape] of Object.entries(cb.objects)) {
             const newId = idMap.get(origId)!;
-            const isRoot = cb.rootIds.includes(origId);
             ops.push({ op: 'add' as const, shape: {
               ...shape,
               id: newId,
-              x: isRoot ? shape.x + dx : shape.x + dx,
-              y: isRoot ? shape.y + dy : shape.y + dy,
+              x: shape.x + dx,
+              y: shape.y + dy,
               parentId: shape.parentId ? (idMap.get(shape.parentId) ?? null) : null,
               frameId: idMap.get(shape.frameId) ?? shape.frameId,
               childIds: shape.childIds.map(c => idMap.get(c) ?? c),
             }});
           }
+          uniquifyRootNames(page, ops, new Set(cb.rootIds.map(id => idMap.get(id)!)));
           const res = await api.applyChanges({ pageId: page.id, ops });
           if (res.ok && res.data) {
             setFile(res.data);
@@ -1460,21 +1713,26 @@ export default function Canvas() {
         return;
       }
 
-      // Duplicate (Cmd+D) — clone selection + offset by 10,10
-      if (meta && e.key === 'd') {
+      // Duplicate (Cmd+D) — clone selection to a clear, non-overlapping slot. Plain only.
+      if (meta && !e.shiftKey && !e.altKey && e.key === 'd') {
         e.preventDefault();
         if (page && selectedIds.size > 0) {
           const roots = topLevelSelection(page, [...selectedIds]);
+          const rootShapes = roots.map(id => page.objects[id]).filter((s): s is Shape => !!s);
+          if (rootShapes.length === 0) return;
+          // One offset for the whole selection (preserves relative layout), cleared
+          // against every existing frame so repeated ⌘D never stacks.
+          const { dx, dy } = clearPlacementOffset(page, shapesBBox(rootShapes));
           const allOps: { op: 'add'; shape: Shape }[] = [];
           const rootCloneIds: string[] = [];
           for (const rootId of roots) {
             const { ops, newRootId } = deepCloneSubtree(page, rootId);
-            // Offset root clone by +10,+10
-            const rootOp = ops.find(op => op.shape.id === newRootId);
-            if (rootOp) { rootOp.shape.x += 10; rootOp.shape.y += 10; }
+            // Shift every cloned node (root + descendants store absolute coords).
+            for (const op of ops) { op.shape.x += dx; op.shape.y += dy; }
             allOps.push(...ops);
             rootCloneIds.push(newRootId);
           }
+          uniquifyRootNames(page, allOps, new Set(rootCloneIds));
           const res = await api.applyChanges({ pageId: page.id, ops: allOps });
           if (res.ok && res.data) { setFile(res.data); setSelectedIds(rootCloneIds); }
         }
@@ -1733,6 +1991,20 @@ export default function Canvas() {
     else setCursor('crosshair');
   }, [activeTool]);
 
+  // Figma affordance: while Alt/Option is held with a selection (and not mid-drag),
+  // show the duplicate cursor so the user knows a drag will clone. Reverts on release.
+  // During an actual drag the move handler owns the cursor, so we skip then.
+  useEffect(() => {
+    const sync = (e: KeyboardEvent) => {
+      if (activeTool !== 'select' || dragRef.current.mode !== 'none') return;
+      if (e.altKey && selectedIds.size > 0) setCursor(DUP_CURSOR);
+      else if (!e.altKey) setCursor('default');
+    };
+    window.addEventListener('keydown', sync);
+    window.addEventListener('keyup', sync);
+    return () => { window.removeEventListener('keydown', sync); window.removeEventListener('keyup', sync); };
+  }, [activeTool, selectedIds]);
+
   const getScreenPoint = (e: React.MouseEvent) => {
     const rect = canvasRef.current!.getBoundingClientRect();
     return { sx: e.clientX - rect.left, sy: e.clientY - rect.top };
@@ -1747,15 +2019,58 @@ export default function Canvas() {
     setIsDragging(true);
   }, [activePage]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // Snapshot a subtree (root + all descendants) for rigid-body rotation previews.
+  const subtreeSnapshots = useCallback((page: Page, rootIds: string[]): Shape[] =>
+    withDescendants(page, rootIds)
+      .map(id => page.objects[id])
+      .filter((s): s is Shape => !!s)
+      .map(s => structuredClone(s)), []);
+
   const startRotateHandle = useCallback((shapeId: string, e: React.MouseEvent) => {
     e.stopPropagation(); e.preventDefault();
     const page = activePage(); const shape = page?.objects[shapeId]; if (!shape) return;
     const { sx, sy } = getScreenPoint(e);
     const doc = screenToDoc(sx, sy, vpRef.current);
     const cx = shape.x + shape.width / 2; const cy = shape.y + shape.height / 2;
-    dragRef.current = { mode: 'rotate', shapeId, original: structuredClone(shape), cx, cy, startDocX: doc.x, startDocY: doc.y };
+    dragRef.current = { mode: 'rotate', shapeId, original: structuredClone(shape), nodes: subtreeSnapshots(page!, [shapeId]), cx, cy, startDocX: doc.x, startDocY: doc.y };
     setIsDragging(true);
-  }, [activePage]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [activePage, subtreeSnapshots]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Union (axis-aligned) bounding box of the current selection, in document space.
+  const selectionUnion = useCallback((): { x: number; y: number; w: number; h: number; shapes: Shape[] } | null => {
+    const page = activePage(); if (!page) return null;
+    const shapes = [...selectedIds].map(id => page.objects[id]).filter((s): s is Shape => !!s);
+    if (shapes.length === 0) return null;
+    const minX = Math.min(...shapes.map(s => s.selrect.x));
+    const minY = Math.min(...shapes.map(s => s.selrect.y));
+    const maxX = Math.max(...shapes.map(s => s.selrect.x + s.selrect.width));
+    const maxY = Math.max(...shapes.map(s => s.selrect.y + s.selrect.height));
+    return { x: minX, y: minY, w: maxX - minX, h: maxY - minY, shapes };
+  }, [activePage, selectedIds]);
+
+  const startGroupResize = useCallback((handleIndex: number, e: React.MouseEvent) => {
+    e.stopPropagation(); e.preventDefault();
+    const u = selectionUnion(); if (!u) return;
+    const { sx, sy } = getScreenPoint(e);
+    const doc = screenToDoc(sx, sy, vpRef.current);
+    dragRef.current = { mode: 'group-resize', handleIndex, ux: u.x, uy: u.y, uw: u.w, uh: u.h, originals: u.shapes.map(s => structuredClone(s)), startDocX: doc.x, startDocY: doc.y };
+    setIsDragging(true);
+  }, [selectionUnion]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const startGroupRotate = useCallback((e: React.MouseEvent) => {
+    e.stopPropagation(); e.preventDefault();
+    const u = selectionUnion(); if (!u) return;
+    const { sx, sy } = getScreenPoint(e);
+    const doc = screenToDoc(sx, sy, vpRef.current);
+    const page = activePage()!;
+    dragRef.current = {
+      mode: 'group-rotate', cx: u.x + u.w / 2, cy: u.y + u.h / 2,
+      originals: u.shapes.map(s => structuredClone(s)),
+      nodes: subtreeSnapshots(page, u.shapes.map(s => s.id)),
+      startDocX: doc.x, startDocY: doc.y,
+    };
+    setIsDragging(true);
+  }, [selectionUnion, activePage, subtreeSnapshots]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const onMouseDown = useCallback(async (e: React.MouseEvent) => {
     // While editing text, a click anywhere on the canvas finishes editing (Figma
@@ -1780,12 +2095,16 @@ export default function Canvas() {
     }
     if (e.button !== 0) return;
 
-    // Alt + left-click on a selected node = duplicate-drag; alt + click elsewhere = pan
+    // Alt/Option + drag on a node = duplicate-drag (clone follows the cursor, original
+    // stays put). Works whether or not the node was already selected — alt-dragging an
+    // unselected frame clones just that frame, matching Figma. Alt on empty canvas = pan.
     if (e.altKey) {
       const altHit = page ? hitTestPoint(page, doc.x, doc.y) : null;
-      const altTarget = altHit && page ? resolveSelectionTarget(page, altHit, groupEditId) : null;
-      if (altTarget && selectedIds.has(altTarget) && page) {
-        const roots = topLevelSelection(page, [...selectedIds]);
+      const altTarget = altHit && page ? resolveSelectionTarget(page, altHit, groupEditIdRef.current) : null;
+      if (altTarget && page) {
+        // Clone the whole selection when the target is part of it; otherwise just the target.
+        const baseIds = selectedIds.has(altTarget) ? [...selectedIds] : [altTarget];
+        const roots = topLevelSelection(page, baseIds);
         const allOps: { op: 'add'; shape: Shape }[] = [];
         const cloneOriginals: Record<string, { x: number; y: number }> = {};
         const rootCloneIds: string[] = [];
@@ -1795,9 +2114,12 @@ export default function Canvas() {
           rootCloneIds.push(newRootId);
           for (const op of ops) cloneOriginals[op.shape.id] = { x: op.shape.x, y: op.shape.y };
         }
+        uniquifyRootNames(page, allOps, new Set(rootCloneIds));
         const res = await api.applyChanges({ pageId: page.id, ops: allOps });
         if (res.ok && res.data) { setFile(res.data); setSelectedIds(rootCloneIds); }
         dragRef.current = { mode: 'move', startDocX: doc.x, startDocY: doc.y, originals: cloneOriginals };
+        setIsDragging(true);
+        setCursor(DUP_CURSOR);
         e.preventDefault(); return;
       }
       dragRef.current = { mode: 'pan', lastScreenX: sx, lastScreenY: sy };
@@ -1904,7 +2226,7 @@ export default function Canvas() {
       if (!shape) return;
       if (handleHit.handleIndex === ROTATE_HANDLE) {
         const { cx, cy } = shapeCenterDoc(shape);
-        dragRef.current = { mode: 'rotate', shapeId: shape.id, original: structuredClone(shape), cx, cy, startDocX: doc.x, startDocY: doc.y };
+        dragRef.current = { mode: 'rotate', shapeId: shape.id, original: structuredClone(shape), nodes: subtreeSnapshots(page, [shape.id]), cx, cy, startDocX: doc.x, startDocY: doc.y };
       } else {
         dragRef.current = { mode: 'resize', shapeId: shape.id, handleIndex: handleHit.handleIndex, original: structuredClone(shape), startDocX: doc.x, startDocY: doc.y };
       }
@@ -2012,6 +2334,9 @@ export default function Canvas() {
         dragRef.current = { ...drag, lastScreenX: sx, lastScreenY: sy };
         break;
       case 'move': {
+        // Alt/Option held mid-drag → show the duplicate cursor (no-op re-render when
+        // the value is unchanged, so this is cheap to call every move).
+        setCursor(e.altKey ? DUP_CURSOR : 'move');
         const dx = doc.x - drag.startDocX; const dy = doc.y - drag.startDocY;
         const noSnap = e.metaKey || e.ctrlKey;
         const next = new Map<string, ShapePreview>();
@@ -2019,7 +2344,15 @@ export default function Canvas() {
 
         if (!noSnap && page) {
           const movedIds = new Set(Object.keys(drag.originals));
-          const targets = getSnapTargets(page, movedIds);
+          // Reuse the cached targets for this drag (owner === drag object); recompute only
+          // when a new drag begins.
+          let targets: { x: number[]; y: number[] };
+          if (snapCacheRef.current?.owner === drag) {
+            targets = snapCacheRef.current.targets;
+          } else {
+            targets = getSnapTargets(page, movedIds);
+            snapCacheRef.current = { owner: drag, targets };
+          }
           // guides handled separately with their own thresholds below
           const [firstId, firstOrig] = Object.entries(drag.originals)[0] ?? [];
           const refShape = firstId ? page.objects[firstId] : null;
@@ -2215,8 +2548,56 @@ export default function Canvas() {
         break;
       }
       case 'rotate': {
-        const r = applyRotateDelta(drag.original, drag.cx, drag.cy, drag.startDocX, drag.startDocY, doc.x, doc.y);
-        previewRef.current = new Map([[drag.shapeId, { rotation: r }]]);
+        const r = applyRotateDelta(drag.original, drag.cx, drag.cy, drag.startDocX, drag.startDocY, doc.x, doc.y, e.shiftKey ? 15 : undefined);
+        // Rigid-body preview: the whole subtree turns with the container every frame —
+        // descendants' centres orbit the pivot and their own rotation gains the delta.
+        const delta = r - drag.original.rotation;
+        const rad = (delta * Math.PI) / 180, cos = Math.cos(rad), sin = Math.sin(rad);
+        const map = new Map<string, ShapePreview>();
+        for (const n of drag.nodes) {
+          if (n.id === drag.shapeId) { map.set(n.id, { rotation: r }); continue; }
+          const ocx = n.x + n.width / 2, ocy = n.y + n.height / 2;
+          const nx = drag.cx + (ocx - drag.cx) * cos - (ocy - drag.cy) * sin;
+          const ny = drag.cy + (ocx - drag.cx) * sin + (ocy - drag.cy) * cos;
+          map.set(n.id, { x: nx - n.width / 2, y: ny - n.height / 2, rotation: ((n.rotation + delta) % 360 + 360) % 360 });
+        }
+        previewRef.current = map;
+        break;
+      }
+      case 'group-resize': {
+        // Resize the union box like a plain shape, then map the scale onto every member.
+        const dx = doc.x - drag.startDocX, dy = doc.y - drag.startDocY;
+        const fake = { x: drag.ux, y: drag.uy, width: drag.uw, height: drag.uh, rotation: 0 } as unknown as Shape;
+        const nb = applyResizeDelta(fake, drag.handleIndex, dx, dy, e.shiftKey);
+        const sx2 = drag.uw === 0 ? 1 : nb.width / drag.uw;
+        const sy2 = drag.uh === 0 ? 1 : nb.height / drag.uh;
+        const map = new Map<string, ShapePreview>();
+        for (const o of drag.originals) {
+          map.set(o.id, {
+            x: nb.x + (o.x - drag.ux) * sx2,
+            y: nb.y + (o.y - drag.uy) * sy2,
+            width: Math.max(1, o.width * sx2),
+            height: Math.max(1, o.height * sy2),
+          });
+        }
+        previewRef.current = map;
+        break;
+      }
+      case 'group-rotate': {
+        const startA = Math.atan2(drag.startDocY - drag.cy, drag.startDocX - drag.cx);
+        const curA = Math.atan2(doc.y - drag.cy, doc.x - drag.cx);
+        let deltaDeg = (curA - startA) * (180 / Math.PI);
+        if (e.shiftKey) deltaDeg = Math.round(deltaDeg / 15) * 15;
+        const rad = (deltaDeg * Math.PI) / 180, cos = Math.cos(rad), sin = Math.sin(rad);
+        // Rigid-body preview over EVERY node in the selected subtrees, not just the roots.
+        const map = new Map<string, ShapePreview>();
+        for (const o of drag.nodes) {
+          const ocx = o.x + o.width / 2, ocy = o.y + o.height / 2;
+          const nx = drag.cx + (ocx - drag.cx) * cos - (ocy - drag.cy) * sin;
+          const ny = drag.cy + (ocx - drag.cx) * sin + (ocy - drag.cy) * cos;
+          map.set(o.id, { x: nx - o.width / 2, y: ny - o.height / 2, rotation: ((o.rotation + deltaDeg) % 360 + 360) % 360 });
+        }
+        previewRef.current = map;
         break;
       }
       case 'marquee':
@@ -2277,7 +2658,6 @@ export default function Canvas() {
         } else if (activeTool === 'text') {
           setCursor('text');
         } else {
-          const hitId = hitTestPoint(page, doc.x, doc.y);
           setCursor(activeTool === 'pen' ? PEN_CURSOR : 'default');
         }
         break;
@@ -2288,7 +2668,9 @@ export default function Canvas() {
   const onMouseUp = useCallback(async (e: React.MouseEvent) => {
     const drag = dragRef.current;
     const page = activePage();
-    previewRef.current = new Map();
+    // NOTE: previewRef is NOT cleared here — the commit below is async, and clearing
+    // now would snap shapes back to their pre-drag positions for the frames between
+    // release and the store update (visible flash). Cleared in the finally at the end.
     dragRef.current = { mode: 'none' };
     setIsDragging(false);
     snapLinesRef.current = [];
@@ -2300,20 +2682,29 @@ export default function Canvas() {
     if (tooltipRef.current) tooltipRef.current.style.display = 'none';
     setCursor(activeTool === 'text' ? 'text' : activeTool === 'pen' ? PEN_CURSOR : activeTool === 'select' ? 'default' : 'crosshair');
 
-    if (!page) return;
+    if (!page) { previewRef.current = new Map(); return; }
     const { sx, sy } = getScreenPoint(e);
     const doc = screenToDoc(sx, sy, vpRef.current);
 
+    try {
     switch (drag.mode) {
       case 'move': {
         const dx = doc.x - drag.startDocX; const dy = doc.y - drag.startDocY;
         if (Math.abs(dx) < 0.5 && Math.abs(dy) < 0.5) break;
         const snapDxCommit = committedSnapOffset?.dx ?? 0;
         const snapDyCommit = committedSnapOffset?.dy ?? 0;
-        const ops: Parameters<typeof api.applyChanges>[0]['ops'] = Object.entries(drag.originals).flatMap(([id, orig]) => [
-          { op: 'set' as const, id, attr: 'x', val: Math.round(orig.x + dx + snapDxCommit) },
-          { op: 'set' as const, id, attr: 'y', val: Math.round(orig.y + dy + snapDyCommit) },
-        ]);
+        // Send x/y ops for the dragged ROOTS only — the engine's rigid-body cascade
+        // translates each root's descendants (sending subtree ops too would double-move).
+        const movedSet = new Set(Object.keys(drag.originals));
+        const moveRoots = topLevelSelection(page, [...movedSet]);
+        const ops: Parameters<typeof api.applyChanges>[0]['ops'] = moveRoots.flatMap(id => {
+          const orig = drag.originals[id];
+          if (!orig) return [];
+          return [
+            { op: 'set' as const, id, attr: 'x', val: Math.round(orig.x + dx + snapDxCommit) },
+            { op: 'set' as const, id, attr: 'y', val: Math.round(orig.y + dy + snapDyCommit) },
+          ];
+        });
 
         // Figma-style re-parenting: each dragged root is re-homed into whatever frame it
         // lands over (by its new center), or the page root when dropped on empty canvas.
@@ -2418,33 +2809,48 @@ export default function Canvas() {
         break;
       }
       case 'rotate': {
-        const r = applyRotateDelta(drag.original, drag.cx, drag.cy, drag.startDocX, drag.startDocY, doc.x, doc.y);
-        const ops: Parameters<typeof api.applyChanges>[0]['ops'] =
-          [{ op: 'set', id: drag.shapeId, attr: 'rotation', val: Math.round(r) }];
-
-        // Container rotation cascades to descendants: each child rotates about the
-        // container's center (the pivot) and gains the same delta to its own rotation, so
-        // the whole subtree turns as one rigid body — matching Figma frame/group rotation.
-        const rs = page.objects[drag.shapeId];
-        if (rs && rs.childIds.length > 0) {
-          const deltaDeg = Math.round(r) - drag.original.rotation;
-          if (deltaDeg !== 0) {
-            const rad = (deltaDeg * Math.PI) / 180;
-            const cos = Math.cos(rad), sin = Math.sin(rad);
-            for (const id of withDescendants(page, [drag.shapeId])) {
-              if (id === drag.shapeId) continue;
-              const c = page.objects[id];
-              if (!c) continue;
-              const ccx = c.x + c.width / 2, ccy = c.y + c.height / 2;
-              const nx = drag.cx + (ccx - drag.cx) * cos - (ccy - drag.cy) * sin;
-              const ny = drag.cy + (ccx - drag.cx) * sin + (ccy - drag.cy) * cos;
-              ops.push({ op: 'set', id, attr: 'x', val: Math.round(nx - c.width / 2) });
-              ops.push({ op: 'set', id, attr: 'y', val: Math.round(ny - c.height / 2) });
-              ops.push({ op: 'set', id, attr: 'rotation', val: Math.round((c.rotation + deltaDeg) % 360) });
-            }
-          }
+        const r = applyRotateDelta(drag.original, drag.cx, drag.cy, drag.startDocX, drag.startDocY, doc.x, doc.y, e.shiftKey ? 15 : undefined);
+        // Single rotation op — the engine's rotation cascade (mockEngine.applyChanges)
+        // turns the whole subtree as one rigid body, identically for drags and panel edits.
+        const res = await api.applyChanges({
+          pageId: page.id,
+          ops: [{ op: 'set', id: drag.shapeId, attr: 'rotation', val: Math.round(r) }],
+        });
+        if (res.ok && res.data) setFile(res.data);
+        break;
+      }
+      case 'group-resize': {
+        const dx = doc.x - drag.startDocX, dy = doc.y - drag.startDocY;
+        const fake = { x: drag.ux, y: drag.uy, width: drag.uw, height: drag.uh, rotation: 0 } as unknown as Shape;
+        const nb = applyResizeDelta(fake, drag.handleIndex, dx, dy, e.shiftKey);
+        const sx2 = drag.uw === 0 ? 1 : nb.width / drag.uw;
+        const sy2 = drag.uh === 0 ? 1 : nb.height / drag.uh;
+        const ops: Parameters<typeof api.applyChanges>[0]['ops'] = [];
+        for (const o of drag.originals) {
+          ops.push({ op: 'set', id: o.id, attr: 'x', val: Math.round(nb.x + (o.x - drag.ux) * sx2) });
+          ops.push({ op: 'set', id: o.id, attr: 'y', val: Math.round(nb.y + (o.y - drag.uy) * sy2) });
+          ops.push({ op: 'set', id: o.id, attr: 'width', val: Math.max(1, Math.round(o.width * sx2)) });
+          ops.push({ op: 'set', id: o.id, attr: 'height', val: Math.max(1, Math.round(o.height * sy2)) });
         }
-
+        const res = await api.applyChanges({ pageId: page.id, ops });
+        if (res.ok && res.data) setFile(res.data);
+        break;
+      }
+      case 'group-rotate': {
+        const startA = Math.atan2(drag.startDocY - drag.cy, drag.startDocX - drag.cx);
+        const curA = Math.atan2(doc.y - drag.cy, doc.x - drag.cx);
+        let deltaDeg = (curA - startA) * (180 / Math.PI);
+        if (e.shiftKey) deltaDeg = Math.round(deltaDeg / 15) * 15;
+        const rad = (deltaDeg * Math.PI) / 180, cos = Math.cos(rad), sin = Math.sin(rad);
+        const ops: Parameters<typeof api.applyChanges>[0]['ops'] = [];
+        for (const o of drag.originals) {
+          const ocx = o.x + o.width / 2, ocy = o.y + o.height / 2;
+          const nx = drag.cx + (ocx - drag.cx) * cos - (ocy - drag.cy) * sin;
+          const ny = drag.cy + (ocx - drag.cx) * sin + (ocy - drag.cy) * cos;
+          ops.push({ op: 'set', id: o.id, attr: 'x', val: Math.round(nx - o.width / 2) });
+          ops.push({ op: 'set', id: o.id, attr: 'y', val: Math.round(ny - o.height / 2) });
+          ops.push({ op: 'set', id: o.id, attr: 'rotation', val: Math.round(((o.rotation + deltaDeg) % 360 + 360) % 360) });
+        }
         const res = await api.applyChanges({ pageId: page.id, ops });
         if (res.ok && res.data) setFile(res.data);
         break;
@@ -2460,9 +2866,6 @@ export default function Canvas() {
             ? (page.objects[drag.frameId]?.childIds ?? [])
             : page.childIds;
           setSelectedIds(hitTestMarquee(page, dm, candidates));
-        } else if (drag.clickSelectId) {
-          // It was a click (no drag) on a frame body → select the frame.
-          setSelectedIds([drag.clickSelectId]);
         }
         break;
       }
@@ -2520,6 +2923,11 @@ export default function Canvas() {
         setActiveTool('select');
         break;
       }
+    }
+    } finally {
+      // Clear the drag preview only after the commit landed, so the canvas never
+      // flashes back to pre-drag positions between mouse release and store update.
+      previewRef.current = new Map();
     }
   }, [activePage, setFile, setSelectedIds, activeTool, setActiveTool, createTextAt]);
 
@@ -2777,6 +3185,41 @@ export default function Canvas() {
         const { zoom, x: panX, y: panY } = viewport;
         const ACCENT = '#1a73e8';
         const elements: React.ReactNode[] = [];
+
+        // Multi-selection → a SINGLE union bounding box with one handle set (Figma-style),
+        // instead of overlapping per-shape boxes. Handles drive group resize / rotate.
+        if (selectedIds.size > 1) {
+          const u = selectionUnion();
+          if (!u) return null;
+          const L = u.x * zoom + panX, T = u.y * zoom + panY;
+          const R = (u.x + u.w) * zoom + panX, B = (u.y + u.h) * zoom + panY;
+          const MX = (L + R) / 2, MY = (T + B) / 2;
+          const gHandles = [
+            { id: 'nw', x: L,  y: T,  cursor: 'nwse-resize', index: 0 },
+            { id: 'n',  x: MX, y: T,  cursor: 'ns-resize',   index: 1 },
+            { id: 'ne', x: R,  y: T,  cursor: 'nesw-resize', index: 2 },
+            { id: 'e',  x: R,  y: MY, cursor: 'ew-resize',   index: 3 },
+            { id: 'se', x: R,  y: B,  cursor: 'nwse-resize', index: 4 },
+            { id: 's',  x: MX, y: B,  cursor: 'ns-resize',   index: 5 },
+            { id: 'sw', x: L,  y: B,  cursor: 'nesw-resize', index: 6 },
+            { id: 'w',  x: L,  y: MY, cursor: 'ew-resize',   index: 7 },
+          ];
+          elements.push(
+            <g key="group-sel">
+              <rect x={L} y={T} width={R - L} height={B - T} fill="none" stroke={ACCENT} strokeWidth={1} style={{ pointerEvents: 'none' }} />
+              <line x1={MX} y1={T - 20} x2={MX} y2={T} stroke={ACCENT} strokeWidth={1} style={{ pointerEvents: 'none' }} />
+              {gHandles.map(h => (
+                <rect key={`g-${h.id}`} x={h.x - 4} y={h.y - 4} width={8} height={8}
+                  fill="white" stroke={ACCENT} strokeWidth={1.5} rx={1}
+                  style={{ cursor: h.cursor, pointerEvents: 'all' }}
+                  onMouseDown={e => { startGroupResize(h.index, e); }} />
+              ))}
+              <circle cx={MX} cy={T - 20} r={5} fill="white" stroke={ACCENT} strokeWidth={1.5}
+                style={{ cursor: 'grab', pointerEvents: 'all' }}
+                onMouseDown={e => { startGroupRotate(e); }} />
+            </g>
+          );
+        } else
         for (const shapeId of selectedIds) {
           if (shapeId === editingTextId) continue;
           if (shapeId === vectorEditShapeId || shapeId === svgEditShapeId || shapeId === pathEditShapeId) continue;
@@ -2798,21 +3241,26 @@ export default function Canvas() {
             { id: 'sw', x: L,  y: B,  cursor: 'nesw-resize', index: 6 },
             { id: 'w',  x: L,  y: MY, cursor: 'ew-resize',   index: 7 },
           ];
+          // Rotate the whole selection group (box + handles) around the shape's centre so the
+          // outline wraps the rotated element instead of staying axis-aligned.
+          const rot = shape.rotation ? `rotate(${shape.rotation} ${MX} ${MY})` : undefined;
           elements.push(
-            <rect key={`${shapeId}-box`} x={L} y={T} width={R - L} height={B - T}
-              fill="none" stroke={ACCENT} strokeWidth={1} style={{ pointerEvents: 'none' }} />,
-            <line key={`${shapeId}-rotline`} x1={MX} y1={T - 20} x2={MX} y2={T}
-              stroke={ACCENT} strokeWidth={1} style={{ pointerEvents: 'none' }} />,
-            ...handles.map(h => (
-              <rect key={`${shapeId}-${h.id}`} x={h.x - 4} y={h.y - 4} width={8} height={8}
-                fill="white" stroke={ACCENT} strokeWidth={1.5} rx={1}
-                style={{ cursor: h.cursor, pointerEvents: 'all' }}
-                onMouseDown={e => { startResizeHandle(shapeId, h.index, e); }} />
-            )),
-            <circle key={`${shapeId}-rotate`} cx={MX} cy={T - 20} r={5}
-              fill="white" stroke={ACCENT} strokeWidth={1.5}
-              style={{ cursor: 'grab', pointerEvents: 'all' }}
-              onMouseDown={e => { startRotateHandle(shapeId, e); }} />,
+            <g key={`${shapeId}-sel`} transform={rot}>
+              <rect x={L} y={T} width={R - L} height={B - T}
+                fill="none" stroke={ACCENT} strokeWidth={1} style={{ pointerEvents: 'none' }} />
+              <line x1={MX} y1={T - 20} x2={MX} y2={T}
+                stroke={ACCENT} strokeWidth={1} style={{ pointerEvents: 'none' }} />
+              {handles.map(h => (
+                <rect key={`${shapeId}-${h.id}`} x={h.x - 4} y={h.y - 4} width={8} height={8}
+                  fill="white" stroke={ACCENT} strokeWidth={1.5} rx={1}
+                  style={{ cursor: h.cursor, pointerEvents: 'all' }}
+                  onMouseDown={e => { startResizeHandle(shapeId, h.index, e); }} />
+              ))}
+              <circle cx={MX} cy={T - 20} r={5}
+                fill="white" stroke={ACCENT} strokeWidth={1.5}
+                style={{ cursor: 'grab', pointerEvents: 'all' }}
+                onMouseDown={e => { startRotateHandle(shapeId, e); }} />
+            </g>
           );
         }
         if (elements.length === 0) return null;
@@ -2916,17 +3364,22 @@ export default function Canvas() {
             const page = activePage();
             if (!page || !canvasClipboard) return;
             const cb = canvasClipboard;
+            const rShapes = cb.rootIds.map(id => cb.objects[id]).filter(Boolean);
             const idMap = new Map<string, string>();
             for (const id of Object.keys(cb.objects)) idMap.set(id, genId());
-            const ops: Parameters<typeof api.applyChanges>[0]['ops'] = [];
+            const { dx, dy } = rShapes.length > 0
+              ? clearPlacementOffset(page, shapesBBox(rShapes))
+              : { dx: DUP_GAP, dy: 0 };
+            const ops: { op: 'add'; shape: Shape }[] = [];
             for (const [origId, shape] of Object.entries(cb.objects)) {
               ops.push({ op: 'add' as const, shape: {
-                ...shape, id: idMap.get(origId)!, x: shape.x + 10, y: shape.y + 10,
+                ...shape, id: idMap.get(origId)!, x: shape.x + dx, y: shape.y + dy,
                 parentId: shape.parentId ? (idMap.get(shape.parentId) ?? null) : null,
                 frameId: idMap.get(shape.frameId) ?? shape.frameId,
                 childIds: shape.childIds.map(c => idMap.get(c) ?? c),
               }});
             }
+            uniquifyRootNames(page, ops, new Set(cb.rootIds.map(id => idMap.get(id)!)));
             const res = await api.applyChanges({ pageId: page.id, ops });
             if (res.ok && res.data) { setFile(res.data); setSelectedIds(cb.rootIds.map(id => idMap.get(id)!)); }
           }}
@@ -2934,15 +3387,18 @@ export default function Canvas() {
             const page = activePage();
             if (!page || selectedIds.size === 0) return;
             const roots = topLevelSelection(page, [...selectedIds]);
+            const rootShapes = roots.map(id => page.objects[id]).filter((s): s is Shape => !!s);
+            if (rootShapes.length === 0) return;
+            const { dx, dy } = clearPlacementOffset(page, shapesBBox(rootShapes));
             const allOps: { op: 'add'; shape: Shape }[] = [];
             const rootCloneIds: string[] = [];
             for (const rootId of roots) {
               const { ops, newRootId } = deepCloneSubtree(page, rootId);
-              const rootOp = ops.find(op => op.shape.id === newRootId);
-              if (rootOp) { rootOp.shape.x += 10; rootOp.shape.y += 10; }
+              for (const op of ops) { op.shape.x += dx; op.shape.y += dy; }
               allOps.push(...ops);
               rootCloneIds.push(newRootId);
             }
+            uniquifyRootNames(page, allOps, new Set(rootCloneIds));
             const res = await api.applyChanges({ pageId: page.id, ops: allOps });
             if (res.ok && res.data) { setFile(res.data); setSelectedIds(rootCloneIds); }
           }}
@@ -2959,6 +3415,21 @@ export default function Canvas() {
             const group = makeDefaultShape({ id: groupId, type: 'group', name: 'Group', frameId: shapes[0].frameId, parentId: commonParent, x: minX, y: minY, width: maxX - minX, height: maxY - minY, fills: [], strokes: [], selrect: { x: minX, y: minY, width: maxX - minX, height: maxY - minY } });
             const res = await api.applyChanges({ pageId: page.id, ops: [{ op: 'add', shape: group }, ...[...selectedIds].map((id, i) => ({ op: 'move' as const, id, parentId: groupId, index: i }))] });
             if (res.ok && res.data) { setFile(res.data); setSelectedIds([groupId]); setGroupEditId(null); }
+          }}
+          onFrameSelection={async () => {
+            // Same as the ⌘⌥G "Group as Frame" shortcut: wrap the selection in a frame.
+            const page = activePage();
+            if (!page || selectedIds.size === 0) return;
+            const shapes = [...selectedIds].map(id => page.objects[id]).filter(Boolean);
+            const minX = Math.min(...shapes.map(s => s.selrect.x));
+            const minY = Math.min(...shapes.map(s => s.selrect.y));
+            const maxX = Math.max(...shapes.map(s => s.selrect.x + s.selrect.width));
+            const maxY = Math.max(...shapes.map(s => s.selrect.y + s.selrect.height));
+            const frameId = genId();
+            const commonParent = shapes.every(s => s.parentId === shapes[0].parentId) ? shapes[0].parentId ?? null : null;
+            const frame = makeDefaultShape({ id: frameId, type: 'frame', name: 'Frame', frameId, parentId: commonParent, x: minX, y: minY, width: maxX - minX, height: maxY - minY, fills: [{ type: 'solid' as const, color: '#FFFFFF', opacity: 1 }], strokes: [], clipContent: true, selrect: { x: minX, y: minY, width: maxX - minX, height: maxY - minY } });
+            const res = await api.applyChanges({ pageId: page.id, ops: [{ op: 'add', shape: frame }, ...[...selectedIds].map((id, i) => ({ op: 'move' as const, id, parentId: frameId, index: i }))] });
+            if (res.ok && res.data) { setFile(res.data); setSelectedIds([frameId]); setGroupEditId(null); }
           }}
           onUngroup={async () => {
             const page = activePage();
@@ -3051,6 +3522,7 @@ interface CtxMenuProps {
   x: number; y: number; hasSelection: boolean; onClose: () => void;
   onCopy: () => void; onCut: () => void; onPaste: () => Promise<void>;
   onDuplicate: () => Promise<void>; onGroup: () => Promise<void>;
+  onFrameSelection: () => Promise<void>;
   onUngroup: () => Promise<void>; onBringToFront: () => Promise<void>;
   onBringForward: () => Promise<void>; onSendBackward: () => Promise<void>;
   onSendToBack: () => Promise<void>; onDelete: () => Promise<void>;
@@ -3084,6 +3556,8 @@ function CanvasContextMenu(props: CtxMenuProps) {
       style={{ ...ctxStyles.item, opacity: disabled ? 0.35 : 1, cursor: disabled ? 'default' : 'pointer' }}
       disabled={disabled}
       onMouseDown={e => { e.preventDefault(); if (!disabled) { action(); onClose(); } }}
+      onMouseEnter={e => { if (!disabled) e.currentTarget.style.background = 'var(--accent-soft)'; }}
+      onMouseLeave={e => { e.currentTarget.style.background = 'transparent'; }}
     >
       <span style={ctxStyles.label}>{label}</span>
       <span style={ctxStyles.hint}>{hint}</span>
@@ -3100,7 +3574,7 @@ function CanvasContextMenu(props: CtxMenuProps) {
       {item('Duplicate', '⌘D',        () => void props.onDuplicate(), !hasSelection)}
       {sep()}
       {item('Group',           '⌘G',    () => void props.onGroup(),        !hasSelection)}
-      {item('Frame selection', '⌘⌥G',  () => void props.onGroup(),        !hasSelection)}
+      {item('Frame selection', '⌘⌥G',  () => void props.onFrameSelection(), !hasSelection)}
       {item('Ungroup',         '⌘⇧G',  () => void props.onUngroup(),       !hasSelection)}
       {sep()}
       {item('Bring to front',  '⌘⌥]',  () => void props.onBringToFront(),  !hasSelection)}
@@ -3116,20 +3590,20 @@ function CanvasContextMenu(props: CtxMenuProps) {
 const ctxStyles: Record<string, React.CSSProperties> = {
   menu: {
     position: 'fixed', zIndex: 9999,
-    background: '#1e1e1e', border: '1px solid rgba(255,255,255,0.12)',
+    background: 'var(--bg-elevated)', border: '1px solid var(--border-strong)',
     borderRadius: 8, padding: '4px 0',
-    boxShadow: '0 8px 32px rgba(0,0,0,0.6)',
+    boxShadow: 'var(--shadow-popover)',
     display: 'flex', flexDirection: 'column',
   },
   item: {
     display: 'flex', justifyContent: 'space-between', alignItems: 'center',
-    background: 'transparent', border: 'none', color: '#ececef',
+    background: 'transparent', border: 'none', color: 'var(--text)',
     fontSize: 12, padding: '7px 12px', fontFamily: 'system-ui',
     textAlign: 'left', gap: 16,
   },
   label: { flex: 1 },
-  hint: { color: 'rgba(255,255,255,0.38)', fontSize: 11, flexShrink: 0 },
-  sep: { height: 1, background: 'rgba(255,255,255,0.1)', margin: '3px 0' },
+  hint: { color: 'var(--text-muted)', fontSize: 11, flexShrink: 0 },
+  sep: { height: 1, background: 'var(--border)', margin: '3px 0' },
 };
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -3154,25 +3628,10 @@ function ZoomIndicator({ zoom }: { zoom: number }) {
   return <div style={styles.zoomBadge}>{Math.round(zoom * 100)}%</div>;
 }
 
-const TOOL_HINTS: Partial<Record<ToolType, string>> = {
-  select: 'Click · Drag to move · Handle to resize/rotate · 0 = fit',
-  rect: 'Drag to draw rectangle · Esc = cancel',
-  ellipse: 'Drag to draw ellipse · Esc = cancel',
-  frame: 'Drag to draw frame · Esc = cancel',
-  text: 'Click to place text · Double-click existing to edit',
-  pen: 'Click to add points · Enter to finish · Esc to cancel',
-  image: 'Choose an image file…',
-};
-
-function ToolHint({ activeTool, penActive }: { activeTool: ToolType; penActive: boolean }) {
-  const hint = penActive && activeTool === 'pen'
-    ? 'Click to add points · Enter to finish · Esc to cancel'
-    : TOOL_HINTS[activeTool] ?? '';
-  return <div style={styles.helpHint}>{hint}</div>;
-}
-
 const styles: Record<string, React.CSSProperties> = {
-  container: { flex: 1, overflow: 'hidden', position: 'relative', background: '#0f0f12' },
+  // The canvas element paints its own backdrop each frame (canvasColors.backdrop follows
+  // the theme), so this container color only shows for a flash before the first draw.
+  container: { flex: 1, overflow: 'hidden', position: 'relative', background: 'var(--bg-canvas)' },
   dragTooltip: {
     display: 'none', position: 'absolute', pointerEvents: 'none', zIndex: 9999,
     background: '#1a73e8', color: '#fff', padding: '2px 7px', borderRadius: 4,
@@ -3181,14 +3640,8 @@ const styles: Record<string, React.CSSProperties> = {
   },
   zoomBadge: {
     position: 'absolute', bottom: 16, right: 16,
-    background: 'rgba(20,20,23,0.9)', color: '#ECECEF',
+    background: 'var(--bg-elevated)', color: 'var(--text)',
     padding: '4px 10px', borderRadius: 6, fontSize: 12, fontFamily: 'system-ui',
-    pointerEvents: 'none', border: '1px solid rgba(255,255,255,0.08)',
-  },
-  helpHint: {
-    position: 'absolute', bottom: 16, left: '50%', transform: 'translateX(-50%)',
-    background: 'rgba(20,20,23,0.8)', color: '#9B9BA6',
-    padding: '4px 12px', borderRadius: 6, fontSize: 11, fontFamily: 'system-ui',
-    pointerEvents: 'none', whiteSpace: 'nowrap',
+    pointerEvents: 'none', border: '1px solid var(--border)',
   },
 };

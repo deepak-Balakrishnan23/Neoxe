@@ -19,4 +19,11 @@ export default defineConfig({
   server: {
     port: 5173,
   },
+  // `vite preview` serves the production build in dist/renderer on a fixed local port.
+  // host: true exposes it on the LAN so other machines can reach it at http://<your-ip>:4173.
+  preview: {
+    port: 4173,
+    host: true,
+    strictPort: true,
+  },
 });

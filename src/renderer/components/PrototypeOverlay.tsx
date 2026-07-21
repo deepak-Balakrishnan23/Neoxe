@@ -1,4 +1,4 @@
-import React, { useRef, useState } from 'react';
+import React, { useRef, useState, useEffect, useMemo } from 'react';
 import { Shape, Interaction } from '../../shared/types';
 import { useDesignStore } from '../store/useDesignStore';
 import { api } from '../ipc/api';
@@ -13,24 +13,107 @@ const ACCENT = '#6E72F5';
 
 function genId() { return Math.random().toString(36).slice(2, 10); }
 
+type EdgeSide = 'top' | 'bottom' | 'left' | 'right';
+
+// Figma-style curved connector: a cubic bézier that exits the source horizontally (from
+// its right-edge connect handle) and enters the target perpendicular to whichever edge it
+// meets. Straight lines cross and tangle in dense flows; the curve reads as a clean cable.
+function connectorPath(
+  sx: number, sy: number,
+  end: { x: number; y: number; side: EdgeSide },
+): string {
+  // Curvature scales with distance so short hops stay tight and long ones bow gently.
+  const k = Math.max(40, Math.hypot(end.x - sx, end.y - sy) * 0.4);
+  const normal: Record<EdgeSide, [number, number]> = {
+    top: [0, -1], bottom: [0, 1], left: [-1, 0], right: [1, 0],
+  };
+  const [nx, ny] = normal[end.side];
+  const c1x = sx + k, c1y = sy;              // exit source rightward (the connect handle)
+  const c2x = end.x + nx * k, c2y = end.y + ny * k; // approach target edge along its normal
+  return `M ${sx} ${sy} C ${c1x} ${c1y} ${c2x} ${c2y} ${end.x} ${end.y}`;
+}
+
+// The 8 connection anchors of a shape (4 edge midpoints + 4 corners), in doc space, each
+// with the outward direction the connection should leave from. Figma reveals only the one
+// nearest the cursor as you approach an edge/corner.
+type AnchorKey = 'n' | 's' | 'e' | 'w' | 'nw' | 'ne' | 'se' | 'sw';
+function shapeAnchorsDoc(s: Shape): { key: AnchorKey; x: number; y: number; dir: [number, number] }[] {
+  const l = s.x, r = s.x + s.width, t = s.y, b = s.y + s.height;
+  const cx = s.x + s.width / 2, cy = s.y + s.height / 2;
+  const d = 1 / Math.SQRT2;
+  return [
+    { key: 'n', x: cx, y: t, dir: [0, -1] },
+    { key: 's', x: cx, y: b, dir: [0, 1] },
+    { key: 'w', x: l, y: cy, dir: [-1, 0] },
+    { key: 'e', x: r, y: cy, dir: [1, 0] },
+    { key: 'nw', x: l, y: t, dir: [-d, -d] },
+    { key: 'ne', x: r, y: t, dir: [d, -d] },
+    { key: 'sw', x: l, y: b, dir: [-d, d] },
+    { key: 'se', x: r, y: b, dir: [d, d] },
+  ];
+}
+
 export default function PrototypeOverlay({ viewport }: { viewport: Viewport }) {
   const { activePage, selectedIds, file, setFile } = useDesignStore();
   const svgRef = useRef<SVGSVGElement>(null);
-  const [drag, setDrag] = useState<{ fromId: string; x: number; y: number } | null>(null);
+  // ox/oy = the anchor point the drag started from (screen coords), so the ghost cable
+  // leaves the exact anchor grabbed rather than the shape centre.
+  const [drag, setDrag] = useState<{ fromId: string; ox: number; oy: number; x: number; y: number } | null>(null);
   const dragRef = useRef(drag);
   dragRef.current = drag;
   const [hoverFrame, setHoverFrame] = useState<string | null>(null);
   const hoverRef = useRef(hoverFrame);
   hoverRef.current = hoverFrame;
 
+  // Cursor position (screen coords relative to this SVG), rAF-throttled. Drives which of a
+  // shape's 8 anchors is revealed — only the one nearest the cursor shows.
+  const [cursor, setCursor] = useState<{ x: number; y: number } | null>(null);
+  useEffect(() => {
+    let raf: number | null = null;
+    let pending: { x: number; y: number } | null = null;
+    const onMove = (e: MouseEvent) => {
+      const rect = svgRef.current?.getBoundingClientRect();
+      if (!rect) return;
+      pending = { x: e.clientX - rect.left, y: e.clientY - rect.top };
+      if (raf == null) raf = requestAnimationFrame(() => { raf = null; setCursor(pending); });
+    };
+    // relatedTarget null ⇒ pointer left the window entirely (not just crossed an element).
+    const onOut = (e: MouseEvent) => { if (!e.relatedTarget) setCursor(null); };
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseout', onOut);
+    return () => {
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseout', onOut);
+      if (raf != null) cancelAnimationFrame(raf);
+    };
+  }, []);
+
   const page = activePage();
+  // Memoize the tree-derived data on `page` identity: this component re-renders on every
+  // rAF-throttled cursor move (to reveal the nearest anchor), and without memoization each
+  // of those ~60/sec re-renders re-walked the ENTIRE shape tree.
+  const frames = useMemo(
+    () => page ? page.childIds.map(id => page.objects[id]).filter((s): s is Shape => s?.type === 'frame') : [],
+    [page]);
+  const links = useMemo(() => {
+    const out: { source: Shape; it: Interaction }[] = [];
+    if (!page) return out;
+    const walk = (id: string) => {
+      const s = page.objects[id];
+      if (!s) return;
+      for (const it of (s.interactions ?? [])) {
+        if (it.action === 'navigate' && it.targetFrameId && page.objects[it.targetFrameId]) out.push({ source: s, it });
+      }
+      s.childIds.forEach(walk);
+    };
+    page.childIds.forEach(walk);
+    return out;
+  }, [page]);
   if (!page || !file) return null;
 
   const { x: panX, y: panY, zoom } = viewport;
   const toScreenX = (d: number) => d * zoom + panX;
   const toScreenY = (d: number) => d * zoom + panY;
-
-  const frames = page.childIds.map(id => page.objects[id]).filter((s): s is Shape => s?.type === 'frame');
 
   const frameAtDoc = (dx: number, dy: number): Shape | null => {
     // topmost frame (later in childIds = on top) containing the point
@@ -41,25 +124,14 @@ export default function PrototypeOverlay({ viewport }: { viewport: Viewport }) {
     return null;
   };
 
-  // All navigate connections on the page
-  const links: { source: Shape; it: Interaction }[] = [];
-  const walk = (id: string) => {
-    const s = page.objects[id];
-    if (!s) return;
-    for (const it of (s.interactions ?? [])) {
-      if (it.action === 'navigate' && it.targetFrameId && page.objects[it.targetFrameId]) links.push({ source: s, it });
-    }
-    s.childIds.forEach(walk);
-  };
-  page.childIds.forEach(walk);
-
   // Endpoint on a target frame's border nearest the source point (screen coords).
   const edgePoint = (frame: Shape, fromX: number, fromY: number) => {
     const l = toScreenX(frame.x), r = toScreenX(frame.x + frame.width);
     const t = toScreenY(frame.y), b = toScreenY(frame.y + frame.height);
     const cx = (l + r) / 2, cy = (t + b) / 2;
-    const cands = [
-      { x: cx, y: t }, { x: cx, y: b }, { x: l, y: cy }, { x: r, y: cy },
+    const cands: { x: number; y: number; side: EdgeSide }[] = [
+      { x: cx, y: t, side: 'top' }, { x: cx, y: b, side: 'bottom' },
+      { x: l, y: cy, side: 'left' }, { x: r, y: cy, side: 'right' },
     ];
     let best = cands[0], bd = Infinity;
     for (const c of cands) {
@@ -69,18 +141,18 @@ export default function PrototypeOverlay({ viewport }: { viewport: Viewport }) {
     return best;
   };
 
-  const startConnect = (source: Shape, e: React.MouseEvent) => {
+  const startConnect = (source: Shape, ox: number, oy: number, e: React.MouseEvent) => {
     e.stopPropagation(); e.preventDefault();
     const rect = svgRef.current?.getBoundingClientRect();
     const toLocal = (ev: MouseEvent | React.MouseEvent) => ({
       x: ev.clientX - (rect?.left ?? 0), y: ev.clientY - (rect?.top ?? 0),
     });
     const init = toLocal(e);
-    setDrag({ fromId: source.id, x: init.x, y: init.y });
+    setDrag({ fromId: source.id, ox, oy, x: init.x, y: init.y });
 
     const onMove = (ev: MouseEvent) => {
       const p = toLocal(ev);
-      setDrag({ fromId: source.id, x: p.x, y: p.y });
+      setDrag({ fromId: source.id, ox, oy, x: p.x, y: p.y });
       const dx = (p.x - panX) / zoom, dy = (p.y - panY) / zoom;
       setHoverFrame(frameAtDoc(dx, dy)?.id ?? null);
     };
@@ -105,11 +177,30 @@ export default function PrototypeOverlay({ viewport }: { viewport: Viewport }) {
     window.addEventListener('mouseup', onUp);
   };
 
-  // Connect handles on each selected shape (right-edge midpoint, screen space)
-  const handles = [...selectedIds]
-    .map(id => page.objects[id])
-    .filter((s): s is Shape => !!s)
-    .map(s => ({ id: s.id, shape: s, x: toScreenX(s.x + s.width), y: toScreenY(s.y + s.height / 2) }));
+  // Hover-aware connection anchors: every frame (and any selected shape) has all 8 anchor
+  // points, but only the ONE nearest the cursor is revealed — and only while the cursor is
+  // near that shape. Approach an edge/corner and its node appears; move away and it hides.
+  const REVEAL_MARGIN = 44; // screen px around the shape within which its anchor reveals
+  const anchors: { shapeId: string; shape: Shape; key: AnchorKey; sx: number; sy: number }[] = [];
+  if (cursor && !drag) {
+    const candidates = new Map<string, Shape>();
+    for (const f of frames) candidates.set(f.id, f);
+    for (const id of selectedIds) { const s = page.objects[id]; if (s) candidates.set(id, s); }
+    for (const s of candidates.values()) {
+      const l = toScreenX(s.x), t = toScreenY(s.y), r = toScreenX(s.x + s.width), b = toScreenY(s.y + s.height);
+      if (cursor.x < l - REVEAL_MARGIN || cursor.x > r + REVEAL_MARGIN ||
+          cursor.y < t - REVEAL_MARGIN || cursor.y > b + REVEAL_MARGIN) continue;
+      // Nearest of the 8 anchors to the cursor.
+      let best: { key: AnchorKey; sx: number; sy: number } | null = null;
+      let bd = Infinity;
+      for (const a of shapeAnchorsDoc(s)) {
+        const sx = toScreenX(a.x), sy = toScreenY(a.y);
+        const d = (sx - cursor.x) ** 2 + (sy - cursor.y) ** 2;
+        if (d < bd) { bd = d; best = { key: a.key, sx, sy }; }
+      }
+      if (best) anchors.push({ shapeId: s.id, shape: s, key: best.key, sx: best.sx, sy: best.sy });
+    }
+  }
 
   return (
     <svg
@@ -122,7 +213,7 @@ export default function PrototypeOverlay({ viewport }: { viewport: Viewport }) {
         </marker>
       </defs>
 
-      {/* existing connections */}
+      {/* existing connections — curved bézier cables (Figma-style) */}
       {links.map(({ source, it }) => {
         const target = page.objects[it.targetFrameId!]!;
         const sx = toScreenX(source.x + source.width / 2);
@@ -130,23 +221,24 @@ export default function PrototypeOverlay({ viewport }: { viewport: Viewport }) {
         const end = edgePoint(target, sx, sy);
         return (
           <g key={source.id + it.id}>
-            <line x1={sx} y1={sy} x2={end.x} y2={end.y} stroke={ACCENT} strokeWidth={2}
-              markerEnd="url(#proto-arrow)" opacity={0.9} />
+            <path d={connectorPath(sx, sy, end)} fill="none" stroke={ACCENT} strokeWidth={2}
+              markerEnd="url(#proto-arrow)" opacity={0.9} strokeLinecap="round" />
             <circle cx={sx} cy={sy} r={4} fill={ACCENT} />
           </g>
         );
       })}
 
-      {/* live drag ghost */}
+      {/* live drag ghost — leaves the grabbed anchor, curves toward the hovered frame */}
       {drag && (() => {
-        const src = page.objects[drag.fromId];
-        if (!src) return null;
-        const sx = toScreenX(src.x + src.width / 2);
-        const sy = toScreenY(src.y + src.height / 2);
+        const sx = drag.ox, sy = drag.oy;
+        const hf = hoverFrame ? page.objects[hoverFrame] : null;
+        const d = hf
+          ? connectorPath(sx, sy, edgePoint(hf, sx, sy))
+          : `M ${sx} ${sy} C ${sx + Math.max(40, Math.abs(drag.x - sx) * 0.4)} ${sy} ${drag.x} ${drag.y} ${drag.x} ${drag.y}`;
         return (
           <g>
-            <line x1={sx} y1={sy} x2={drag.x} y2={drag.y} stroke={ACCENT} strokeWidth={2}
-              strokeDasharray="6 4" markerEnd="url(#proto-arrow)" />
+            <path d={d} fill="none" stroke={ACCENT} strokeWidth={2}
+              strokeDasharray="6 4" markerEnd="url(#proto-arrow)" strokeLinecap="round" />
             <circle cx={sx} cy={sy} r={4} fill={ACCENT} />
           </g>
         );
@@ -162,13 +254,18 @@ export default function PrototypeOverlay({ viewport }: { viewport: Viewport }) {
         );
       })()}
 
-      {/* connect handles on selected shapes */}
-      {!drag && handles.map(h => (
-        <g key={h.id} style={{ pointerEvents: 'all', cursor: 'crosshair' }}
-          onMouseDown={e => startConnect(h.shape, e)}>
-          <circle cx={h.x} cy={h.y} r={9} fill="transparent" />
-          <circle cx={h.x} cy={h.y} r={6} fill="#fff" stroke={ACCENT} strokeWidth={2} />
-          <circle cx={h.x} cy={h.y} r={2.5} fill={ACCENT} />
+      {/* Hover-revealed connection anchor — the single node nearest the cursor. Sits ON the
+          edge/corner (a solid accent dot with a white ring + "+"), signalling "drag to link".
+          One per hovered shape; approaching a different side moves it to that edge/corner. */}
+      {anchors.map(a => (
+        <g key={a.shapeId + a.key} style={{ pointerEvents: 'all', cursor: 'crosshair' }}
+          onMouseDown={e => startConnect(a.shape, a.sx, a.sy, e)}>
+          {/* generous invisible hit target */}
+          <circle cx={a.sx} cy={a.sy} r={12} fill="transparent" />
+          <circle cx={a.sx} cy={a.sy} r={7} fill={ACCENT} stroke="#fff" strokeWidth={1.5} />
+          {/* white + : "connect" */}
+          <path d={`M ${a.sx - 3.2} ${a.sy} L ${a.sx + 3.2} ${a.sy} M ${a.sx} ${a.sy - 3.2} L ${a.sx} ${a.sy + 3.2}`}
+            stroke="#fff" strokeWidth={1.5} fill="none" strokeLinecap="round" />
         </g>
       ))}
     </svg>

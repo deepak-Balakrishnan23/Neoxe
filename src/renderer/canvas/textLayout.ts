@@ -1,4 +1,5 @@
 import { Shape, TextParagraph, TextStyle, TextTransform } from '../../shared/types';
+import { ensureFontLoaded } from './fontLoader';
 
 // Shared text measurement + wrapping, used by the renderer (drawing), the editor
 // (commit sizing) and resize. Keeping one implementation guarantees the on-canvas
@@ -8,7 +9,9 @@ export function applyTransform(text: string, transform: TextTransform | undefine
   switch (transform) {
     case 'uppercase':  return text.toUpperCase();
     case 'lowercase':  return text.toLowerCase();
-    case 'capitalize': return text.replace(/\b\w/g, c => c.toUpperCase());
+    // Unicode-aware: capitalize the first letter of each word incl. accented/non-ASCII
+    // scripts (\b\w only matches ASCII, leaving "élan" → "élan").
+    case 'capitalize': return text.replace(/(^|\s)(\p{L})/gu, (_m, sp, ch) => sp + ch.toUpperCase());
     default:           return text;
   }
 }
@@ -20,15 +23,28 @@ function measureCtx(): CanvasRenderingContext2D | null {
 }
 
 function applyFont(ctx: CanvasRenderingContext2D, style: TextStyle) {
+  ensureFontLoaded(style.fontFamily, style.fontWeight);
   ctx.font = `${style.fontWeight} ${style.fontSize}px ${style.fontFamily}`;
-  // letterSpacing is supported on modern canvases; guarded for older ones.
-  try { (ctx as CanvasRenderingContext2D & { letterSpacing: string }).letterSpacing = `${style.letterSpacing}px`; } catch { /* ignore */ }
+  // letterSpacing is supported on modern canvases; guarded for older ones. Normalize to a
+  // number — `${undefined}px` = "undefinedpx" is silently ignored, leaving the shared
+  // measureCtx on the PREVIOUS shape's spacing and corrupting the next shape's measurement.
+  try { (ctx as CanvasRenderingContext2D & { letterSpacing: string }).letterSpacing = `${style.letterSpacing ?? 0}px`; } catch { /* ignore */ }
 }
+
+// Wrap results memoized on (font, letterSpacing, width, text) — the full set of inputs that
+// determine wrapping. The draw loop re-wraps every fixed-width text shape on every frame
+// during a drag (60fps); without this it re-ran O(words × measureText) per shape each frame
+// even though nothing changed. Bounded; cleared wholesale when it grows large.
+const _wrapCache = new Map<string, string[]>();
 
 // Greedy word-wrap to a max width (px). Words wider than the box are broken by
 // character (CSS overflow-wrap: anywhere) so a long unbroken string still wraps.
 export function wrapLines(ctx: CanvasRenderingContext2D, text: string, maxWidth: number): string[] {
   if (text === '') return [''];
+  const spacing = (ctx as CanvasRenderingContext2D & { letterSpacing?: string }).letterSpacing ?? '';
+  const key = `${ctx.font}|${spacing}|${Math.round(maxWidth)}|${text}`;
+  const cached = _wrapCache.get(key);
+  if (cached) return cached;
   const fits = (s: string) => ctx.measureText(s).width <= maxWidth;
   const lines: string[] = [];
   for (const rawLine of text.split('\n')) {
@@ -49,6 +65,8 @@ export function wrapLines(ctx: CanvasRenderingContext2D, text: string, maxWidth:
     for (const word of rawLine.split(' ')) place(word);
     lines.push(current);
   }
+  if (_wrapCache.size > 4000) _wrapCache.clear();
+  _wrapCache.set(key, lines);
   return lines;
 }
 

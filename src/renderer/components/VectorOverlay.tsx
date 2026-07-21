@@ -1,6 +1,7 @@
 import React from 'react';
 import { Page, VectorChildNode } from '../../shared/types';
 import { Viewport } from '../canvas/renderer';
+import { sanitizeSvgMarkup } from '../../shared/sanitizeSvg';
 
 interface Props {
   page: Page;
@@ -59,7 +60,9 @@ function renderVChild(
         </g>
       );
     case 'vector-raw':
-      return <g key={node.id} dangerouslySetInnerHTML={{ __html: node.outerHTML ?? '' }} />;
+      // outerHTML originates from an imported (untrusted) SVG file — sanitize before
+      // injecting into the live DOM, or a crafted file runs script in the app.
+      return <g key={node.id} dangerouslySetInnerHTML={{ __html: sanitizeSvgMarkup(node.outerHTML ?? '') }} />;
     default:
       return null;
   }
@@ -92,9 +95,11 @@ export default function VectorOverlay({ page, viewport, vectorEditShapeId, vecto
         // Shapes with svgInnerHTML → render as a single inline <svg>; live preview
         // replaces the innerHTML during drag-editing so the shape updates in real time.
         if (shape.svgInnerHTML) {
-          const innerHTML = isSvgEditing && livePreviewSvg != null
+          // svgInnerHTML comes from imported SVGs / opened .design files (untrusted) —
+          // sanitize at the injection point so stored markup can never execute script.
+          const innerHTML = sanitizeSvgMarkup(isSvgEditing && livePreviewSvg != null
             ? livePreviewSvg
-            : shape.svgInnerHTML;
+            : shape.svgInnerHTML);
           return (
             <svg
               key={shape.id}

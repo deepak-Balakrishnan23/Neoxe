@@ -1,27 +1,12 @@
-import { DesignFile, ChangeSet, IPCResponse, TokenType, DesignToken, Layout } from '../../shared/types';
+import { DesignFile, ChangeSet, IPCResponse, TokenType, DesignToken } from '../../shared/types';
 import { makeEmptyFile } from '../../shared/sampleFile';
 import { DocumentEngine, EngineSession } from '../mockEngine';
 
-// Typed wrapper around window.designAPI (exposed by Electron preload)
-declare global {
-  interface Window {
-    designAPI?: {
-      newFile: () => Promise<IPCResponse<DesignFile>>;
-      openFile: () => Promise<IPCResponse<DesignFile>>;
-      saveFile: () => Promise<IPCResponse<void>>;
-      loadFile?: (file: DesignFile) => Promise<IPCResponse<DesignFile>>;
-      getState: () => Promise<IPCResponse<DesignFile>>;
-      applyChanges: (changeSet: ChangeSet) => Promise<IPCResponse<DesignFile>>;
-      undo: () => Promise<IPCResponse<DesignFile>>;
-      redo: () => Promise<IPCResponse<DesignFile>>;
-    };
-  }
-}
-
-// In-browser mock (used when running in Vite preview, not Electron)
+// In-browser document engine facade. The app is a pure web app — the engine runs in the
+// renderer; disk open/save live in io/fileIO.ts (File System Access API + fallbacks).
 const engine = new DocumentEngine();
 
-const browserMock = {
+const docApi = {
   newFile: async (): Promise<IPCResponse<DesignFile>> => {
     engine.load(makeEmptyFile());
     return { ok: true, data: engine.getState()! };
@@ -30,19 +15,14 @@ const browserMock = {
     engine.load(file);
     return { ok: true, data: engine.getState()! };
   },
-  openFile: async (): Promise<IPCResponse<DesignFile>> => {
-    return { ok: false, error: 'File open not available in browser preview' };
-  },
-  saveFile: async (): Promise<IPCResponse<void>> => {
-    return { ok: false, error: 'File save not available in browser preview' };
-  },
   getState: async (): Promise<IPCResponse<DesignFile>> => {
     const s = engine.getState();
     return s ? { ok: true, data: s } : { ok: false, error: 'no file loaded' };
   },
   applyChanges: async (cs: ChangeSet): Promise<IPCResponse<DesignFile>> => {
-    engine.applyChanges(cs);
-    return { ok: true, data: engine.getState()! };
+    // applyChanges already returns the (possibly structurally-shared) snapshot — use it
+    // directly instead of a second getState() that would force a full clone.
+    return { ok: true, data: engine.applyChanges(cs) };
   },
   undo: async (): Promise<IPCResponse<DesignFile>> => {
     engine.undo();
@@ -124,20 +104,7 @@ const tokenMock = {
   },
 };
 
-// ── Layout management ─────────────────────────────────────────────────────────
-
-const layoutMock = {
-  setLayout: async (shapeId: string, pageId: string, kind: 'flex' | 'grid' | null): Promise<IPCResponse<DesignFile>> => {
-    const f = engine.setLayout(shapeId, pageId, kind);
-    return f ? { ok: true, data: f } : { ok: false, error: 'failed' };
-  },
-  updateLayout: async (shapeId: string, pageId: string, patch: Partial<Layout>): Promise<IPCResponse<DesignFile>> => {
-    const f = engine.updateLayout(shapeId, pageId, patch);
-    return f ? { ok: true, data: f } : { ok: false, error: 'failed' };
-  },
-};
-
-// ── Page management (browser mock only — Electron handlers added in Phase 11) ─
+// ── Page management ───────────────────────────────────────────────────────────
 
 const pageMock = {
   addPage: async (): Promise<IPCResponse<DesignFile>> => {
@@ -162,17 +129,12 @@ const pageMock = {
   },
 };
 
-const delegate = () => window.designAPI ?? browserMock;
-
 export const api = {
-  newFile: () => delegate().newFile(),
-  openFile: () => delegate().openFile(),
-  saveFile: () => delegate().saveFile(),
-  // Load an already-parsed document (from renderer-side Open) into the engine.
-  // In Electron this hits the main-process engine; in the browser it hits the mock.
-  loadFile: (file: DesignFile) => (window.designAPI?.loadFile ?? browserMock.loadFile)(file),
+  newFile: () => docApi.newFile(),
+  // Load an already-parsed document (from disk Open in io/fileIO.ts) into the engine.
+  loadFile: (file: DesignFile) => docApi.loadFile(file),
 
-  // ── Multi-tab session management (renderer engine; browser runtime) ──────────
+  // ── Multi-tab session management ──────────────────────────────────────────────
   // Each tab owns an isolated document + undo/redo history. The store stashes the
   // active session out and swaps another in when switching tabs.
   exportSession: (): EngineSession => engine.exportSession(),
@@ -180,10 +142,10 @@ export const api = {
     engine.loadSession(session);
     return engine.getState();
   },
-  getState: () => delegate().getState(),
-  applyChanges: (cs: ChangeSet) => delegate().applyChanges(cs),
-  undo: () => delegate().undo(),
-  redo: () => delegate().redo(),
+  getState: () => docApi.getState(),
+  applyChanges: (cs: ChangeSet) => docApi.applyChanges(cs),
+  undo: () => docApi.undo(),
+  redo: () => docApi.redo(),
   // Component & assets
   createComponent: (shapeId: string, pageId: string) => compMock.createComponent(shapeId, pageId),
   createInstance: (componentId: string, pageId: string, x: number, y: number) => compMock.createInstance(componentId, pageId, x, y),
@@ -201,9 +163,6 @@ export const api = {
   bindToken: (shapeId: string, pageId: string, path: string, tokenName: string) => tokenMock.bindToken(shapeId, pageId, path, tokenName),
   unbindToken: (shapeId: string, pageId: string, path: string) => tokenMock.unbindToken(shapeId, pageId, path),
   switchTheme: (themeId: string) => tokenMock.switchTheme(themeId),
-  // Auto-layout
-  setLayout: (shapeId: string, pageId: string, kind: 'flex' | 'grid' | null) => layoutMock.setLayout(shapeId, pageId, kind),
-  updateLayout: (shapeId: string, pageId: string, patch: Partial<Layout>) => layoutMock.updateLayout(shapeId, pageId, patch),
   // Prototype
   setPrototypeStart: async (frameId: string): Promise<IPCResponse<DesignFile>> => {
     const f = engine.setPrototypeStart(frameId);

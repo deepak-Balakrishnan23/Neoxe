@@ -18,7 +18,7 @@ const TYPE_ICONS: Record<string, IconName> = {
 
 export default function LayersPanel() {
   const [panelTab, setPanelTab] = useState<'layers' | 'assets' | 'tokens'>('layers');
-  const { file, activePage, selectedIds, toggleSelected, setSelectedIds, setFile, clearSelection, vectorEditShapeId, vectorEditChildId, setVectorEditShapeId, setVectorEditChildId, groupEditId, setGroupEditId, setSvgEditShapeId, setLivePreviewSvg } = useDesignStore();
+  const { file, activePage, toggleSelected, setFile, clearSelection, vectorEditChildId, setVectorEditShapeId, setVectorEditChildId, groupEditId, setGroupEditId, setSvgEditShapeId, setLivePreviewSvg } = useDesignStore();
   const page = activePage();
 
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
@@ -27,8 +27,9 @@ export default function LayersPanel() {
   const [dropTarget, setDropTarget] = useState<DropTarget | null>(null);
   const [renamingPageId, setRenamingPageId] = useState<string | null>(null);
 
-  const toggleCollapse = (id: string) =>
-    setCollapsed(s => { const n = new Set(s); n.has(id) ? n.delete(id) : n.add(id); return n; });
+  // useCallback so LayerRow (memoized) sees a stable handler reference across renders.
+  const toggleCollapse = useCallback((id: string) =>
+    setCollapsed(s => { const n = new Set(s); n.has(id) ? n.delete(id) : n.add(id); return n; }), []);
 
   // ── Visibility & lock ───────────────────────────────────────────────────────
   const toggleAttr = useCallback(async (shape: Shape, attr: 'hidden' | 'locked') => {
@@ -52,7 +53,7 @@ export default function LayersPanel() {
   }, [page, setFile]);
 
   // ── Drag-to-reorder ─────────────────────────────────────────────────────────
-  const handleDragStart = (id: string) => { setDraggingId(id); };
+  const handleDragStart = useCallback((id: string) => { setDraggingId(id); }, []);
 
   const handleDragOver = useCallback((e: React.DragEvent, targetId: string, isContainer: boolean) => {
     e.preventDefault();
@@ -103,6 +104,25 @@ export default function LayersPanel() {
 
   const handleDragEnd = () => { setDraggingId(null); setDropTarget(null); };
 
+  // Stable row callbacks so memoized LayerRows don't re-render just because the panel did.
+  const onSelectRow = useCallback((id: string, multi: boolean) => {
+    if (!page) return;
+    // Exit any vector / SVG anchor edit mode when selecting a different layer
+    setVectorEditShapeId(null);
+    setVectorEditChildId(null);
+    setSvgEditShapeId(null);
+    setLivePreviewSvg(null);
+    const s = page.objects[id];
+    const par = s?.parentId ? page.objects[s.parentId] : null;
+    if (par?.isSVGImport && groupEditId !== par.id) setGroupEditId(par.id);
+    toggleSelected(id, multi);
+  }, [page, groupEditId, setVectorEditShapeId, setVectorEditChildId, setSvgEditShapeId, setLivePreviewSvg, setGroupEditId, toggleSelected]);
+
+  const onSelectVectorChildRow = useCallback((shapeId: string, childId: string) => {
+    setVectorEditShapeId(shapeId);
+    setVectorEditChildId(childId);
+  }, [setVectorEditShapeId, setVectorEditChildId]);
+
   if (!page) return (
     <div style={styles.panel}>
       <TabBar tab={panelTab} onSwitch={setPanelTab} />
@@ -133,23 +153,11 @@ export default function LayersPanel() {
             key={id}
             id={id}
             depth={0}
-            page={page}
-            selectedIds={selectedIds}
             collapsed={collapsed}
             renamingId={renamingId}
             draggingId={draggingId}
             dropTarget={dropTarget}
-            onSelect={(id, multi) => {
-              // Exit any vector / SVG anchor edit mode when selecting a different layer
-              setVectorEditShapeId(null);
-              setVectorEditChildId(null);
-              setSvgEditShapeId(null);
-              setLivePreviewSvg(null);
-              const s = page.objects[id];
-              const par = s?.parentId ? page.objects[s.parentId] : null;
-              if (par?.isSVGImport && groupEditId !== par.id) setGroupEditId(par.id);
-              toggleSelected(id, multi);
-            }}
+            onSelect={onSelectRow}
             onToggleCollapse={toggleCollapse}
             onToggleAttr={toggleAttr}
             onStartRename={setRenamingId}
@@ -157,10 +165,7 @@ export default function LayersPanel() {
             onDragStart={handleDragStart}
             onDragOver={handleDragOver}
             vectorEditChildId={vectorEditChildId}
-            onSelectVectorChild={(shapeId, childId) => {
-              setVectorEditShapeId(shapeId);
-              setVectorEditChildId(childId);
-            }}
+            onSelectVectorChild={onSelectVectorChildRow}
           />
         ))}
       </div>
@@ -182,6 +187,7 @@ export default function LayersPanel() {
         {file!.pages.map(p => (
           <div
             key={p.id}
+            className="layer-row"
             style={{
               ...styles.pageRow,
               background: p.id === file!.activePageId ? 'var(--accent-soft)' : undefined,
@@ -220,6 +226,7 @@ export default function LayersPanel() {
             )}
             {file!.pages.length > 1 && (
               <button
+                className="layer-action"
                 style={styles.deletePageBtn}
                 title="Delete page"
                 onClick={async (e) => {
@@ -268,8 +275,6 @@ const tabStyles: Record<string, React.CSSProperties> = {
 interface RowProps {
   id: string;
   depth: number;
-  page: Page;
-  selectedIds: Set<string>;
   collapsed: Set<string>;
   renamingId: string | null;
   draggingId: string | null;
@@ -285,12 +290,24 @@ interface RowProps {
   onSelectVectorChild: (shapeId: string, childId: string) => void;
 }
 
-function LayerRow(props: RowProps) {
-  const { id, depth, page, selectedIds, collapsed, renamingId, draggingId, dropTarget } = props;
-  const shape = page.objects[id];
+const LayerRow = React.memo(function LayerRow(props: RowProps) {
+  const { id, depth, collapsed, renamingId, draggingId, dropTarget } = props;
+  // Hooks must run before any early return (rules of hooks) — a shape toggling in/out of
+  // existence would otherwise change hook order and corrupt React's hook state.
+  const nameRef = useRef<HTMLInputElement>(null);
+  // Per-row subscriptions to THIS shape + its selection. Combined with the engine's
+  // structural-sharing snapshots (unchanged shapes keep their object identity), an edit to
+  // one shape re-renders only its own row — not the whole tree. (The `page` object identity
+  // changes every edit, so taking it as a prop would defeat the memo.)
+  const selected = useDesignStore(s => s.selectedIds.has(id));
+  const shape = useDesignStore(s => {
+    const f = s.file;
+    if (!f) return undefined;
+    const p = f.pages.find(pg => pg.id === f.activePageId);
+    return p?.objects[id];
+  });
   if (!shape) return null;
 
-  const selected = selectedIds.has(id);
   const isContainer = shape.type === 'frame' || shape.type === 'group' || shape.type === 'vector';
   const isCollapsed = collapsed.has(id);
   const isDragging = draggingId === id;
@@ -298,7 +315,6 @@ function LayerRow(props: RowProps) {
   const isDropAfter = dropTarget?.id === id && dropTarget.pos === 'after';
   const isDropInside = dropTarget?.id === id && dropTarget.pos === 'inside';
   const renaming = renamingId === id;
-  const nameRef = useRef<HTMLInputElement>(null);
 
   return (
     <>
@@ -412,7 +428,7 @@ function LayerRow(props: RowProps) {
       ))}
     </>
   );
-}
+});
 
 // ── VectorChildRow ──────────────────────────────────────────────────────────
 
@@ -475,16 +491,6 @@ const styles: Record<string, React.CSSProperties> = {
     fontFamily: 'system-ui',
     userSelect: 'none',
   },
-  sectionHeader: {
-    padding: '10px 12px 6px',
-    fontSize: 11,
-    fontWeight: 600,
-    color: 'var(--text-secondary)',
-    letterSpacing: '0.06em',
-    textTransform: 'uppercase',
-    borderBottom: '1px solid var(--border)',
-    flexShrink: 0,
-  },
   list: {
     flex: 1,
     overflowY: 'auto',
@@ -529,7 +535,7 @@ const styles: Record<string, React.CSSProperties> = {
   renameInput: {
     flex: 1,
     background: 'var(--border)',
-    border: '1px solid #6E72F5',
+    border: '1px solid var(--accent)',
     borderRadius: 3,
     color: 'var(--text)',
     fontSize: 12,
@@ -550,9 +556,6 @@ const styles: Record<string, React.CSSProperties> = {
     margin: '0 8px',
     borderRadius: 1,
     pointerEvents: 'none',
-  },
-  badge: {
-    fontSize: 10, color: 'var(--accent-hover)', flexShrink: 0, lineHeight: 1,
   },
   empty: {
     padding: 16,

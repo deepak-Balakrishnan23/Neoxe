@@ -76,20 +76,48 @@ export default function InteractionsSection({ shape }: { shape: Shape }) {
             </select>
             <button style={s.del} onClick={() => remove(it.id)}>×</button>
           </div>
+          {/* Action — the runtime supports navigate / back / open-URL; expose all three
+              (they were previously unreachable from the UI). */}
           <div style={s.iRow}>
-            <span style={s.tag}>Go to</span>
-            <select style={s.select} value={it.targetFrameId ?? ''}
-              onChange={e => update(it.id, { targetFrameId: e.target.value })}>
-              {frames.map(f => <option key={f.id} value={f.id}>{f.name}</option>)}
+            <span style={s.tag}>Do</span>
+            <select style={s.select} value={it.action}
+              onChange={e => {
+                const action = e.target.value as Interaction['action'];
+                update(it.id, action === 'navigate'
+                  ? { action, targetFrameId: it.targetFrameId ?? frames[0]?.id }
+                  : { action });
+              }}>
+              <option value="navigate">Navigate to</option>
+              <option value="back">Go back</option>
+              <option value="url">Open URL</option>
             </select>
           </div>
-          <div style={s.iRow}>
-            <span style={s.tag}>Anim</span>
-            <select style={s.select} value={it.transition}
-              onChange={e => update(it.id, { transition: e.target.value as Transition })}>
-              {TRANSITIONS.map(t => <option key={t} value={t}>{t}</option>)}
-            </select>
-          </div>
+          {it.action === 'navigate' && (
+            <div style={s.iRow}>
+              <span style={s.tag}>Go to</span>
+              <select style={s.select} value={it.targetFrameId ?? ''}
+                onChange={e => update(it.id, { targetFrameId: e.target.value })}>
+                {frames.map(f => <option key={f.id} value={f.id}>{f.name}</option>)}
+              </select>
+            </div>
+          )}
+          {it.action === 'url' && (
+            <div style={s.iRow}>
+              <span style={s.tag}>URL</span>
+              <input style={s.select} type="url" placeholder="https://…"
+                value={it.url ?? ''}
+                onChange={e => update(it.id, { url: e.target.value })} />
+            </div>
+          )}
+          {it.action !== 'back' && (
+            <div style={s.iRow}>
+              <span style={s.tag}>Anim</span>
+              <select style={s.select} value={it.transition}
+                onChange={e => update(it.id, { transition: e.target.value as Transition })}>
+                {TRANSITIONS.map(t => <option key={t} value={t}>{t}</option>)}
+              </select>
+            </div>
+          )}
         </div>
       ))}
     </div>
@@ -108,7 +136,7 @@ const s: Record<string, React.CSSProperties> = {
     width: '100%', background: 'var(--border)', border: '1px solid var(--border-strong)',
     borderRadius: 6, color: 'var(--text)', fontSize: 12, padding: '6px', cursor: 'pointer', marginBottom: 8,
   },
-  startActive: { background: 'rgba(245,197,66,0.18)', border: '1px solid rgba(245,197,66,0.5)', color: '#F5C542' },
+  startActive: { background: 'rgba(245,197,66,0.18)', border: '1px solid rgba(245,197,66,0.5)', color: 'var(--comment)' },
   empty: { fontSize: 11, color: 'var(--text-secondary)', padding: '2px 0 4px' },
   interaction: {
     background: 'var(--row-hover)', borderRadius: 6, padding: 8, marginBottom: 6,

@@ -142,32 +142,35 @@ export function applyRotateDelta(
   startDocY: number,
   currentDocX: number,
   currentDocY: number,
+  snapDeg?: number,   // when set (e.g. 15 with Shift), snap the result to this increment
 ): number {
   const startAngle = Math.atan2(startDocY - centerY, startDocX - centerX);
   const currentAngle = Math.atan2(currentDocY - centerY, currentDocX - centerX);
   const delta = (currentAngle - startAngle) * (180 / Math.PI);
-  return ((original.rotation + delta) % 360 + 360) % 360;
+  let deg = original.rotation + delta;
+  if (snapDeg && snapDeg > 0) deg = Math.round(deg / snapDeg) * snapDeg;
+  return ((deg % 360) + 360) % 360;
 }
 
-// Cursor names for each handle index
-const HANDLE_CURSORS: Record<number, string> = {
-  0: 'nwse-resize',
-  1: 'ns-resize',
-  2: 'nesw-resize',
-  3: 'ew-resize',
-  4: 'nwse-resize',
-  5: 'ns-resize',
-  6: 'nesw-resize',
-  7: 'ew-resize',
-  8: 'default', // rotate
-};
+
+// Curved-arrow rotate cursor (white halo for contrast on any background), hotspot centred.
+export const ROTATE_CURSOR = `url("data:image/svg+xml,${encodeURIComponent(
+  '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">' +
+  '<g fill="none" stroke="white" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round">' +
+  '<path d="M6 8a7 7 0 1 1-1.2 4"/><path d="M6 3.5V8H10.5"/></g>' +
+  '<g fill="none" stroke="black" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">' +
+  '<path d="M6 8a7 7 0 1 1-1.2 4"/><path d="M6 3.5V8H10.5"/></g></svg>'
+)}") 12 12, grab`;
 
 export function handleCursor(index: number, rotation: number): string {
-  if (index === 8) return 'default';
-  // Rotate the cursor icon based on shape rotation
+  if (index === 8) return ROTATE_CURSOR;
+  // The 8 handle directions repeat every 180°; each 45° of shape rotation shifts a
+  // handle's visual direction by one slot (nwse → ns → nesw → ew → nwse …). Matching
+  // Figma: the resize cursor follows the rotated edge, not the original axis.
   const baseCursors = ['nwse-resize', 'ns-resize', 'nesw-resize', 'ew-resize',
     'nwse-resize', 'ns-resize', 'nesw-resize', 'ew-resize'];
-  return baseCursors[index] ?? 'default';
+  const shift = Math.round(((rotation % 180) + 180) % 180 / 45) % 4;
+  return baseCursors[(index + shift) % 8] ?? 'default';
 }
 
 export function shapeCenterDoc(shape: Shape): { cx: number; cy: number } {

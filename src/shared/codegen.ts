@@ -1,4 +1,5 @@
-import { Shape, Page, Fill, Stroke, Shadow, TextStyle, DesignFile } from './types';
+import { Shape, Page, Fill, Shadow } from './types';
+import { sanitizeSvgMarkup } from './sanitizeSvg';
 
 // ── Code generation: shape → CSS / SVG / HTML / React / Tailwind ───────────────
 
@@ -38,12 +39,15 @@ function shadowToCss(s: Shadow): string {
 
 // ── CSS generation ────────────────────────────────────────────────────────────
 
-export function shapeToCssProps(shape: Shape): Record<string, string> {
+export function shapeToCssProps(shape: Shape, page?: Page): Record<string, string> {
   const props: Record<string, string> = {};
 
+  // Position relative to the PARENT container (what you'd paste into real CSS),
+  // not the page-absolute canvas coordinate — matching Figma's inspect output.
+  const parent = page && shape.parentId ? page.objects[shape.parentId] : null;
   props['position'] = 'absolute';
-  props['left'] = `${round(shape.x)}px`;
-  props['top'] = `${round(shape.y)}px`;
+  props['left'] = `${round(shape.x - (parent?.x ?? 0))}px`;
+  props['top'] = `${round(shape.y - (parent?.y ?? 0))}px`;
   props['width'] = `${round(shape.width)}px`;
   props['height'] = `${round(shape.height)}px`;
 
@@ -67,12 +71,16 @@ export function shapeToCssProps(shape: Shape): Record<string, string> {
 
   if (shape.type === 'circle') props['border-radius'] = '50%';
 
-  // Shadows
+  // Shadows. text-shadow has no inset concept, so inner shadows are dropped there (emitting
+  // them produced invalid CSS); box-shadow keeps them (shadowToCss adds `inset`).
   const drops = shape.shadows.filter(s => !s.hidden);
   if (drops.length > 0) {
-    const box = drops.filter(s => s.type !== 'inner' || true).map(shadowToCss).join(', ');
-    if (shape.type === 'text') props['text-shadow'] = drops.map(shadowToCss).join(', ');
-    else props['box-shadow'] = box;
+    if (shape.type === 'text') {
+      const outer = drops.filter(s => s.type !== 'inner');
+      if (outer.length > 0) props['text-shadow'] = outer.map(shadowToCss).join(', ');
+    } else {
+      props['box-shadow'] = drops.map(shadowToCss).join(', ');
+    }
   }
 
   // Blur
@@ -81,29 +89,30 @@ export function shapeToCssProps(shape: Shape): Record<string, string> {
     else props['backdrop-filter'] = `blur(${shape.blur.value}px)`;
   }
 
-  // Layout
-  if (shape.type === 'frame' && shape.layout) {
-    const L = shape.layout;
-    if (L.type === 'flex') {
-      props['display'] = 'flex';
-      props['flex-direction'] = L.direction;
-      props['flex-wrap'] = L.wrap;
-      props['justify-content'] = mapJustify(L.justify);
-      props['align-items'] = mapAlign(L.align);
-      props['gap'] = `${L.gap}px`;
-      props['padding'] = `${L.padding.top}px ${L.padding.right}px ${L.padding.bottom}px ${L.padding.left}px`;
-      // override absolute positioning for flex children handled by browser
-      delete props['position'];
-      props['position'] = 'relative';
-    } else if (L.type === 'grid') {
+  // Layout — emitted from the Figma-style Auto Layout settings (the app's single
+  // layout model). horizontal/vertical/wrap map to flexbox, grid to CSS grid.
+  if (shape.type === 'frame' && shape.autoLayout) {
+    const al = shape.autoLayout;
+    if (al.direction === 'grid') {
       props['display'] = 'grid';
-      props['grid-template-columns'] = L.columns.map(t => t.kind === 'fr' ? `${t.value}fr` : t.kind === 'fixed' ? `${t.value}px` : 'auto').join(' ');
-      props['grid-template-rows'] = L.rows.map(t => t.kind === 'fr' ? `${t.value}fr` : t.kind === 'fixed' ? `${t.value}px` : 'auto').join(' ');
-      props['column-gap'] = `${L.columnGap}px`;
-      props['row-gap'] = `${L.rowGap}px`;
-      props['padding'] = `${L.padding.top}px ${L.padding.right}px ${L.padding.bottom}px ${L.padding.left}px`;
-      props['position'] = 'relative';
+      props['grid-template-columns'] = `repeat(${Math.max(1, Math.floor(al.columns ?? 2))}, 1fr)`;
+      props['gap'] = `${al.spacing ?? 0}px`;
+    } else {
+      props['display'] = 'flex';
+      const base = al.direction === 'vertical' ? 'column' : 'row';
+      props['flex-direction'] = al.reversed ? `${base}-reverse` : base;
+      if (al.direction === 'wrap') props['flex-wrap'] = 'wrap';
+      props['justify-content'] = mapJustify(al.justifyContent);
+      props['align-items'] = mapAlign(al.alignItems);
+      props['gap'] = `${al.spacing ?? 0}px`;
     }
+    props['padding'] = `${al.padding.top}px ${al.padding.right}px ${al.padding.bottom}px ${al.padding.left}px`;
+    // W/H already include padding (Figma bakes them in), so the box must size border-box or
+    // the emitted padding inflates the element beyond its declared width/height.
+    props['box-sizing'] = 'border-box';
+    // flex/grid children are positioned by the browser, not absolutely
+    delete props['position'];
+    props['position'] = 'relative';
   }
 
   // Typography
@@ -133,8 +142,8 @@ function mapAlign(a: string): string {
   return m[a] ?? a;
 }
 
-export function shapeToCss(shape: Shape, selector?: string): string {
-  const props = shapeToCssProps(shape);
+export function shapeToCss(shape: Shape, selector?: string, page?: Page): string {
+  const props = shapeToCssProps(shape, page);
   const body = Object.entries(props).map(([k, v]) => `  ${k}: ${v};`).join('\n');
   const sel = selector ?? `.${cssClassName(shape)}`;
   return `${sel} {\n${body}\n}`;
@@ -320,12 +329,34 @@ function shapeToHtmlEl(s: Shape, page: Page, images: Record<string, string> | un
       const vb = s.svgOriginalWidth && s.svgOriginalHeight ? `0 0 ${s.svgOriginalWidth} ${s.svgOriginalHeight}` : `0 0 ${w} ${h}`;
       return `<svg style="${style}" viewBox="${vb}" preserveAspectRatio="none">${s.svgInnerHTML}</svg>`;
     }
-    return `<div style="${style};overflow:hidden">${s.svgContent}</div>`;
+    // svgContent is RAW imported file text (unlike svgInnerHTML, which was sanitized on
+    // import) — sanitize before embedding in the exported/presented HTML or a crafted SVG
+    // could run script when the prototype is opened.
+    return `<div style="${style};overflow:hidden">${sanitizeSvgMarkup(s.svgContent!)}</div>`;
   }
 
   const props = shapeToCssProps(s);
   props['left'] = `${left}px`;
   props['top'] = `${top}px`;
+  // The prototype flattens the subtree: every descendant is emitted as an
+  // absolutely-positioned SIBLING with the engine's final x/y already baked in
+  // (flat coordinate model). Re-emitting the auto-layout CSS here would apply
+  // layout twice — position:relative puts the div back into block flow (each
+  // auto-layout frame pushes the next one down by its own height) and padding
+  // inflates the painted box — so strip every flow property and pin absolute.
+  delete props['display'];
+  delete props['flex-direction'];
+  delete props['flex-wrap'];
+  delete props['justify-content'];
+  delete props['align-items'];
+  delete props['gap'];
+  delete props['grid-template-columns'];
+  delete props['padding'];
+  props['position'] = 'absolute';
+  // Borders must not grow the box beyond the shape's stored width/height.
+  if (props['border']) props['box-sizing'] = 'border-box';
+  // The canvas never paints fills behind text glyphs — don't paint them here either.
+  if (s.type === 'text') delete props['background'];
   const cr = cornerRadiusCss(s);
   if (cr && s.type !== 'circle') props['border-radius'] = cr;
   if (s.clipContent) props['overflow'] = 'hidden';
@@ -346,14 +377,31 @@ function shapeToHtmlEl(s: Shape, page: Page, images: Record<string, string> | un
 export function frameToHtml(frame: Shape, page: Page, images?: Record<string, string>): string {
   const ox = frame.x, oy = frame.y;
   const flat: Shape[] = [];
+  const seen = new Set<string>();
   const collect = (id: string) => {
+    if (seen.has(id)) return;
     const s = page.objects[id];
     if (!s || s.hidden) return;
+    seen.add(id);
     flat.push(s);
     s.childIds.forEach(collect);
   };
-  flat.push(frame);                 // frame fill = screen backdrop
+  flat.push(frame); seen.add(frame.id);   // frame fill = screen backdrop
   frame.childIds.forEach(collect);
+
+  // Adopt loose top-level shapes that visually sit inside this frame. A shape can look
+  // like it's "in" a frame while actually being a page-level sibling (drawn before the
+  // frame existed, dropped from another frame, etc.). Without this, Present renders those
+  // frames blank even though the editor shows content — the "click → blank white screen"
+  // report. Other top-level frames are excluded (they're their own screens); the frame's
+  // overflow:hidden clips anything that pokes past the edge.
+  const cx0 = frame.x, cy0 = frame.y, cx1 = frame.x + frame.width, cy1 = frame.y + frame.height;
+  for (const id of page.childIds) {
+    const s = page.objects[id];
+    if (!s || s.hidden || s.type === 'frame' || seen.has(id)) continue;
+    const scx = s.x + s.width / 2, scy = s.y + s.height / 2;
+    if (scx >= cx0 && scx <= cx1 && scy >= cy0 && scy <= cy1) collect(id);
+  }
 
   const body = flat.map(s => shapeToHtmlEl(s, page, images, ox, oy)).join('\n        ');
   return `<div class="frame-root" style="position:relative;width:${round(frame.width)}px;height:${round(frame.height)}px;overflow:hidden">\n        ${body}\n      </div>`;
@@ -403,7 +451,7 @@ export function shapeToHtml(shape: Shape, page: Page): string {
 
 export function shapeToReact(shape: Shape, page: Page): string {
   const compName = pascalCase(shape.name);
-  const styleObj = cssToReactStyle(shapeToCssProps(shape));
+  const styleObj = cssToReactStyle(shapeToCssProps(shape, page));
   const text = shape.type === 'text'
     ? (shape.paragraphs ?? []).flatMap(p => p.spans.map(s => s.text)).join('')
     : '';
@@ -425,15 +473,17 @@ export function shapeToTailwind(shape: Shape): string {
   if (shape.opacity < 1) classes.push(`opacity-[${round(shape.opacity, 2)}]`);
   if (shape.rotation) classes.push(`rotate-[${shape.rotation}deg]`);
 
-  if (shape.type === 'frame' && shape.layout?.type === 'flex') {
-    const L = shape.layout;
+  if (shape.type === 'frame' && shape.autoLayout && shape.autoLayout.direction !== 'grid') {
+    const al = shape.autoLayout;
     classes.push('flex');
-    if (L.direction.startsWith('column')) classes.push('flex-col');
-    classes.push(`gap-[${L.gap}px]`);
+    if (al.direction === 'vertical') classes.push(al.reversed ? 'flex-col-reverse' : 'flex-col');
+    else if (al.reversed) classes.push('flex-row-reverse');
+    if (al.direction === 'wrap') classes.push('flex-wrap');
+    classes.push(`gap-[${al.spacing ?? 0}px]`);
     const jmap: Record<string, string> = { start: 'justify-start', center: 'justify-center', end: 'justify-end', 'space-between': 'justify-between', 'space-around': 'justify-around', 'space-evenly': 'justify-evenly' };
-    classes.push(jmap[L.justify] ?? '');
-    const amap: Record<string, string> = { start: 'items-start', center: 'items-center', end: 'items-end', stretch: 'items-stretch' };
-    classes.push(amap[L.align] ?? '');
+    classes.push(jmap[al.justifyContent] ?? '');
+    const amap: Record<string, string> = { start: 'items-start', center: 'items-center', end: 'items-end' };
+    classes.push(amap[al.alignItems] ?? '');
   }
 
   const text = shape.type === 'text'
@@ -465,7 +515,7 @@ export type CodeFormat = 'css' | 'svg' | 'html' | 'react' | 'tailwind';
 
 export function generateCode(shape: Shape, page: Page, format: CodeFormat): string {
   switch (format) {
-    case 'css': return shapeToCss(shape);
+    case 'css': return shapeToCss(shape, undefined, page);
     case 'svg': return shapeToSvg(shape, page);
     case 'html': return shapeToHtml(shape, page);
     case 'react': return shapeToReact(shape, page);

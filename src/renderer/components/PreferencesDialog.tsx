@@ -5,11 +5,26 @@ import Icon from './Icon';
 
 export default function PreferencesDialog() {
   const prefs = usePrefs();
+  // True only when the mousedown began on the backdrop itself — a drag that starts
+  // inside the dialog and releases on the backdrop must not dismiss it.
+  const downOnOverlay = React.useRef(false);
+  // Escape closes the dialog (keyboard-dismissable, like every other modal). Effect runs
+  // before the early return to satisfy rules-of-hooks; it no-ops while closed.
+  React.useEffect(() => {
+    if (!prefs.prefsOpen) return;
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') prefs.setPrefsOpen(false); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [prefs.prefsOpen, prefs]);
   if (!prefs.prefsOpen) return null;
 
   return (
-    <div style={s.overlay} onMouseDown={() => prefs.setPrefsOpen(false)}>
-      <div style={s.dialog} onMouseDown={e => e.stopPropagation()}>
+    <div
+      style={s.overlay}
+      onMouseDown={e => { downOnOverlay.current = e.target === e.currentTarget; }}
+      onClick={e => { if (downOnOverlay.current && e.target === e.currentTarget) prefs.setPrefsOpen(false); }}
+    >
+      <div style={s.dialog}>
         <div style={s.title}>Settings</div>
 
         <div style={s.groupLabel}>Appearance</div>
@@ -119,7 +134,7 @@ const s: Record<string, React.CSSProperties> = {
   },
   actions: { marginTop: 8 },
   primary: {
-    width: '100%', background: '#6E72F5', border: 'none', color: '#fff',
+    width: '100%', background: T.accent, border: 'none', color: '#fff',
     fontSize: 13, padding: '8px', borderRadius: 6, cursor: 'pointer', fontWeight: 500,
   },
 };

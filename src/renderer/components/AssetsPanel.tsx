@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { DesignFile } from '../../shared/types';
+import { DesignFile, ChangeOp } from '../../shared/types';
 import { useDesignStore } from '../store/useDesignStore';
 import { api } from '../ipc/api';
 import ColorPicker from './ColorPicker';
@@ -38,7 +38,7 @@ export default function AssetsPanel() {
 // ── Components tab ────────────────────────────────────────────────────────────
 
 function ComponentsTab() {
-  const { file, setFile } = useDesignStore();
+  const { file } = useDesignStore();
   const components = file ? Object.entries(file.components) : [];
 
   if (components.length === 0) {
@@ -106,12 +106,12 @@ function ColorsTab() {
   const applyColor = async (hex: string, opacity: number) => {
     const page = activePage();
     if (!page || selectedIds.size === 0) return;
-    const ops = [...selectedIds].flatMap(id => {
+    const ops = [...selectedIds].flatMap((id): ChangeOp[] => {
       const s = page.objects[id];
       if (!s) return [];
       if (s.type === 'text' && s.textStyle)
-        return [{ op: 'set' as const, id, attr: 'textStyle', val: { ...s.textStyle, color: hex, opacity } }];
-      return [{ op: 'set' as const, id, attr: 'fills', val: [{ type: 'solid', color: hex, opacity }] }];
+        return [{ op: 'set', id, attr: 'textStyle', val: { ...s.textStyle, color: hex, opacity } }];
+      return [{ op: 'set', id, attr: 'fills', val: [{ type: 'solid', color: hex, opacity }] }];
     });
     if (!ops.length) return;
     const res = await api.applyChanges({ pageId: page.id, ops });

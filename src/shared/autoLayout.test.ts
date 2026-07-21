@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   calculateLayout, applyAutoLayoutToPage, AutoLayoutNode, Bounds, AutoLayoutPadding,
 } from './autoLayout';
-import { makeDefaultShape, Page, Shape } from './types';
+import { makeDefaultShape, Page } from './types';
 
 // Tiny factory so each test reads as a layout, not boilerplate.
 const node = (n: Partial<AutoLayoutNode> = {}): AutoLayoutNode => ({
@@ -485,5 +485,260 @@ describe('reversed (via applyAutoLayoutToPage)', () => {
     // reversed → b (last) is placed first at the container origin, a after it
     expect(page.objects.b.x).toBe(100);
     expect(page.objects.a.x).toBe(160); // 100 + b.width(60)
+  });
+});
+
+describe('negative gap (overlap)', () => {
+  it('places children overlapping and shrinks a hug container', () => {
+    const c = node({
+      autoLayout: true, direction: 'horizontal', widthMode: 'hug', heightMode: 'hug',
+      spacing: -10, padding: pad(0, 0, 0, 0),
+      children: [leaf(40, 20), leaf(40, 20)],
+    });
+    const r = calculateLayout(c, PARENT);
+    expect(r.bounds.width).toBe(70);                 // 40 + 40 + (-10)
+    expect(r.children.map(ch => ch.bounds.x)).toEqual([0, 30]); // second overlaps first by 10
+  });
+});
+
+describe('min/max constraints', () => {
+  it('clamps a hug container to maxWidth', () => {
+    const c = node({
+      autoLayout: true, direction: 'horizontal', widthMode: 'hug', heightMode: 'hug',
+      spacing: 0, padding: pad(0, 0, 0, 0), maxWidth: 100,
+      children: [leaf(80, 20), leaf(80, 20)],   // natural 160
+    });
+    expect(calculateLayout(c, PARENT).bounds.width).toBe(100);
+  });
+
+  it('clamps a fill child to maxWidth so it does not consume all leftover', () => {
+    const c = node({
+      autoLayout: true, direction: 'horizontal', widthMode: 'fixed', heightMode: 'fixed',
+      width: 500, height: 100, spacing: 0, padding: pad(0, 0, 0, 0),
+      children: [{ ...leaf(0, 40), widthMode: 'fill', maxWidth: 120 }],
+    });
+    expect(calculateLayout(c, PARENT).children[0].bounds.width).toBe(120);
+  });
+
+  it('clamps a fill child up to minWidth', () => {
+    const c = node({
+      autoLayout: true, direction: 'horizontal', widthMode: 'fixed', heightMode: 'fixed',
+      width: 50, height: 100, spacing: 0, padding: pad(0, 0, 0, 0),
+      children: [{ ...leaf(0, 40), widthMode: 'fill', minWidth: 200 }],
+    });
+    expect(calculateLayout(c, PARENT).children[0].bounds.width).toBe(200);
+  });
+});
+
+describe('wrap alignment', () => {
+  it('centres items on the main axis within each row (justifyContent center)', () => {
+    const c = node({
+      autoLayout: true, direction: 'wrap', widthMode: 'fixed', heightMode: 'hug',
+      width: 100, height: 0, spacing: 0, padding: pad(0, 0, 0, 0),
+      justifyContent: 'center', alignItems: 'start',
+      children: [leaf(40, 20)],   // one 40-wide item in a 100-wide row → slack 60 → leading 30
+    });
+    expect(calculateLayout(c, PARENT).children[0].bounds.x).toBe(30);
+  });
+
+  it('aligns items to the bottom of their row (alignItems end)', () => {
+    const c = node({
+      autoLayout: true, direction: 'wrap', widthMode: 'fixed', heightMode: 'hug',
+      width: 200, height: 0, spacing: 0, padding: pad(0, 0, 0, 0),
+      justifyContent: 'start', alignItems: 'end',
+      children: [leaf(40, 40), leaf(40, 20)],   // row height 40; second item (h20) drops to y=20
+    });
+    expect(calculateLayout(c, PARENT).children.map(ch => ch.bounds.y)).toEqual([0, 20]);
+  });
+});
+
+describe('grid', () => {
+  it('flows children row-major into equal columns; keeps their own box top-left', () => {
+    const c = node({
+      autoLayout: true, direction: 'grid', columns: 2, widthMode: 'fixed', heightMode: 'fixed',
+      width: 200, height: 200, spacing: 0, padding: pad(0, 0, 0, 0),
+      children: [leaf(40, 20), leaf(40, 20), leaf(40, 20), leaf(40, 20)],
+    });
+    const r = calculateLayout(c, PARENT);
+    // colW = 200/2 = 100; row height 20
+    expect(r.children.map(ch => ch.bounds.x)).toEqual([0, 100, 0, 100]);
+    expect(r.children.map(ch => ch.bounds.y)).toEqual([0, 0, 20, 20]);
+    expect(r.children.map(ch => ch.bounds.width)).toEqual([40, 40, 40, 40]); // not fill → own width
+  });
+
+  it('fill child stretches to the column width', () => {
+    const c = node({
+      autoLayout: true, direction: 'grid', columns: 2, widthMode: 'fixed', heightMode: 'fixed',
+      width: 200, height: 200, spacing: 0, padding: pad(0, 0, 0, 0),
+      children: [{ ...leaf(40, 20), widthMode: 'fill' }, leaf(40, 20)],
+    });
+    expect(calculateLayout(c, PARENT).children[0].bounds.width).toBe(100);
+  });
+
+  it('hug height = sum of row heights (2 rows of 20)', () => {
+    const c = node({
+      autoLayout: true, direction: 'grid', columns: 2, widthMode: 'fixed', heightMode: 'hug',
+      width: 200, height: 0, spacing: 0, padding: pad(0, 0, 0, 0),
+      children: [leaf(40, 20), leaf(40, 20), leaf(40, 20)],   // 3 items / 2 cols → 2 rows
+    });
+    expect(calculateLayout(c, PARENT).bounds.height).toBe(40);
+  });
+
+  it('respects column + row gap (spacing) on both axes', () => {
+    const c = node({
+      autoLayout: true, direction: 'grid', columns: 2, widthMode: 'fixed', heightMode: 'fixed',
+      width: 210, height: 200, spacing: 10, padding: pad(0, 0, 0, 0),
+      children: [leaf(40, 20), leaf(40, 20), leaf(40, 20), leaf(40, 20)],
+    });
+    const r = calculateLayout(c, PARENT);
+    // colW = (210 - 10)/2 = 100; second column starts at 100 + 10 = 110; second row at 20 + 10 = 30
+    expect(r.children.map(ch => ch.bounds.x)).toEqual([0, 110, 0, 110]);
+    expect(r.children.map(ch => ch.bounds.y)).toEqual([0, 0, 30, 30]);
+  });
+});
+
+describe('wrap alignContent (row distribution)', () => {
+  const twoRows = (alignContent: 'start' | 'center' | 'end' | 'space-between'): AutoLayoutNode => node({
+    autoLayout: true, direction: 'wrap', widthMode: 'fixed', heightMode: 'fixed',
+    width: 100, height: 100, spacing: 0, padding: pad(0, 0, 0, 0), alignContent,
+    // three 40-wide × 20-tall items in a 100-wide container → row1=[i1,i2], row2=[i3].
+    // Two rows of height 20 → content 40, container 100 → cross slack 60.
+    children: [leaf(40, 20), leaf(40, 20), leaf(40, 20)],
+  });
+  it('start: rows packed at the top', () => {
+    expect(calculateLayout(twoRows('start'), PARENT).children.map(c => c.bounds.y)).toEqual([0, 0, 20]);
+  });
+  it('center: rows centred (slack 60 → +30)', () => {
+    expect(calculateLayout(twoRows('center'), PARENT).children.map(c => c.bounds.y)).toEqual([30, 30, 50]);
+  });
+  it('end: rows pushed to the bottom (slack 60)', () => {
+    expect(calculateLayout(twoRows('end'), PARENT).children.map(c => c.bounds.y)).toEqual([60, 60, 80]);
+  });
+});
+
+describe('stroke included in layout', () => {
+  const withStroke = (strokeInLayout: boolean): AutoLayoutNode => node({
+    autoLayout: true, direction: 'horizontal', widthMode: 'hug', heightMode: 'hug',
+    spacing: 0, padding: pad(0, 0, 0, 0), strokeInLayout,
+    children: [
+      { ...leaf(40, 40), strokeExtent: 8 },   // e.g. 4px outer stroke → 8 total
+      leaf(40, 40),
+    ],
+  });
+  it('off (default): stroke ignored — siblings touch, hug = 80', () => {
+    const r = calculateLayout(withStroke(false), PARENT);
+    expect(r.bounds.width).toBe(80);
+    expect(r.children.map(c => c.bounds.x)).toEqual([0, 40]);
+  });
+  it('on: stroke reserves space — second child pushed by 8, hug = 88', () => {
+    const r = calculateLayout(withStroke(true), PARENT);
+    expect(r.bounds.width).toBe(88);            // 40 + 8(stroke) + 40
+    // geometric box centred in its occupancy → first child offset by half-ext (4)
+    expect(r.children.map(c => c.bounds.x)).toEqual([4, 48]);
+  });
+});
+
+describe('rotated children use their AABB footprint (via applyAutoLayoutToPage)', () => {
+  const alFrame = (childIds: string[]) => makeDefaultShape({
+    id: 'c', type: 'frame', name: 'AL', frameId: 'c', parentId: null,
+    x: 0, y: 0, width: 0, height: 0, childIds,
+    autoLayout: { direction: 'horizontal', spacing: 10,
+      padding: { top: 0, right: 0, bottom: 0, left: 0 }, justifyContent: 'start', alignItems: 'start' },
+    widthMode: 'hug', heightMode: 'hug',
+  });
+
+  it('90°-rotated child contributes swapped dims; siblings do not overlap', () => {
+    const c = alFrame(['a', 'b']);
+    // a: 100×40 rotated 90° → AABB 40×100
+    const a = makeDefaultShape({ id: 'a', type: 'rect', name: 'a', frameId: 'c', parentId: 'c', x: 0, y: 0, width: 100, height: 40, rotation: 90 });
+    const b = makeDefaultShape({ id: 'b', type: 'rect', name: 'b', frameId: 'c', parentId: 'c', x: 0, y: 0, width: 50, height: 50 });
+    const page: Page = { id: 'p', name: 'P', background: '#fff', childIds: ['c'], objects: { c, a, b } };
+
+    applyAutoLayoutToPage(page);
+    // hug: width = 40 (AABB) + 10 + 50 = 100; height = max(100, 50) = 100
+    expect(page.objects.c.width).toBe(100);
+    expect(page.objects.c.height).toBe(100);
+    // a keeps its own size + rotation; centred in its 40×100 slot at (0,0)
+    expect(page.objects.a.width).toBe(100);
+    expect(page.objects.a.height).toBe(40);
+    expect(page.objects.a.rotation).toBe(90);
+    expect(page.objects.a.x).toBe(Math.round(0 + 40 / 2 - 100 / 2));  // -30 (AABB centred)
+    expect(page.objects.a.y).toBe(Math.round(0 + 100 / 2 - 40 / 2));  // 30
+    // b starts after a's AABB + spacing: 40 + 10 = 50
+    expect(page.objects.b.x).toBe(50);
+  });
+
+  it('45°-rotated square: AABB = side·√2 pushes the sibling out', () => {
+    const c = alFrame(['a', 'b']);
+    const a = makeDefaultShape({ id: 'a', type: 'rect', name: 'a', frameId: 'c', parentId: 'c', x: 0, y: 0, width: 100, height: 100, rotation: 45 });
+    const b = makeDefaultShape({ id: 'b', type: 'rect', name: 'b', frameId: 'c', parentId: 'c', x: 0, y: 0, width: 50, height: 50 });
+    const page: Page = { id: 'p', name: 'P', background: '#fff', childIds: ['c'], objects: { c, a, b } };
+
+    applyAutoLayoutToPage(page);
+    const aabb = Math.round(100 * Math.SQRT2);   // ≈ 141
+    // b sits after the AABB + spacing, so the rotated square never overlaps it
+    expect(page.objects.b.x).toBe(aabb + 10);
+    expect(page.objects.c.width).toBe(aabb + 10 + 50);
+    expect(page.objects.c.height).toBe(aabb);
+  });
+});
+
+describe('rotated AL container (flat model: children carry the same rotation)', () => {
+  it('children with rel-rotation 0 keep exact footprints; placements rotate about the container centre; rotation is never written', () => {
+    const c = makeDefaultShape({
+      id: 'c', type: 'frame', name: 'AL', frameId: 'c', parentId: null,
+      x: 0, y: 0, width: 0, height: 0, rotation: 90, childIds: ['a', 'b'],
+      autoLayout: { direction: 'horizontal', spacing: 10,
+        padding: { top: 0, right: 0, bottom: 0, left: 0 }, justifyContent: 'start', alignItems: 'start' },
+      widthMode: 'hug', heightMode: 'hug',
+    });
+    // Cascade state: children rotated WITH the container (rotation 90 each).
+    const a = makeDefaultShape({ id: 'a', type: 'rect', name: 'a', frameId: 'c', parentId: 'c', x: 0, y: 0, width: 40, height: 20, rotation: 90 });
+    const b = makeDefaultShape({ id: 'b', type: 'rect', name: 'b', frameId: 'c', parentId: 'c', x: 0, y: 0, width: 60, height: 20, rotation: 90 });
+    const page: Page = { id: 'p', name: 'P', background: '#fff', childIds: ['c'], objects: { c, a, b } };
+
+    applyAutoLayoutToPage(page);
+
+    // rel = 90 − 90 = 0 → EXACT footprints (no AABB): local slots a(0,0,40,20), b(50,0,60,20)
+    // → hug 110×20 (container box stays unrotated dims).
+    expect(page.objects.c.width).toBe(110);
+    expect(page.objects.c.height).toBe(20);
+    // Placements rotate about the container centre (55,10) by 90°:
+    // a: local centre (20,10) → (55,−25) → x = 55−20 = 35, y = −25−10 = −35
+    expect(page.objects.a.x).toBe(35);
+    expect(page.objects.a.y).toBe(-35);
+    // b: local centre (80,10) → (55,35) → x = 55−30 = 25, y = 35−10 = 25
+    expect(page.objects.b.x).toBe(25);
+    expect(page.objects.b.y).toBe(25);
+    // The engine must NEVER write rotation.
+    expect(page.objects.a.rotation).toBe(90);
+    expect(page.objects.b.rotation).toBe(90);
+    expect(page.objects.c.rotation).toBe(90);
+    // Sizes untouched (rel 0 slots are exact).
+    expect(page.objects.a.width).toBe(40);
+    expect(page.objects.a.height).toBe(20);
+  });
+});
+
+describe('absolute-positioned children', () => {
+  it('excludes absolute children from flow and from hug measurement', () => {
+    const c = makeDefaultShape({
+      id: 'c', type: 'frame', name: 'AL', frameId: 'c', parentId: null,
+      x: 0, y: 0, width: 0, height: 0, childIds: ['flow', 'abs'],
+      autoLayout: { direction: 'horizontal', spacing: 0,
+        padding: { top: 0, right: 0, bottom: 0, left: 0 }, justifyContent: 'start', alignItems: 'start' },
+      widthMode: 'hug', heightMode: 'hug',
+    });
+    const flow = makeDefaultShape({ id: 'flow', type: 'rect', name: 'flow', frameId: 'c', parentId: 'c', x: 0, y: 0, width: 40, height: 30 });
+    const abs = makeDefaultShape({ id: 'abs', type: 'rect', name: 'abs', frameId: 'c', parentId: 'c', x: 999, y: 999, width: 500, height: 500, layoutPositioning: 'absolute' });
+    const page: Page = { id: 'p', name: 'P', background: '#fff', childIds: ['c'], objects: { c, flow, abs } };
+
+    applyAutoLayoutToPage(page);
+    // hug ignores the absolute child → container is just the flow child
+    expect(page.objects.c.width).toBe(40);
+    expect(page.objects.c.height).toBe(30);
+    // absolute child keeps its manual position (not placed into the flow)
+    expect(page.objects.abs.x).toBe(999);
+    expect(page.objects.abs.y).toBe(999);
   });
 });

@@ -3,12 +3,14 @@ import { useDesignStore, Guide } from '../store/useDesignStore';
 import { usePrefs } from '../store/usePrefs';
 
 const RULER_SIZE = 20;
+// Guide blue/red read fine on both themes; the ruler surfaces follow the theme via
+// CSS vars (this is SVG, so vars work directly in fill/stroke).
 const GUIDE_COLOR = '#2897E0';
 const GUIDE_HOVER_COLOR = '#FF3B30';
-const RULER_BG = '#1a1a1a';
-const RULER_TICK = '#4a4a4a';
-const RULER_TEXT = '#777';
-const RULER_BORDER = '#333';
+const RULER_BG = 'var(--bg-panel)';
+const RULER_TICK = 'var(--text-faint)';
+const RULER_TEXT = 'var(--text-muted)';
+const RULER_BORDER = 'var(--border-strong)';
 
 interface Viewport { x: number; y: number; zoom: number; }
 interface RulerProps { viewport: Viewport; }
@@ -56,12 +58,16 @@ export default function Ruler({ viewport }: RulerProps) {
     if (!selectedId) return;
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Delete' || e.key === 'Backspace') {
+        // Stop the canvas's global keydown from ALSO deleting the selected shape — a guide
+        // being selected owns this Delete. Capture phase so it wins the race.
+        e.preventDefault();
+        e.stopPropagation();
         removeGuide(pageIdRef.current, selectedId);
         setSelectedId(null);
       }
     };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
+    window.addEventListener('keydown', onKey, true);
+    return () => window.removeEventListener('keydown', onKey, true);
   }, [selectedId, removeGuide]);
 
   const startDrag = (d: DragState) => {

@@ -1,14 +1,26 @@
-// Renderer-side file I/O. NATIVE SAVE ONLY — never downloads.
+// Renderer-side file I/O (pure web app).
 //
-//  - Electron: window.fileAPI → OS save dialog on first save, fs.writeFile after.
-//  - Browser (Chromium/Brave): File System Access API → real OS save dialog on first
-//    save, then silent overwrite of the same file via the kept handle.
-//  - No File System Access + no Electron (e.g. Firefox): save reports unsupported. We do
-//    NOT fall back to a blob download — clicking Save must never spray files into Downloads.
+//  - Chromium (Chrome/Edge, Brave with the flag): File System Access API → real OS save
+//    dialog on first save, then silent overwrite of the same file via the kept handle.
+//  - No File System Access (Safari/Firefox, default Brave): fall back to a normal
+//    download for save, and a hidden <input type=file> for open.
 
 import { DesignFile } from '../../shared/types';
+import { importDesignJson } from '../../shared/importers';
 
 const DESIGN_EXT = '.design';
+
+// Parse + validate an opened file. Routes through importDesignJson so native .design files
+// are shape-checked (a foreign/corrupt JSON without pages/activePageId used to sail through
+// `JSON.parse(...) as DesignFile` and crash later on file.pages.find(...)), and Figma /
+// Penpot exports are converted instead of silently producing a broken document.
+function parseDesignFile(text: string): DesignFile {
+  let json: unknown;
+  try { json = JSON.parse(text); }
+  catch { throw new Error('This file isn’t valid JSON.'); }
+  try { return importDesignJson(json); }
+  catch { throw new Error('This file isn’t a recognized design file (.design, Figma, or Penpot export).'); }
+}
 
 interface FsaHandle {
   name?: string;
@@ -21,12 +33,6 @@ interface FsaHandle {
 const win = window as unknown as {
   showOpenFilePicker?: (opts?: unknown) => Promise<FsaHandle[]>;
   showSaveFilePicker?: (opts?: unknown) => Promise<FsaHandle>;
-  fileAPI?: {
-    saveDialog: (defaultName: string, filters?: { name: string; extensions: string[] }[]) => Promise<{ canceled: boolean; filePath?: string }>;
-    writeFile: (filePath: string, content: string) => Promise<{ success: boolean; error?: string }>;
-    // Binary export: write a data-URL (e.g. PNG/JPG canvas output) to disk natively.
-    writeExport?: (filePath: string, dataUrl: string) => Promise<{ success: boolean; error?: string }>;
-  };
 };
 
 function sanitizeName(name: string): string {
@@ -35,28 +41,24 @@ function sanitizeName(name: string): string {
 }
 
 // Per-document save target (kept across edits, keyed by the stable file id). Holds the
-// chosen on-disk path (Electron) or the FileSystemFileHandle (browser) so re-saves write
-// to the same place with no prompt.
-type SaveTarget =
-  | { kind: 'electron'; path: string }
-  | { kind: 'fsa'; handle: FsaHandle };
-const saveTargets = new Map<string, SaveTarget>();
+// FileSystemFileHandle so re-saves write to the same place with no prompt.
+const saveTargets = new Map<string, FsaHandle>();
 
 export interface PersistResult {
-  saved: boolean;          // false = cancelled or unsupported
+  saved: boolean;          // false = the user cancelled the OS save dialog
   firstSave: boolean;      // true when this document had no prior save target
-  targetLabel: string | null;  // path/filename to show/remember on the tab
-  unsupported?: boolean;   // true when neither native API is available
+  targetLabel: string | null;  // filename to show/remember on the tab
 }
 
 async function ensurePermission(handle: FsaHandle): Promise<boolean> {
   const opts = { mode: 'readwrite' };
   try {
-    if (!handle.queryPermission || (await handle.queryPermission(opts)) === 'granted') return true;
+    if (!handle.queryPermission) return true;                       // older impl — assume usable
+    if ((await handle.queryPermission(opts)) === 'granted') return true;
     if (handle.requestPermission && (await handle.requestPermission(opts)) === 'granted') return true;
-    return false;
+    return false;                                                   // prompt dismissed / denied
   } catch {
-    return true;
+    return false;                                                   // request needs activation / failed
   }
 }
 
@@ -66,11 +68,9 @@ async function writeViaHandle(handle: FsaHandle, content: string | Blob) {
   await writable.close();
 }
 
-// Last-resort download for EXPORT only (never for document save). Used when neither Electron
-// nor the File System Access API is available — e.g. Brave, which disables showSaveFilePicker
-// by default. Exporting an asset to Downloads is normal web behaviour; the strict no-download
-// rule applies only to the document Save button (persistFile), not to exports.
-function downloadExport(filename: string, payload: string | Blob, mime: string) {
+// Download fallback for browsers without the File System Access API. The file genuinely
+// saves (to the Downloads folder); the user just doesn't pick the location.
+function downloadFile(filename: string, payload: string | Blob, mime: string) {
   const blob = typeof payload === 'string' ? new Blob([payload], { type: mime }) : payload;
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
@@ -83,8 +83,9 @@ function downloadExport(filename: string, payload: string | Blob, mime: string) 
 }
 
 /**
- * Save a document to disk natively. First save prompts (OS dialog); later saves overwrite
- * the remembered target silently. Never downloads.
+ * Save a document to disk. With the File System Access API the first save prompts
+ * (native OS dialog) and later saves overwrite the remembered target silently;
+ * without it, each save downloads the file.
  */
 export async function persistFile(opts: { content: string; filename: string; fileId: string }): Promise<PersistResult> {
   const { content, fileId } = opts;
@@ -92,33 +93,20 @@ export async function persistFile(opts: { content: string; filename: string; fil
   const existing = saveTargets.get(fileId);
   const firstSave = !existing;
 
-  // ── Electron native ──────────────────────────────────────────────────────
-  if (win.fileAPI) {
-    if (existing && existing.kind === 'electron') {
-      const r = await win.fileAPI.writeFile(existing.path, content);
-      return { saved: !!r.success, firstSave, targetLabel: existing.path };
-    }
-    const dlg = await win.fileAPI.saveDialog(defaultName);
-    if (dlg.canceled || !dlg.filePath) return { saved: false, firstSave, targetLabel: null };
-    const r = await win.fileAPI.writeFile(dlg.filePath, content);
-    if (!r.success) return { saved: false, firstSave, targetLabel: null };
-    saveTargets.set(fileId, { kind: 'electron', path: dlg.filePath });
-    return { saved: true, firstSave, targetLabel: dlg.filePath };
-  }
-
-  // ── Browser native: File System Access API ────────────────────────────────
   if (win.showSaveFilePicker) {
-    if (existing && existing.kind === 'fsa' && (await ensurePermission(existing.handle))) {
-      await writeViaHandle(existing.handle, content);
-      return { saved: true, firstSave, targetLabel: existing.handle.name ?? defaultName };
+    // Repeat save of an already-targeted file → write straight back, no dialog.
+    if (existing && (await ensurePermission(existing))) {
+      await writeViaHandle(existing, content);
+      return { saved: true, firstSave, targetLabel: existing.name ?? defaultName };
     }
+    // First save (or Save As) → native OS "Save As" dialog, then remember the handle.
     try {
       const handle = await win.showSaveFilePicker({
         suggestedName: defaultName,
         types: [{ description: 'Design File', accept: { 'application/json': [DESIGN_EXT, '.json'] } }],
       });
       await writeViaHandle(handle, content);
-      saveTargets.set(fileId, { kind: 'fsa', handle });
+      saveTargets.set(fileId, handle);
       return { saved: true, firstSave, targetLabel: handle.name ?? defaultName };
     } catch (e) {
       if ((e as DOMException)?.name === 'AbortError') return { saved: false, firstSave, targetLabel: null };
@@ -126,8 +114,9 @@ export async function persistFile(opts: { content: string; filename: string; fil
     }
   }
 
-  // No native save available — deliberately do NOT download.
-  return { saved: false, firstSave, targetLabel: null, unsupported: true };
+  // No File System Access API — download so Save still works in every browser.
+  downloadFile(defaultName, content, 'application/json');
+  return { saved: true, firstSave, targetLabel: defaultName };
 }
 
 /** Serialize a document exactly as Open expects to parse it. */
@@ -138,13 +127,11 @@ export function serializeFile(file: DesignFile): string {
 export interface ExportResult {
   saved: boolean;
   targetLabel: string | null;
-  unsupported?: boolean;
 }
 
 /**
- * Export arbitrary text (e.g. an HTML prototype) to disk via the native OS dialog.
- * One-shot: always prompts for a location (export ≠ document save). Never downloads —
- * if no native API exists, reports unsupported so the caller can show a toast.
+ * Export arbitrary text (e.g. an HTML prototype) to disk. One-shot: always prompts for a
+ * location where supported (export ≠ document save); downloads otherwise.
  */
 export async function exportTextFile(opts: {
   content: string;
@@ -158,15 +145,6 @@ export async function exportTextFile(opts: {
   const base = (opts.suggestedName || 'export').trim().replace(/[\\/:*?"<>|]+/g, '-');
   const suggestedName = base.endsWith(ext) ? base : base + ext;
 
-  // ── Electron native ──────────────────────────────────────────────────────
-  if (win.fileAPI) {
-    const dlg = await win.fileAPI.saveDialog(suggestedName, [{ name: description, extensions: [extension.replace(/^\./, '')] }]);
-    if (dlg.canceled || !dlg.filePath) return { saved: false, targetLabel: null };
-    const r = await win.fileAPI.writeFile(dlg.filePath, content);
-    return { saved: !!r.success, targetLabel: r.success ? dlg.filePath : null };
-  }
-
-  // ── Browser native: File System Access API ────────────────────────────────
   if (win.showSaveFilePicker) {
     try {
       const handle = await win.showSaveFilePicker({
@@ -181,21 +159,19 @@ export async function exportTextFile(opts: {
     }
   }
 
-  // No native save API (e.g. Brave) — fall back to a normal download so export still works.
-  downloadExport(suggestedName, content, mime);
+  downloadFile(suggestedName, content, mime);
   return { saved: true, targetLabel: suggestedName };
 }
 
 // Keep the node name readable for the suggested filename: strip only characters that
 // would break a path, preserve spaces / case (Figma keeps the layer name as-is).
 function exportBaseName(name: string): string {
-  return (name || 'export').replace(/[\\/:*?"<>| -]+/g, '').trim() || 'export';
+  return (name || 'export').replace(/[\\/:*?"<>| -]+/g, '').trim() || 'export';
 }
 
 /**
- * Save an exported asset (SVG text, or a PNG/JPG/PDF blob) to disk natively. One-shot
- * dialog; never downloads. Provide `text` for SVG, or `blob` (+ `dataUrl` for the Electron
- * binary write path) for raster/PDF.
+ * Save an exported asset (SVG text, or a PNG/JPG/PDF blob) to disk. One-shot dialog where
+ * supported; downloads otherwise. Provide `text` for SVG, or `blob`/`dataUrl` for raster/PDF.
  */
 export async function saveExportFile(opts: {
   text?: string;
@@ -212,27 +188,11 @@ export async function saveExportFile(opts: {
   const base = exportBaseName(opts.suggestedName);
   const suggestedName = base.endsWith(ext) ? base : base + ext;
 
-  // ── Electron native ──────────────────────────────────────────────────────
-  if (win.fileAPI) {
-    const dlg = await win.fileAPI.saveDialog(suggestedName, [{ name: description, extensions: [extNoDot] }]);
-    if (dlg.canceled || !dlg.filePath) return { saved: false, targetLabel: null };
-    let r: { success: boolean; error?: string };
-    if (text != null) {
-      r = await win.fileAPI.writeFile(dlg.filePath, text);
-    } else {
-      const url = dataUrl ?? (blob ? await blobToDataUrl(blob) : '');
-      r = win.fileAPI.writeExport
-        ? await win.fileAPI.writeExport(dlg.filePath, url)
-        : { success: false, error: 'writeExport unavailable' };
-    }
-    return { saved: !!r.success, targetLabel: r.success ? dlg.filePath : null };
-  }
+  // Decode a data-URL to a Blob SYNCHRONOUSLY (atob, no await) so the file picker is the
+  // first await after the click — otherwise transient activation is lost and it throws.
+  const payload: string | Blob = text != null ? text : (blob ?? (dataUrl ? dataUrlToBlob(dataUrl, mime) : ''));
 
-  // ── Browser native: File System Access API ────────────────────────────────
   if (win.showSaveFilePicker) {
-    // Decode a data-URL to a Blob SYNCHRONOUSLY (atob, no await) so the file picker is the
-    // first await after the click — otherwise transient activation is lost and it throws.
-    const payload: string | Blob = text != null ? text : (blob ?? (dataUrl ? dataUrlToBlob(dataUrl, mime) : ''));
     try {
       const handle = await win.showSaveFilePicker({
         suggestedName,
@@ -246,19 +206,8 @@ export async function saveExportFile(opts: {
     }
   }
 
-  // No native save API (e.g. Brave) — fall back to a normal download so export still works.
-  const payload: string | Blob = text != null ? text : (blob ?? (dataUrl ? dataUrlToBlob(dataUrl, mime) : ''));
-  downloadExport(suggestedName, payload, mime);
+  downloadFile(suggestedName, payload, mime);
   return { saved: true, targetLabel: suggestedName };
-}
-
-function blobToDataUrl(blob: Blob): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const r = new FileReader();
-    r.onload = () => resolve(r.result as string);
-    r.onerror = reject;
-    r.readAsDataURL(blob);
-  });
 }
 
 function dataUrlToBlob(dataUrl: string, fallbackMime: string): Blob {
@@ -288,8 +237,8 @@ export async function openDesignFile(): Promise<DesignFile | null> {
       if (!handle?.getFile) return null;
       const fileObj = await handle.getFile();
       const text = await fileObj.text();
-      const parsed = JSON.parse(text) as DesignFile;
-      if (parsed?.id) saveTargets.set(parsed.id, { kind: 'fsa', handle });
+      const parsed = parseDesignFile(text);
+      if (parsed?.id) saveTargets.set(parsed.id, handle);
       return parsed;
     } catch (e) {
       if ((e as DOMException)?.name === 'AbortError') return null;
@@ -297,7 +246,7 @@ export async function openDesignFile(): Promise<DesignFile | null> {
     }
   }
 
-  // Fallback open: hidden <input type=file> (read-only; no save handle).
+  // Fallback open: hidden <input type=file> (read-only; no save handle to keep).
   return new Promise<DesignFile | null>((resolve, reject) => {
     const input = document.createElement('input');
     input.type = 'file';
@@ -307,7 +256,7 @@ export async function openDesignFile(): Promise<DesignFile | null> {
       const f = input.files?.[0];
       input.remove();
       if (!f) return resolve(null);
-      f.text().then(t => resolve(JSON.parse(t) as DesignFile)).catch(reject);
+      f.text().then(t => resolve(parseDesignFile(t))).catch(reject);
     };
     document.body.appendChild(input);
     input.click();

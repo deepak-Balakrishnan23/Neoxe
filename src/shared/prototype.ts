@@ -36,17 +36,24 @@ export function generatePrototypeHtml(file: DesignFile, page: Page): string {
 
     // Collect interactive shapes in this frame's subtree → hotspots (one per interaction)
     const hotspots: string[] = [];
+    const walked = new Set<string>();
     const walk = (id: string) => {
+      if (walked.has(id)) return;
       const s = page.objects[id];
       if (!s) return;
+      walked.add(id);
       for (const it of (s.interactions ?? [])) {
         let attrs: string | null = null;
-        if (it.action === 'navigate' && it.targetFrameId) {
+        // Navigate targets must still exist as top-level frames — a deleted/moved target
+        // would otherwise emit a dead hotspot into the export.
+        if (it.action === 'navigate' && it.targetFrameId && frameIds.includes(it.targetFrameId)) {
           attrs = `data-action="navigate" data-target="${it.targetFrameId}" title="→ ${escapeAttr(page.objects[it.targetFrameId]?.name ?? 'frame')}"`;
         } else if (it.action === 'back') {
           attrs = `data-action="back" title="← Back"`;
-        } else if (it.action === 'url' && it.url) {
-          attrs = `data-action="url" data-href="${escapeAttr(it.url)}" title="↗ ${escapeAttr(it.url)}"`;
+        } else if (it.action === 'url' && it.url && /^https?:\/\//i.test(it.url.trim())) {
+          // Only http(s) — a javascript:/data: URL here would execute in the exported
+          // prototype when the hotspot is clicked.
+          attrs = `data-action="url" data-href="${escapeAttr(it.url.trim())}" title="↗ ${escapeAttr(it.url.trim())}"`;
         }
         if (!attrs) continue;
         const left = s.selrect.x - frame.x;
@@ -58,7 +65,21 @@ export function generatePrototypeHtml(file: DesignFile, page: Page): string {
       }
       s.childIds.forEach(walk);
     };
-    frame.childIds.forEach(walk);
+    // Walk the frame ITSELF, not just its children: dragging a connection from a whole
+    // frame (Figma's frame→frame flow, e.g. Frame 1 → 2 → 3) stores the interaction on
+    // the frame. Starting the walk at frame.childIds skipped those, so the whole chain
+    // produced zero hotspots — Present showed screen 1 and every click did nothing. A
+    // frame-level navigate becomes a full-screen hotspot (left/top = 0, frame-sized).
+    walk(frame.id);
+    // Also process loose top-level shapes that sit inside this frame (see frameToHtml):
+    // their interactions must become hotspots too, or a connection dragged from a shape
+    // that isn't a true child of the frame would render but never be clickable.
+    for (const id of page.childIds) {
+      const s = page.objects[id];
+      if (!s || s.type === 'frame' || walked.has(id)) continue;
+      const scx = s.x + s.width / 2, scy = s.y + s.height / 2;
+      if (scx >= frame.x && scx <= frame.x + frame.width && scy >= frame.y && scy <= frame.y + frame.height) walk(id);
+    }
 
     return `<div class="screen" id="screen-${frame.id}" data-w="${frame.width}" data-h="${frame.height}">
       <div class="screen-inner" style="width:${frame.width}px;height:${frame.height}px">
@@ -70,7 +91,10 @@ export function generatePrototypeHtml(file: DesignFile, page: Page): string {
   }).join('\n');
 
   const protoId = `proto-${file.id}`;
-  return wrapHtml(file.name, screensHtml, JSON.stringify(screens), JSON.stringify(startId), JSON.stringify(protoId));
+  // Escape `<` inside the embedded JSON: a document string containing "</script>" would
+  // otherwise terminate the inline <script> block and inject markup into the export.
+  const embed = (v: unknown) => JSON.stringify(v).replace(/</g, '\\u003c');
+  return wrapHtml(file.name, screensHtml, embed(screens), embed(startId), embed(protoId));
 }
 
 // ── HTML shell with embedded nav + comment runtime ────────────────────────────
@@ -120,12 +144,18 @@ function wrapHtml(title: string, screensHtml: string, screensJson: string, start
 
   /* comments */
   body.comment-mode .screen-inner { cursor:crosshair; }
+  /* The comment layer OVERLAYS the whole screen (above hotspots, z 15 > 5). It ignores the
+     mouse in normal mode (pointer-events:none) so hotspots stay clickable, and becomes the
+     click target in comment mode — full-screen hotspots can no longer swallow the click.
+     Pins/popups opt back in so they're clickable in either mode. */
+  .comment-layer { position:absolute; inset:0; z-index:15; pointer-events:none; }
+  body.comment-mode .comment-layer { pointer-events:auto; cursor:crosshair; }
   .comment-pin { position:absolute; width:26px; height:26px; border-radius:50% 50% 50% 2px;
     background:#f5c542; border:2px solid #fff; box-shadow:0 2px 8px rgba(0,0,0,.35); z-index:20;
     transform:translate(-4px,-26px); cursor:pointer; display:flex; align-items:center; justify-content:center;
-    font-size:11px; font-weight:700; color:#1a1a2e; }
+    font-size:11px; font-weight:700; color:#1a1a2e; pointer-events:auto; }
   .comment-pop { position:absolute; z-index:30; width:240px; background:#1e1e2e; border:1px solid rgba(255,255,255,.15);
-    border-radius:10px; padding:10px; box-shadow:0 8px 28px rgba(0,0,0,.5); transform:translate(8px,-8px); }
+    border-radius:10px; padding:10px; box-shadow:0 8px 28px rgba(0,0,0,.5); transform:translate(8px,-8px); pointer-events:auto; }
   .comment-pop textarea { width:100%; height:64px; background:rgba(255,255,255,.07); border:1px solid rgba(255,255,255,.12);
     border-radius:6px; color:#cdd6f4; font-family:inherit; font-size:13px; padding:6px; resize:none; outline:none; }
   .comment-pop .meta { font-size:11px; color:#9399b2; margin-bottom:6px; }
@@ -222,13 +252,15 @@ function wrapHtml(title: string, screensHtml: string, screensJson: string, start
     var a = h.getAttribute('data-action');
     if(a === 'navigate') navigate(h.getAttribute('data-target'), h.getAttribute('data-transition'));
     else if(a === 'back') goBack();
-    else if(a === 'url'){ var u = h.getAttribute('data-href'); if(u) window.open(u, '_blank'); }
+    else if(a === 'url'){ var u = h.getAttribute('data-href'); if(u && /^https?:\\/\\//i.test(u)) window.open(u, '_blank', 'noopener'); }
   }
   document.querySelectorAll('.hotspot').forEach(function(h){
     var trigger = h.getAttribute('data-trigger') || 'click';
     h.addEventListener(trigger === 'hover' ? 'mouseenter' : 'click', function(e){
-      e.stopPropagation();
+      // In comment mode the click belongs to the comment layer — bail BEFORE stopping
+      // propagation, or a full-screen hotspot blocks comments everywhere on its screen.
       if(commentMode) return;
+      e.stopPropagation();
       act(h);
     });
   });
@@ -257,10 +289,15 @@ function wrapHtml(title: string, screensHtml: string, screensJson: string, start
     closePop();
   }
 
+  // Click the layer itself: it overlays the full screen (inset:0), so its rect matches the
+  // scaled screen exactly — dividing by curScale recovers frame-local pin coordinates.
+  // (The old handler listened on the parent and measured against an UNSTYLED zero-size
+  // layer div sitting below the content, so every pin landed at the wrong spot.)
   document.querySelectorAll('.comment-layer').forEach(function(layer){
-    layer.parentElement.addEventListener('click', function(e){
+    layer.addEventListener('click', function(e){
       if(!commentMode) return;
       if(e.target.classList.contains('comment-pin')) return;
+      if(e.target.closest('.comment-pop')) return; // typing in the editor, not placing
       e.stopPropagation();
       var rect = layer.getBoundingClientRect();
       var x = (e.clientX - rect.left) / curScale;

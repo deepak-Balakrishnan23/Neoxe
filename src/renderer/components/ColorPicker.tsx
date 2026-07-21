@@ -310,10 +310,10 @@ export default function ColorPicker({ color, opacity, onChange, onClose, anchorR
       {/* Top: Solid / Gradient toggle (only the first two Figma fill types) */}
       {allowGradient && (
         <div style={styles.modeRow}>
-          <button title="Solid" style={styles.modeBtn(mode === 'solid')} onClick={switchToSolid}>
+          <button title="Solid" style={modeBtnStyle(mode === 'solid')} onClick={switchToSolid}>
             <span style={{ ...styles.modeSwatch, background: activeHex }} />
           </button>
-          <button title="Gradient" style={styles.modeBtn(mode === 'gradient')} onClick={switchToGradient}>
+          <button title="Gradient" style={modeBtnStyle(mode === 'gradient')} onClick={switchToGradient}>
             <span style={{ ...styles.modeSwatch, background: 'linear-gradient(135deg,#fff,#000)' }} />
           </button>
         </div>
@@ -348,8 +348,8 @@ export default function ColorPicker({ color, opacity, onChange, onClose, anchorR
                   ...styles.stopHandle,
                   left: `${st.offset * 100}%`,
                   background: st.color,
-                  outline: i === selected ? '2px solid #fff' : '1px solid rgba(255,255,255,0.6)',
-                  boxShadow: i === selected ? '0 0 0 1px #6E72F5' : '0 1px 3px rgba(0,0,0,0.5)',
+                  outline: i === selected ? '2px solid var(--text)' : '1px solid var(--border-strong)',
+                  boxShadow: i === selected ? '0 0 0 1px var(--accent)' : '0 1px 3px rgba(0,0,0,0.5)',
                 }}
               />
             ))}
@@ -406,57 +406,60 @@ export default function ColorPicker({ color, opacity, onChange, onClose, anchorR
           onChange={e => { const a = Math.max(0, Math.min(100, Number(e.target.value))) / 100; setAlpha(a); applyColor(hue, sat, val, a); }}
           onKeyDown={e => e.stopPropagation()}
         />
-        <span style={{ color: '#9B9BA6', fontSize: 11 }}>%</span>
+        <span style={{ color: 'var(--text-secondary)', fontSize: 11 }}>%</span>
       </div>
     </div>
   );
 }
 
-const styles: Record<string, React.CSSProperties> & { modeBtn: (a: boolean) => React.CSSProperties } = {
+// Kept outside the styles record — a function value can't satisfy the CSSProperties
+// index signature, so mixing it in breaks the whole record's type.
+const modeBtnStyle = (active: boolean): React.CSSProperties => ({
+  width: 34, height: 28, borderRadius: 6, cursor: 'pointer',
+  display: 'flex', alignItems: 'center', justifyContent: 'center',
+  background: active ? 'var(--accent-soft)' : 'var(--bg-elevated)',
+  border: active ? '1px solid var(--accent)' : '1px solid transparent',
+});
+
+const styles: Record<string, React.CSSProperties> = {
   popover: {
     position: 'fixed', width: 236,
-    background: '#141417', border: '1px solid rgba(255,255,255,0.12)',
-    borderRadius: 10, padding: 10, boxShadow: '0 8px 32px rgba(0,0,0,0.5)',
+    background: 'var(--bg-panel)', border: '1px solid var(--border-strong)',
+    borderRadius: 10, padding: 10, boxShadow: 'var(--shadow-popover)',
     zIndex: 1000, display: 'flex', flexDirection: 'column', gap: 8,
   },
   modeRow: { display: 'flex', gap: 4 },
-  modeBtn: (active: boolean) => ({
-    width: 34, height: 28, borderRadius: 6, cursor: 'pointer',
-    display: 'flex', alignItems: 'center', justifyContent: 'center',
-    background: active ? 'rgba(110,114,245,0.25)' : 'rgba(255,255,255,0.06)',
-    border: active ? '1px solid #6E72F5' : '1px solid transparent',
-  }),
-  modeSwatch: { width: 16, height: 16, borderRadius: 4, border: '1px solid rgba(255,255,255,0.2)' },
+  modeSwatch: { width: 16, height: 16, borderRadius: 4, border: '1px solid var(--border-strong)' },
   gradTypeSelect: {
-    background: 'rgba(255,255,255,0.07)', border: '1px solid rgba(255,255,255,0.1)',
-    borderRadius: 6, color: '#ECECEF', fontSize: 12, padding: '5px 7px', outline: 'none', cursor: 'pointer',
+    background: 'var(--bg-elevated)', border: '1px solid var(--border)',
+    borderRadius: 6, color: 'var(--text)', fontSize: 12, padding: '5px 7px', outline: 'none', cursor: 'pointer',
   },
-  gradBar: { position: 'relative', height: 18, borderRadius: 6, cursor: 'copy', border: '1px solid rgba(255,255,255,0.15)' },
+  gradBar: { position: 'relative', height: 18, borderRadius: 6, cursor: 'copy', border: '1px solid var(--border-strong)' },
   stopHandle: {
     position: 'absolute', top: '50%', width: 12, height: 12, borderRadius: '50%',
     transform: 'translate(-50%, -50%)', cursor: 'grab',
   },
   stopList: { display: 'flex', flexDirection: 'column', gap: 2, maxHeight: 96, overflowY: 'auto' },
   stopRow: { display: 'flex', alignItems: 'center', gap: 6, padding: '3px 4px', borderRadius: 5, cursor: 'pointer' },
-  stopRowActive: { background: 'rgba(110,114,245,0.18)' },
+  stopRowActive: { background: 'var(--accent-soft)' },
   stopOffset: {
-    width: 42, background: 'rgba(255,255,255,0.07)', border: '1px solid rgba(255,255,255,0.1)',
-    borderRadius: 4, color: '#ECECEF', fontSize: 11, padding: '3px 5px', outline: 'none',
+    width: 42, background: 'var(--bg-elevated)', border: '1px solid var(--border)',
+    borderRadius: 4, color: 'var(--text)', fontSize: 11, padding: '3px 5px', outline: 'none',
   },
-  stopSwatch: { width: 16, height: 16, borderRadius: 4, border: '1px solid rgba(255,255,255,0.2)', flexShrink: 0 },
-  stopHex: { flex: 1, color: '#ECECEF', fontSize: 11, fontFamily: 'monospace' },
-  stopPct: { color: '#9B9BA6', fontSize: 11 },
+  stopSwatch: { width: 16, height: 16, borderRadius: 4, border: '1px solid var(--border-strong)', flexShrink: 0 },
+  stopHex: { flex: 1, color: 'var(--text)', fontSize: 11, fontFamily: 'monospace' },
+  stopPct: { color: 'var(--text-secondary)', fontSize: 11 },
   stopRemove: {
     width: 18, height: 18, borderRadius: 4, border: 'none', background: 'transparent',
-    color: '#9B9BA6', cursor: 'pointer', fontSize: 14, lineHeight: 1,
+    color: 'var(--text-secondary)', cursor: 'pointer', fontSize: 14, lineHeight: 1,
   },
   svCanvas: { borderRadius: 4, cursor: 'default', display: 'block' },
   slider: { borderRadius: 7, cursor: 'ew-resize', display: 'block' },
   row: { display: 'flex', alignItems: 'center', gap: 6 },
-  swatch: { width: 20, height: 20, borderRadius: 4, border: '1px solid rgba(255,255,255,0.15)', flexShrink: 0 },
+  swatch: { width: 20, height: 20, borderRadius: 4, border: '1px solid var(--border-strong)', flexShrink: 0 },
   hexInput: {
-    flex: 1, background: 'rgba(255,255,255,0.07)', border: '1px solid rgba(255,255,255,0.1)',
-    borderRadius: 4, color: '#ECECEF', fontSize: 12, padding: '3px 6px',
+    flex: 1, background: 'var(--bg-elevated)', border: '1px solid var(--border)',
+    borderRadius: 4, color: 'var(--text)', fontSize: 12, padding: '3px 6px',
     outline: 'none', fontFamily: 'monospace',
   },
 };
