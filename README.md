@@ -1,6 +1,6 @@
 # Neouxe
 
-A local-first, browser-based design tool — think Figma-style layers, components,
+A local-first, browser-based design tool, think Figma-style layers, components,
 design tokens, auto layout, and prototyping, running entirely client-side with
 no backend or native shell.
 
@@ -20,21 +20,16 @@ no backend or native shell.
   uses the browser File System Access API where available, with download/file-picker
   fallbacks elsewhere
 
-## Tech stack
-
-- [React 19](https://react.dev/) + [Zustand](https://github.com/pmndrs/zustand) for state
-- [Vite](https://vitejs.dev/) for dev server and bundling
-- [TypeScript](https://www.typescriptlang.org/) throughout
-- [Vitest](https://vitest.dev/) for testing
+![Neoxe Screenshot](images/screenshot.png)
 
 ## Getting started
-
+Either
 ```bash
 npm install
 npm run dev
 ```
-
-Then open **http://localhost:5173**.
+or 
+Then open https://neoxe-852eg8ro7-deepak2311.vercel.app
 
 ## Scripts
 
