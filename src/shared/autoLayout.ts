@@ -552,8 +552,10 @@ function shapeToNode(shape: Shape, page: Page, isRoot = true, parentRotation = 0
     .filter((c): c is Shape => !!c && !c.hidden && c.layoutPositioning !== 'absolute');
   return {
     id: shape.id,
-    width: shape.width,
-    height: shape.height,
+    // On a 'fill' axis, shape.width/height hold the size the ENGINE last resolved. Feed
+    // the declared size instead so a hugging ancestor measures the intrinsic child.
+    width: shape.widthMode === 'fill' ? (shape.baseWidth ?? shape.width) : shape.width,
+    height: shape.heightMode === 'fill' ? (shape.baseHeight ?? shape.height) : shape.height,
     autoLayout: !!settings,
     direction: settings?.direction,
     spacing: settings?.spacing,
@@ -598,6 +600,11 @@ export function applyAutoLayoutToPage(page: Page): boolean {
   const writeBounds = (id: string, b: Bounds, ctx: PlaceCtx) => {
     const s = page.objects[id];
     if (!s) return;
+    // A stretched axis is about to have its resolved size written over the declared one.
+    // Remember the declared size the first time so Fixed can restore it and hug ancestors
+    // keep measuring the intrinsic size (see Shape.baseWidth).
+    if (s.widthMode === 'fill' && s.baseWidth === undefined) s.baseWidth = s.width;
+    if (s.heightMode === 'fill' && s.baseHeight === undefined) s.baseHeight = s.height;
     const rel = normDeg(s.rotation - ctx.theta);
 
     // The child's local centre inside the layout slot. rel ≠ 0 children keep their own

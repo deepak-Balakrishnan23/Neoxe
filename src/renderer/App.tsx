@@ -96,7 +96,8 @@ export default function App() {
       }
       return;
     }
-    if (meta && e.key === 'e') {
+    // Figma binds ⇧⌘E to Export and leaves ⌘E for Flatten (handled on the canvas).
+    if (meta && e.shiftKey && e.key.toLowerCase() === 'e') {
       e.preventDefault();
       setExportOpen(true);
       return;

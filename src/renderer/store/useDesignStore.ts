@@ -6,7 +6,7 @@ import { persistFile, serializeFile } from '../io/fileIO';
 import { markSavePoint, clearAutosave, cancelAutosave } from '../persistence';
 import type { EngineSession } from '../mockEngine';
 
-export type ToolType = 'select' | 'rect' | 'ellipse' | 'frame' | 'text' | 'pen' | 'image';
+export type ToolType = 'select' | 'rect' | 'ellipse' | 'frame' | 'text' | 'pen' | 'image' | 'line' | 'polygon' | 'star';
 
 // One open document. The active tab's live document/history lives in the engine; its
 // `session` is null. Inactive tabs cache their full session (doc + undo/redo) so they

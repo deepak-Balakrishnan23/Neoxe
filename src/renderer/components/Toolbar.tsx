@@ -70,7 +70,7 @@ export default function Toolbar() {
         <button onClick={handlePresent} title="Present prototype" style={styles.presentBtn}>
           <Icon name="play" size={14} /> Present
         </button>
-        <button onClick={() => setExportOpen(true)} title="Export (⌘E)" style={styles.exportBtn}>
+        <button onClick={() => setExportOpen(true)} title="Export (⇧⌘E)" style={styles.exportBtn}>
           <Icon name="export" size={14} color="#fff" /> Export
         </button>
       </div>

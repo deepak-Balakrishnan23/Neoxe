@@ -76,7 +76,7 @@ function rasterize(
   const renderTarget = ids && ids.length > 0 ? filteredPage(page, ids) : page;
   // skipBackground=true: the page background color is a canvas UI affordance only —
   // exported images show only the node's own fills, not the page canvas background.
-  renderPage(ctx, renderTarget, viewport, new Set(), images, undefined, null, file, undefined, true);
+  renderPage(ctx, renderTarget, viewport, new Set(), images, undefined, null, file, undefined, true, undefined, true);
   return canvas;
 }
 
@@ -87,10 +87,13 @@ export async function exportRaster(
   ids: string[] | undefined,
   images: Record<string, HTMLImageElement>,
   format: RasterFormat,
+  // Per-layer export settings supply their own suffix and skip the save dialog, since a
+  // batch can only show one.
+  opts?: { suffix?: string; forceDownload?: boolean },
 ) {
   const opaqueBg = format === 'jpeg' ? (page.background || '#FFFFFF') : undefined;
   const canvas = rasterize(file, page, scale, ids, images, opaqueBg);
-  const suffix = scale === 1 ? '' : `@${scale}x`;
+  const suffix = opts?.suffix ?? (scale === 1 ? '' : `@${scale}x`);
   // Synchronous toDataURL (not the async toBlob): an await before the native save dialog
   // consumes the click's transient activation and makes showSaveFilePicker throw.
   const dataUrl = canvas.toDataURL(RASTER_MIME[format], 0.92);
@@ -100,6 +103,7 @@ export async function exportRaster(
     extension: RASTER_EXT[format],
     description: `${format.toUpperCase()} Image`,
     mime: RASTER_MIME[format],
+    forceDownload: opts?.forceDownload,
   });
 }
 
@@ -132,7 +136,7 @@ function filteredPage(page: Page, ids: string[]): Page {
 
 // ── SVG export ────────────────────────────────────────────────────────────────
 
-export function exportSvg(file: DesignFile, page: Page, ids?: string[]) {
+export function exportSvg(file: DesignFile, page: Page, ids?: string[], opts?: { suffix?: string; forceDownload?: boolean }) {
   const images = file.images;
   let svg: string;
   if (ids && ids.length === 1 && page.objects[ids[0]]) {
@@ -147,10 +151,11 @@ export function exportSvg(file: DesignFile, page: Page, ids?: string[]) {
   }
   return saveExportFile({
     text: svg,
-    suggestedName: exportBaseName(page, ids),
+    suggestedName: `${exportBaseName(page, ids)}${opts?.suffix ?? ''}`,
     extension: 'svg',
     description: 'SVG Image',
     mime: 'image/svg+xml',
+    forceDownload: opts?.forceDownload,
   });
 }
 

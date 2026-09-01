@@ -1,8 +1,22 @@
-import { DesignFile, ChangeSet, ChangeOp, Shape, Page, makeDefaultPage, ColorEntry, TextStyle, DesignToken, TokenType, VectorChildNode } from '../shared/types';
+import { DesignFile, ChangeSet, ChangeOp, Shape, Page, makeDefaultPage, ColorEntry, TextStyle, DesignToken, TokenType, VectorChildNode, ComponentPropDef, Shadow, BlurEffect, LayoutGrid } from '../shared/types';
 import { applyTokensToFile } from '../shared/tokens';
 import { applyAutoLayoutToPage } from '../shared/autoLayout';
+import { constraintOps } from '../shared/constraints';
+import { resolvePropDefs } from '../shared/components';
+import { booleanSegments, BoolOp } from '../shared/boolean';
+import { shapeToSegments, segmentsBounds, toLocal } from '../shared/flatten';
 
 function uid() { return Math.random().toString(36).slice(2, 10); }
+
+// The value `attr` will hold once this changeset applies — the last op that sets it, or
+// the shape's current value when the changeset doesn't touch it.
+function pendingNumber(ops: ChangeOp[], id: string, attr: string, current: number): number {
+  for (let i = ops.length - 1; i >= 0; i--) {
+    const o = ops[i];
+    if (o.op === 'set' && o.id === id && o.attr === attr && typeof o.val === 'number') return o.val;
+  }
+  return current;
+}
 
 // Properties propagated from master to instances (unless overridden)
 const PROPAGATED_ATTRS = new Set([
@@ -215,20 +229,69 @@ export class DocumentEngine {
       }
     }
 
+    // Constraint cascade: resizing a container repositions/resizes its children per their
+    // Figma constraints. Emitted as real ops (like the rigid-body cascade above) so undo
+    // restores exact child boxes instead of re-deriving them from a reverse resize.
+    {
+      const done = new Set<string>();
+      for (const op of changeSet.ops) {
+        if (op.op !== 'set') continue;
+        if (op.attr !== 'width' && op.attr !== 'height') continue;
+        const s = page.objects[op.id];
+        if (!s || s.childIds.length === 0 || done.has(op.id)) continue;
+        const width = pendingNumber(changeSet.ops, op.id, 'width', s.width);
+        const height = pendingNumber(changeSet.ops, op.id, 'height', s.height);
+        if (width === s.width && height === s.height) continue;  // a pure move — rigid body's job
+        done.add(op.id);
+        ops.push(...constraintOps(
+          page, op.id,
+          { x: s.x, y: s.y, width: s.width, height: s.height },
+          {
+            x: pendingNumber(changeSet.ops, op.id, 'x', s.x),
+            y: pendingNumber(changeSet.ops, op.id, 'y', s.y),
+            width, height,
+          },
+        ));
+      }
+    }
+
+    // Declared-size bookkeeping for stretched ('fill') axes. `width`/`height` carry the
+    // size the layout engine resolved, so the declared one is parked in baseWidth/
+    // baseHeight (see Shape.baseWidth). Leaving 'fill' restores it; setting a size
+    // explicitly redeclares it. Expanded into real ops so undo covers them too.
+    for (const op of changeSet.ops) {
+      if (op.op !== 'set') continue;
+      const s = page.objects[op.id];
+      if (!s) continue;
+      for (const axis of ['width', 'height'] as const) {
+        const modeAttr = axis === 'width' ? 'widthMode' : 'heightMode';
+        const baseAttr = axis === 'width' ? 'baseWidth' : 'baseHeight';
+        const base = s[baseAttr];
+        if (op.attr === modeAttr && op.val !== 'fill' && base !== undefined) {
+          ops.push({ op: 'set', id: op.id, attr: axis, val: base });
+          ops.push({ op: 'set', id: op.id, attr: baseAttr, val: undefined });
+        } else if (op.attr === axis && base !== undefined) {
+          ops.push({ op: 'set', id: op.id, attr: baseAttr, val: undefined });
+        }
+      }
+    }
+
     for (const op of ops) {
       const inv = this.applyOp(page, op);
       if (inv) inverseOps.unshift(inv);
       // Track changes to master components for propagation
       if (op.op === 'set') {
         const shape = page.objects[op.id];
-        if (shape?.componentId && PROPAGATED_ATTRS.has(op.attr)) {
+        // Any shape inside a master propagates — not just the master's root, now that
+        // instances mirror the whole subtree.
+        if (shape && PROPAGATED_ATTRS.has(op.attr) && (shape.componentId || masterRootId(page, op.id))) {
           masterChanges.push({ shapeId: op.id, attr: op.attr });
         }
         // If this is an instance being edited, mark the attr as overridden. Record an
         // inverse restoring the PREVIOUS overrides map — without it, undoing the edit
         // reverts the value but leaves the override flag set, permanently blocking
         // future master updates for that attr on this instance.
-        if (shape?.masterId && PROPAGATED_ATTRS.has(op.attr)) {
+        if ((shape?.masterId || shape?.masterShapeId) && PROPAGATED_ATTRS.has(op.attr)) {
           inverseOps.unshift({ op: 'set', id: op.id, attr: 'overrides', val: shape.overrides ? { ...shape.overrides } : undefined });
           shape.overrides = { ...(shape.overrides ?? {}), [op.attr]: op.val };
         }
@@ -237,6 +300,28 @@ export class DocumentEngine {
 
     // Propagate master changes to all instances across all pages
     for (const { shapeId, attr } of masterChanges) this.propagateMasterAttr(page, shapeId, attr);
+
+    // Re-derive component-property effects for any instance whose values just changed,
+    // and for instances whose master was edited (propagation may have overwritten them).
+    let componentPropsApplied = false;
+    for (const op of ops) {
+      if (op.op !== 'set') continue;
+      if (op.attr === 'componentProps' && page.objects[op.id]?.masterId) {
+        this.applyComponentProps(page, op.id);
+        componentPropsApplied = true;
+      }
+    }
+    if (masterChanges.length) {
+      for (const s of Object.values(page.objects)) if (s.masterId) this.applyComponentProps(page, s.id);
+    }
+
+    // Structural edits inside a master change the SHAPE of every instance's tree.
+    const structuralOps = ops.some(o => o.op === 'add' || o.op === 'del' || o.op === 'move');
+    const instancesReconciled = structuralOps ? this.reconcileInstances() : false;
+
+    // Recompute boolean outlines before layout — a bool's box can change, and a hugging
+    // auto-layout parent has to measure the new one.
+    const booleansChanged = this.recomputeBooleans(page);
 
     // Re-run Figma-style Auto Layout so containers reflow their children.
     const autoLayoutChanged = this.reflow(page);
@@ -265,7 +350,10 @@ export class DocumentEngine {
       else if (op.op === 'setImage') { /* images are shared by reference — nothing to track */ }
       else structural = true; // add / del / move reshuffles structure
     }
-    const canShare = !structural && masterChanges.length === 0 && !autoLayoutChanged && this.lastSnapshot !== null;
+    // Applying component properties mutates layers INSIDE the instance, which the ops
+    // never name — the same reason propagation and reflow disqualify the shared path.
+    const canShare = !structural && masterChanges.length === 0 && !autoLayoutChanged
+      && !componentPropsApplied && !booleansChanged && !instancesReconciled && this.lastSnapshot !== null;
     return canShare ? this.incrementalSnapshot(changeSet.pageId, touched) : this.snapshot();
   }
 
@@ -337,22 +425,236 @@ export class DocumentEngine {
     const targetPage = this.file.pages.find(p => p.id === pageId);
     if (!targetPage) return null;
 
-    const instanceId = uid();
-    const instance: Shape = {
-      ...structuredClone(master),
-      id: instanceId,
-      x, y,
-      masterId: componentId,
-      componentId: undefined,
-      overrides: {},
-      selrect: { x, y, width: master.width, height: master.height },
-    };
-    // Reset childIds (instances don't replicate master's children hierarchy for now)
-    instance.childIds = [];
+    // Deep-clone the master's whole subtree. Every node keeps a `masterShapeId` link so
+    // later master edits reach the matching node inside each instance; only the root
+    // carries `masterId`, which is what makes it an instance rather than a copy.
+    const subtree = cloneSubtree(masterPage, comp.shapeId);
+    const idMap: Record<string, string> = {};
+    for (const oldId of Object.keys(subtree)) idMap[oldId] = uid();
+    const dx = x - master.x, dy = y - master.y;
+
+    for (const [oldId, node] of Object.entries(subtree)) {
+      const clone = node;
+      clone.masterShapeId = oldId;
+      clone.componentId = undefined;
+      clone.overrides = {};
+      clone.id = idMap[oldId];
+      clone.childIds = clone.childIds.map(c => idMap[c]).filter(Boolean);
+      clone.parentId = clone.parentId && idMap[clone.parentId] ? idMap[clone.parentId] : null;
+      clone.x += dx; clone.y += dy;
+      clone.selrect = { x: clone.x, y: clone.y, width: clone.width, height: clone.height };
+      targetPage.objects[clone.id] = clone;
+    }
+
+    const instanceId = idMap[comp.shapeId];
+    const instance = targetPage.objects[instanceId];
+    instance.masterId = componentId;
     instance.parentId = null;
-    targetPage.objects[instanceId] = instance;
     targetPage.childIds.push(instanceId);
+    recomputeFrameId(targetPage, instanceId);
+    this.applyComponentProps(targetPage, instanceId);
     return this.snapshot();
+  }
+
+  // Every shape inside `instanceRootId`, root first.
+  private instanceSubtree(page: Page, instanceRootId: string): Shape[] {
+    const out: Shape[] = [];
+    const visit = (id: string) => {
+      const s = page.objects[id];
+      if (!s) return;
+      out.push(s);
+      for (const c of s.childIds) visit(c);
+    };
+    visit(instanceRootId);
+    return out;
+  }
+
+  /** Declare the component properties an instance of `componentId` can set. */
+  setComponentProps(componentId: string, props: ComponentPropDef[]): DesignFile | null {
+    if (!this.file) return null;
+    const comp = this.file.components[componentId];
+    if (!comp) return null;
+    comp.props = props;
+    // Existing instances re-derive from the new definitions (defaults may have changed).
+    for (const p of this.file.pages) {
+      for (const s of Object.values(p.objects)) if (s.masterId === componentId) this.applyComponentProps(p, s.id);
+    }
+    return this.snapshot();
+  }
+
+  // ── Effect & grid styles ────────────────────────────────────────────────────
+  // Named, reusable versions of what a layer already stores inline. Kept as plain
+  // file-level lists, like colours and typography.
+
+  addEffectStyle(name: string, shadows: Shadow[], blur: BlurEffect | null): DesignFile | null {
+    if (!this.file) return null;
+    this.file.effects = [...(this.file.effects ?? []), {
+      id: uid(), name: name.trim() || 'Effect',
+      shadows: structuredClone(shadows), blur: blur ? structuredClone(blur) : null,
+    }];
+    return this.snapshot();
+  }
+
+  deleteEffectStyle(id: string): DesignFile | null {
+    if (!this.file) return null;
+    this.file.effects = (this.file.effects ?? []).filter(e => e.id !== id);
+    return this.snapshot();
+  }
+
+  addGridStyle(name: string, grids: LayoutGrid[]): DesignFile | null {
+    if (!this.file) return null;
+    this.file.gridStyles = [...(this.file.gridStyles ?? []), {
+      id: uid(), name: name.trim() || 'Grid', grids: structuredClone(grids),
+    }];
+    return this.snapshot();
+  }
+
+  deleteGridStyle(id: string): DesignFile | null {
+    if (!this.file) return null;
+    this.file.gridStyles = (this.file.gridStyles ?? []).filter(g => g.id !== id);
+    return this.snapshot();
+  }
+
+  // ── Variants ────────────────────────────────────────────────────────────────
+
+  /**
+   * Turn the selected shapes into one component set. Shapes that aren't components yet
+   * become components first; each gets a value for `propName` taken from its layer name
+   * (deduplicated), which is the property the instance picker then exposes.
+   */
+  combineAsVariants(shapeIds: string[], pageId: string, propName = 'Variant'): DesignFile | null {
+    if (!this.file) return null;
+    const page = this.file.pages.find(p => p.id === pageId);
+    if (!page || shapeIds.length < 2) return null;
+
+    const setId = uid();
+    const values: string[] = [];
+    const variants: Record<string, Record<string, string>> = {};
+    const taken = new Set<string>();
+
+    for (const id of shapeIds) {
+      const shape = page.objects[id];
+      if (!shape) continue;
+      let componentId = shape.componentId;
+      if (!componentId) {
+        componentId = uid();
+        shape.componentId = componentId;
+        this.file.components[componentId] = { name: shape.name, pageId, shapeId: id };
+      }
+      let value = shape.name.trim() || 'Variant';
+      let n = 2;
+      while (taken.has(value)) value = `${shape.name.trim() || 'Variant'} ${n++}`;
+      taken.add(value);
+      values.push(value);
+      variants[componentId] = { [propName]: value };
+      this.file.components[componentId].setId = setId;
+    }
+
+    const componentIds = Object.keys(variants);
+    if (componentIds.length < 2) return null;
+    this.file.componentSets = this.file.componentSets ?? {};
+    this.file.componentSets[setId] = {
+      id: setId,
+      name: page.objects[shapeIds[0]]?.name ?? 'Component set',
+      properties: { [propName]: values },
+      variants,
+      defaultComponentId: componentIds[0],
+    };
+    return this.snapshot();
+  }
+
+  /**
+   * Point an instance at the sibling variant matching `props`, rebuilding its subtree
+   * from that master. The root keeps its id and position so the selection survives the
+   * swap; descendant overrides don't (their layers are replaced).
+   */
+  setInstanceVariant(shapeId: string, pageId: string, props: Record<string, string>): DesignFile | null {
+    if (!this.file) return null;
+    const page = this.file.pages.find(p => p.id === pageId);
+    const root = page?.objects[shapeId];
+    if (!page || !root?.masterId) return null;
+    const comp = this.file.components[root.masterId];
+    const set = comp?.setId ? this.file.componentSets?.[comp.setId] : null;
+    if (!set) return null;
+
+    const target = Object.entries(set.variants).find(([, vals]) =>
+      Object.entries(props).every(([k, v]) => vals[k] === v));
+    if (!target) return null;
+    const [nextComponentId] = target;
+    if (nextComponentId === root.masterId) return this.snapshot();
+
+    const nextComp = this.file.components[nextComponentId];
+    const masterPage = nextComp ? this.file.pages.find(p => p.id === nextComp.pageId) : null;
+    const master = masterPage && nextComp ? masterPage.objects[nextComp.shapeId] : null;
+    if (!master || !masterPage) return null;
+
+    // Drop the old descendants, then graft a fresh clone of the new variant's subtree
+    // onto the existing root id.
+    for (const node of this.instanceSubtree(page, shapeId)) {
+      if (node.id === shapeId) continue;
+      delete page.objects[node.id];
+    }
+    const dx = root.x - master.x, dy = root.y - master.y;
+    const subtree = cloneSubtree(masterPage, nextComp!.shapeId);
+    const idMap: Record<string, string> = { [nextComp!.shapeId]: shapeId };
+    for (const oldId of Object.keys(subtree)) if (!idMap[oldId]) idMap[oldId] = uid();
+
+    for (const [oldId, node] of Object.entries(subtree)) {
+      const clone = node;
+      clone.masterShapeId = oldId;
+      clone.componentId = undefined;
+      clone.id = idMap[oldId];
+      clone.childIds = clone.childIds.map(c => idMap[c]).filter(Boolean);
+      clone.x += dx; clone.y += dy;
+      clone.selrect = { x: clone.x, y: clone.y, width: clone.width, height: clone.height };
+      if (oldId === nextComp!.shapeId) {
+        // The root keeps its identity, placement and overrides — only its content swaps.
+        clone.parentId = root.parentId;
+        clone.masterId = nextComponentId;
+        clone.overrides = root.overrides ?? {};
+        clone.componentProps = root.componentProps;
+      } else {
+        clone.parentId = idMap[clone.parentId!] ?? shapeId;
+        clone.overrides = {};
+      }
+      page.objects[clone.id] = clone;
+    }
+    recomputeFrameId(page, shapeId);
+    this.applyComponentProps(page, shapeId);
+    return this.snapshot();
+  }
+
+  // ── Component properties ────────────────────────────────────────────────────
+
+  /**
+   * Push an instance's component-property values onto the layers the master bound them
+   * to. Idempotent: derived purely from the stored values, so it can re-run after any
+   * swap or propagation.
+   */
+  private applyComponentProps(page: Page, instanceRootId: string) {
+    if (!this.file) return;
+    const root = page.objects[instanceRootId];
+    if (!root?.masterId) return;
+    const comp = this.file.components[root.masterId];
+    // Variants share their set's properties, so resolve across the set — otherwise
+    // swapping to a variant that didn't declare them would silently drop the values.
+    const defs = resolvePropDefs(this.file, root.masterId);
+    if (!comp || !defs.length) return;
+    const masterPage = this.file.pages.find(p => p.id === comp!.pageId);
+    if (!masterPage) return;
+    const values = root.componentProps ?? {};
+    const valueOf = (id: string) => (id in values ? values[id] : defs.find(d => d.id === id)?.defaultValue);
+
+    for (const node of this.instanceSubtree(page, instanceRootId)) {
+      const master = node.masterShapeId ? masterPage.objects[node.masterShapeId] : null;
+      const bind = master?.propBindings;
+      if (!bind) continue;
+      if (bind.visible) node.hidden = valueOf(bind.visible) === false;
+      if (bind.characters) {
+        const text = String(valueOf(bind.characters) ?? '');
+        node.paragraphs = [{ align: node.paragraphs?.[0]?.align ?? 'left', spans: [{ text }] }];
+      }
+    }
   }
 
   detachInstance(shapeId: string, pageId: string): DesignFile | null {
@@ -361,23 +663,25 @@ export class DocumentEngine {
     if (!page) return null;
     const shape = page.objects[shapeId];
     if (!shape?.masterId) return null;
-    // Apply all master properties (resolve) then detach
+    // Bake the master's values into the whole instance subtree, then cut every link so
+    // the result is plain geometry that no longer tracks the component.
     const comp = this.file.components[shape.masterId];
-    if (comp) {
-      const masterPage = this.file.pages.find(p => p.id === comp.pageId);
-      const master = masterPage?.objects[comp.shapeId];
+    const masterPage = comp ? this.file.pages.find(p => p.id === comp.pageId) : null;
+    for (const node of this.instanceSubtree(page, shapeId)) {
+      const master = masterPage && node.masterShapeId ? masterPage.objects[node.masterShapeId] : null;
       if (master) {
         for (const attr of PROPAGATED_ATTRS) {
-          if (!(attr in (shape.overrides ?? {}))) {
+          if (!(attr in (node.overrides ?? {}))) {
             // Deep-clone so the detached shape doesn't share the master's arrays.
             const v = (master as unknown as Record<string, unknown>)[attr];
-            (shape as unknown as Record<string, unknown>)[attr] = (v && typeof v === 'object') ? structuredClone(v) : v;
+            (node as unknown as Record<string, unknown>)[attr] = (v && typeof v === 'object') ? structuredClone(v) : v;
           }
         }
       }
+      node.masterId = undefined;
+      node.masterShapeId = undefined;
+      node.overrides = undefined;
     }
-    shape.masterId = undefined;
-    shape.overrides = undefined;
     return this.snapshot();
   }
 
@@ -387,7 +691,19 @@ export class DocumentEngine {
     if (!page) return null;
     const shape = page.objects[shapeId];
     if (!shape?.masterId) return null;
-    shape.overrides = {};
+    // Drop every local override in the subtree AND pull the master's current values back
+    // in — clearing the map alone would leave the last overridden value sitting there.
+    const comp = this.file.components[shape.masterId];
+    const masterPage = comp ? this.file.pages.find(p => p.id === comp.pageId) : null;
+    for (const node of this.instanceSubtree(page, shapeId)) {
+      node.overrides = {};
+      const master = masterPage && node.masterShapeId ? masterPage.objects[node.masterShapeId] : null;
+      if (!master) continue;
+      for (const attr of PROPAGATED_ATTRS) {
+        const v = (master as unknown as Record<string, unknown>)[attr];
+        (node as unknown as Record<string, unknown>)[attr] = (v && typeof v === 'object') ? structuredClone(v) : v;
+      }
+    }
     return this.snapshot();
   }
 
@@ -534,6 +850,11 @@ export class DocumentEngine {
   // safe because every recorded state was itself reflow-stable when it was created.
   private replaySideEffects(page: Page, propagations?: { shapeId: string; attr: string }[]) {
     if (propagations) for (const { shapeId, attr } of propagations) this.propagateMasterAttr(page, shapeId, attr);
+    // Component-property effects live on layers the ops never name, so — like propagation
+    // and reflow — they're re-derived from the restored state rather than inverse-recorded.
+    this.reconcileInstances();
+    for (const s of Object.values(page.objects)) if (s.masterId) this.applyComponentProps(page, s.id);
+    this.recomputeBooleans(page);
     this.reflow(page);
   }
 
@@ -542,12 +863,18 @@ export class DocumentEngine {
   private propagateMasterAttr(page: Page, shapeId: string, attr: string) {
     if (!this.file) return;
     const masterShape = page.objects[shapeId];
-    if (!masterShape?.componentId) return;
+    if (!masterShape) return;
+    // The root of a master carries componentId; nodes below it are reached through the
+    // masterShapeId back-link that every instance node keeps.
     const componentId = masterShape.componentId;
+    if (!componentId && !masterRootId(page, shapeId)) return;
     const val = (masterShape as unknown as Record<string, unknown>)[attr];
     for (const p of this.file.pages) {
       for (const s of Object.values(p.objects)) {
-        if (s.masterId === componentId) {
+        // Instance roots match on componentId; nodes deeper inside an instance match on
+        // the master shape they mirror. Both sides must be defined — an undefined
+        // componentId would otherwise match every shape that isn't an instance.
+        if ((componentId != null && s.masterId === componentId) || (s.masterShapeId != null && s.masterShapeId === shapeId)) {
           // Only propagate if the instance hasn't locally overridden this attr.
           // Use `attr in overrides` (not truthiness) so a deliberate falsy override
           // — opacity:0, content:"" — isn't treated as "unset" and clobbered by master.
@@ -559,6 +886,143 @@ export class DocumentEngine {
         }
       }
     }
+  }
+
+  /**
+   * Mirror STRUCTURAL master edits into every instance: layers added to a master appear
+   * in each instance, layers removed disappear, and sibling order follows the master.
+   * Property edits are handled by propagateMasterAttr; this is the shape of the tree.
+   *
+   * Derived entirely from the master, so it re-runs after undo instead of being recorded
+   * as inverse ops — the same contract as propagation and reflow.
+   */
+  private reconcileInstances(): boolean {
+    if (!this.file) return false;
+    let changed = false;
+
+    for (const [componentId, comp] of Object.entries(this.file.components)) {
+      const masterPage = this.file.pages.find(p => p.id === comp.pageId);
+      const master = masterPage?.objects[comp.shapeId];
+      if (!masterPage || !master) continue;
+
+      for (const page of this.file.pages) {
+        for (const root of Object.values(page.objects)) {
+          if (root.masterId !== componentId) continue;
+          const dx = root.x - master.x, dy = root.y - master.y;
+
+          // Where each master node currently lives inside this instance.
+          const byMaster = new Map<string, Shape>();
+          for (const node of this.instanceSubtree(page, root.id)) {
+            if (node.masterShapeId) byMaster.set(node.masterShapeId, node);
+          }
+          byMaster.set(comp.shapeId, root);
+
+          // Add anything the master has and the instance doesn't, parents first.
+          const addMissing = (masterId: string) => {
+            const masterNode = masterPage.objects[masterId];
+            if (!masterNode) return;
+            for (const childMasterId of masterNode.childIds) {
+              const childMaster = masterPage.objects[childMasterId];
+              if (!childMaster) continue;
+              if (!byMaster.has(childMasterId)) {
+                const subtree = cloneSubtree(masterPage, childMasterId);
+                const idMap: Record<string, string> = {};
+                for (const oldId of Object.keys(subtree)) idMap[oldId] = uid();
+                for (const [oldId, clone] of Object.entries(subtree)) {
+                  clone.masterShapeId = oldId;
+                  clone.componentId = undefined;
+                  clone.masterId = undefined;
+                  clone.overrides = {};
+                  clone.id = idMap[oldId];
+                  clone.childIds = clone.childIds.map(c => idMap[c]).filter(Boolean);
+                  clone.parentId = clone.parentId && idMap[clone.parentId] ? idMap[clone.parentId] : byMaster.get(masterId)!.id;
+                  clone.x += dx; clone.y += dy;
+                  clone.selrect = { x: clone.x, y: clone.y, width: clone.width, height: clone.height };
+                  page.objects[clone.id] = clone;
+                  byMaster.set(oldId, clone);
+                }
+                const parent = byMaster.get(masterId)!;
+                parent.childIds.push(idMap[childMasterId]);
+                changed = true;
+              }
+              addMissing(childMasterId);
+            }
+          };
+          addMissing(comp.shapeId);
+
+          // Drop anything the master no longer has.
+          for (const node of this.instanceSubtree(page, root.id)) {
+            if (node.id === root.id || !node.masterShapeId) continue;
+            if (masterPage.objects[node.masterShapeId]) continue;
+            const parent = node.parentId ? page.objects[node.parentId] : null;
+            if (parent) parent.childIds = parent.childIds.filter(c => c !== node.id);
+            for (const gone of this.instanceSubtree(page, node.id)) delete page.objects[gone.id];
+            changed = true;
+          }
+
+          // Match the master's sibling order.
+          for (const [masterId, node] of byMaster) {
+            const masterNode = masterPage.objects[masterId];
+            if (!masterNode || !page.objects[node.id]) continue;
+            const wanted = masterNode.childIds
+              .map(cid => byMaster.get(cid)?.id)
+              .filter((id): id is string => !!id && page.objects[id]?.parentId === node.id);
+            if (wanted.length === node.childIds.length && wanted.some((id, i) => id !== node.childIds[i])) {
+              node.childIds = wanted;
+              changed = true;
+            }
+          }
+
+          if (changed) recomputeFrameId(page, root.id);
+        }
+      }
+    }
+    return changed;
+  }
+
+  /**
+   * Recompute the cached outline of every boolean group on the page. Deep-first so a
+   * nested boolean's own result is ready before its parent consumes it. Derived purely
+   * from the operands, so — like reflow — it can be re-run after undo instead of being
+   * recorded as inverse ops.
+   */
+  private recomputeBooleans(page: Page): boolean {
+    let changed = false;
+    const visit = (id: string) => {
+      const shape = page.objects[id];
+      if (!shape) return;
+      for (const childId of shape.childIds) visit(childId);
+      if (shape.type !== 'bool') return;
+
+      const operands = shape.childIds
+        .map(cid => page.objects[cid])
+        .filter((c): c is Shape => !!c && !c.hidden)
+        .map(c => shapeToSegments(c, page.objects))
+        .filter(segs => segs.length > 0);
+
+      const next = operands.length >= 2
+        ? booleanSegments((shape.boolType ?? 'union') as BoolOp, operands)
+        : operands[0] ?? [];
+      // null = the clipper could not produce a result; keep whatever geometry we had
+      // rather than blanking the shape mid-edit.
+      if (next === null) return;
+
+      const bounds = segmentsBounds(next);
+      const local = bounds ? toLocal(next, bounds.x, bounds.y) : next;
+      const nx = bounds ? Math.round(bounds.x) : shape.x;
+      const ny = bounds ? Math.round(bounds.y) : shape.y;
+      const nw = bounds ? Math.round(bounds.width) : shape.width;
+      const nh = bounds ? Math.round(bounds.height) : shape.height;
+
+      if (JSON.stringify(shape.content ?? []) === JSON.stringify(local)
+          && shape.x === nx && shape.y === ny && shape.width === nw && shape.height === nh) return;
+      shape.content = local;
+      shape.x = nx; shape.y = ny; shape.width = nw; shape.height = nh;
+      shape.selrect = { x: nx, y: ny, width: nw, height: nh };
+      changed = true;
+    };
+    for (const rootId of page.childIds) visit(rootId);
+    return changed;
   }
 
   // Loop until stable in case a hug parent's resize cascades up through nested
@@ -649,6 +1113,19 @@ export class DocumentEngine {
       }
     }
   }
+}
+
+// The id of the master-component root above `id` (or `id` itself when it IS one), else
+// null. Used to decide whether an edit should propagate out to instances.
+function masterRootId(page: Page, id: string): string | null {
+  let cur: string | null = id;
+  while (cur) {
+    const s: Shape | undefined = page.objects[cur];
+    if (!s) return null;
+    if (s.componentId) return cur;
+    cur = s.parentId;
+  }
+  return null;
 }
 
 function cloneSubtree(page: Page, rootId: string): Record<string, Shape> {

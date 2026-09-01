@@ -65,6 +65,164 @@ describe('DocumentEngine — structural-sharing snapshots', () => {
   });
 });
 
+describe('DocumentEngine — components, variants and properties', () => {
+  // A "Button" master: a frame with a text label inside, plus a second variant frame.
+  function componentScene() {
+    const eng = new DocumentEngine();
+    const f = makeEmptyFile();
+    const page = f.pages[0];
+    const mkText = (id: string, parent: string, x: number) => makeDefaultShape({
+      id, type: 'text', name: 'label', frameId: parent, parentId: parent, x, y: 10, width: 100, height: 20,
+      paragraphs: [{ align: 'left', spans: [{ text: 'Button' }] }],
+      selrect: { x, y: 10, width: 100, height: 20 },
+    });
+    page.objects['def'] = makeDefaultShape({ id: 'def', type: 'frame', name: 'Default', frameId: 'def', parentId: null, x: 0, y: 0, width: 160, height: 40, selrect: { x: 0, y: 0, width: 160, height: 40 } });
+    page.objects['defL'] = mkText('defL', 'def', 10);
+    page.objects['def'].childIds = ['defL'];
+    page.objects['hov'] = makeDefaultShape({ id: 'hov', type: 'frame', name: 'Hover', frameId: 'hov', parentId: null, x: 300, y: 0, width: 160, height: 40, selrect: { x: 300, y: 0, width: 160, height: 40 } });
+    page.objects['hovL'] = mkText('hovL', 'hov', 310);
+    page.objects['hov'].childIds = ['hovL'];
+    page.childIds.push('def', 'hov');
+    eng.load(f);
+    return eng;
+  }
+  const componentIdFor = (eng: DocumentEngine, shapeId: string) =>
+    Object.entries(eng.getState()!.components).find(([, c]) => c.shapeId === shapeId)![0];
+
+  it('an instance mirrors the master subtree and tracks edits to its children', () => {
+    const eng = componentScene();
+    eng.createComponent('def', 'page-1');
+    const compId = componentIdFor(eng, 'def');
+    eng.createInstance(compId, 'page-1', 0, 200);
+
+    const objs1 = objs(eng.getState()!);
+    const instance = Object.values(objs1).find(s => s.masterId === compId)!;
+    expect(instance.childIds).toHaveLength(1);
+    const label = objs1[instance.childIds[0]];
+    expect(label.masterShapeId).toBe('defL');
+    expect(label.y).toBe(210); // master child offset preserved
+
+    // Editing the master's child reaches the instance's copy.
+    eng.applyChanges({ pageId: 'page-1', ops: [{ op: 'set', id: 'defL', attr: 'fills', val: [{ type: 'solid', color: '#00FF00', opacity: 1 }] }] });
+    const after = objs(eng.getState()!)[label.id];
+    expect((after.fills[0] as { color: string }).color).toBe('#00FF00');
+  });
+
+  it('detaching bakes the master values in and cuts every link in the subtree', () => {
+    const eng = componentScene();
+    eng.createComponent('def', 'page-1');
+    const compId = componentIdFor(eng, 'def');
+    eng.createInstance(compId, 'page-1', 0, 200);
+    const instanceId = Object.values(objs(eng.getState()!)).find(s => s.masterId === compId)!.id;
+
+    eng.detachInstance(instanceId, 'page-1');
+    const detached = objs(eng.getState()!)[instanceId];
+    expect(detached.masterId).toBeUndefined();
+    expect(objs(eng.getState()!)[detached.childIds[0]].masterShapeId).toBeUndefined();
+
+    // A later master edit no longer reaches it.
+    eng.applyChanges({ pageId: 'page-1', ops: [{ op: 'set', id: 'defL', attr: 'opacity', val: 0.5 }] });
+    expect(objs(eng.getState()!)[detached.childIds[0]].opacity).toBe(1);
+  });
+
+  it('swapping a variant keeps the instance id, position and component-property values', () => {
+    const eng = componentScene();
+    eng.combineAsVariants(['def', 'hov'], 'page-1', 'State');
+    const defComp = componentIdFor(eng, 'def');
+    eng.setComponentProps(defComp, [{ id: 'p-text', name: 'Label', type: 'text', defaultValue: 'Button' }]);
+    eng.applyChanges({ pageId: 'page-1', ops: [
+      { op: 'set', id: 'defL', attr: 'propBindings', val: { characters: 'p-text' } },
+      { op: 'set', id: 'hovL', attr: 'propBindings', val: { characters: 'p-text' } },
+    ] });
+    eng.createInstance(defComp, 'page-1', 0, 200);
+    const instanceId = Object.values(objs(eng.getState()!)).find(s => s.masterId === defComp)!.id;
+    eng.applyChanges({ pageId: 'page-1', ops: [{ op: 'set', id: instanceId, attr: 'componentProps', val: { 'p-text': 'Save' } }] });
+
+    const textOf = (id: string) => {
+      const o = objs(eng.getState()!);
+      return o[o[id].childIds[0]].paragraphs![0].spans[0].text;
+    };
+    expect(textOf(instanceId)).toBe('Save');
+
+    eng.setInstanceVariant(instanceId, 'page-1', { State: 'Hover' });
+    const swapped = objs(eng.getState()!)[instanceId];
+    expect(swapped.x).toBe(0);
+    expect(swapped.y).toBe(200);
+    expect(eng.getState()!.components[swapped.masterId!].shapeId).toBe('hov');
+    // The property is declared on the Default variant only — the set shares it.
+    expect(textOf(instanceId)).toBe('Save');
+  });
+
+  it('a layer added to a master appears in existing instances, and removing it takes it back out', () => {
+    const eng = componentScene();
+    eng.createComponent('def', 'page-1');
+    const compId = componentIdFor(eng, 'def');
+    eng.createInstance(compId, 'page-1', 0, 200);
+    const instanceId = Object.values(objs(eng.getState()!)).find(s => s.masterId === compId)!.id;
+    expect(objs(eng.getState()!)[instanceId].childIds).toHaveLength(1);
+
+    // Add a badge to the master.
+    eng.applyChanges({ pageId: 'page-1', ops: [
+      { op: 'add', shape: makeDefaultShape({ id: 'badge', type: 'rect', name: 'badge', frameId: 'def', parentId: 'def', x: 130, y: 5, width: 20, height: 20, selrect: { x: 130, y: 5, width: 20, height: 20 } }) },
+    ] });
+
+    const withBadge = objs(eng.getState()!);
+    const instance = withBadge[instanceId];
+    expect(instance.childIds).toHaveLength(2);
+    const badgeCopy = instance.childIds.map(id => withBadge[id]).find(c => c.masterShapeId === 'badge')!;
+    expect(badgeCopy).toBeTruthy();
+    expect(badgeCopy.y).toBe(205); // master y + the instance's offset
+
+    // Removing it from the master removes it from the instance too.
+    eng.applyChanges({ pageId: 'page-1', ops: [{ op: 'del', id: 'badge' }] });
+    const after = objs(eng.getState()!);
+    expect(after[instanceId].childIds).toHaveLength(1);
+    expect(after[badgeCopy.id]).toBeUndefined();
+  });
+
+  it('instance children follow the master\'s sibling order', () => {
+    const eng = componentScene();
+    // Give the master a second child so there is an order to change.
+    eng.applyChanges({ pageId: 'page-1', ops: [
+      { op: 'add', shape: makeDefaultShape({ id: 'icon', type: 'rect', name: 'icon', frameId: 'def', parentId: 'def', x: 4, y: 4, width: 10, height: 10, selrect: { x: 4, y: 4, width: 10, height: 10 } }) },
+    ] });
+    eng.createComponent('def', 'page-1');
+    const compId = componentIdFor(eng, 'def');
+    eng.createInstance(compId, 'page-1', 0, 200);
+    const instanceId = Object.values(objs(eng.getState()!)).find(s => s.masterId === compId)!.id;
+
+    const masterOrder = () => objs(eng.getState()!)['def'].childIds;
+    const instanceOrder = () => objs(eng.getState()!)[instanceId].childIds
+      .map(id => objs(eng.getState()!)[id].masterShapeId);
+    expect(instanceOrder()).toEqual(masterOrder());
+
+    // Reorder the master's children; the instance follows.
+    eng.applyChanges({ pageId: 'page-1', ops: [{ op: 'move', id: 'icon', parentId: 'def', index: 0 }] });
+    expect(instanceOrder()).toEqual(masterOrder());
+  });
+
+  it('undo restores the layers a component property had changed', () => {
+    const eng = componentScene();
+    eng.createComponent('def', 'page-1');
+    const compId = componentIdFor(eng, 'def');
+    eng.setComponentProps(compId, [{ id: 'p-text', name: 'Label', type: 'text', defaultValue: 'Button' }]);
+    eng.applyChanges({ pageId: 'page-1', ops: [{ op: 'set', id: 'defL', attr: 'propBindings', val: { characters: 'p-text' } }] });
+    eng.createInstance(compId, 'page-1', 0, 200);
+    const instanceId = Object.values(objs(eng.getState()!)).find(s => s.masterId === compId)!.id;
+
+    const textOf = () => {
+      const o = objs(eng.getState()!);
+      return o[o[instanceId].childIds[0]].paragraphs![0].spans[0].text;
+    };
+    eng.applyChanges({ pageId: 'page-1', ops: [{ op: 'set', id: instanceId, attr: 'componentProps', val: { 'p-text': 'Save' } }] });
+    expect(textOf()).toBe('Save');
+    eng.undo();
+    expect(textOf()).toBe('Button');
+    eng.redo();
+    expect(textOf()).toBe('Save');
+  });
+});
+
 describe('DocumentEngine — undo replays side effects', () => {
   it('undo of an auto-layout spacing change restores the children positions', () => {
     const eng = new DocumentEngine();
@@ -91,6 +249,35 @@ describe('DocumentEngine — undo replays side effects', () => {
     eng.redo();
     expect(objs(eng.getState()!)['frame-1'].autoLayout!.spacing).toBe(40);
     expect(objs(eng.getState()!).B.y).toBe(before.A.y + before.A.height + 40);
+  });
+
+  it('a fill child keeps its declared size: Fixed restores it and a hug parent does not ratchet', () => {
+    const eng = new DocumentEngine();
+    const f = fileWithTwoRects();
+    f.pages[0].objects['frame-1'].width = 400;
+    f.pages[0].objects['frame-1'].height = 300;
+    f.pages[0].objects['frame-1'].autoLayout = {
+      direction: 'horizontal', spacing: 10,
+      padding: { top: 0, right: 0, bottom: 0, left: 0 },
+      justifyContent: 'start', alignItems: 'start',
+    };
+    eng.load(f);
+    // B fills the leftover space: 400 - 40 (A) - 10 (gap) = 350.
+    eng.applyChanges({ pageId: 'page-1', ops: [{ op: 'set', id: 'B', attr: 'widthMode', val: 'fill' }] });
+    expect(objs(eng.getState()!).B.width).toBe(350);
+    expect(objs(eng.getState()!).B.baseWidth).toBe(40);
+
+    // A hugging parent measures B's DECLARED width (40), not the stretched 350 …
+    eng.applyChanges({ pageId: 'page-1', ops: [{ op: 'set', id: 'frame-1', attr: 'widthMode', val: 'hug' }] });
+    expect(objs(eng.getState()!)['frame-1'].width).toBe(90);
+    // … and stays there however many reflows follow.
+    eng.applyChanges({ pageId: 'page-1', ops: [{ op: 'set', id: 'frame-1', attr: 'name', val: 'AL' }] });
+    expect(objs(eng.getState()!)['frame-1'].width).toBe(90);
+
+    // Leaving fill restores the declared width instead of freezing the stretched one.
+    eng.applyChanges({ pageId: 'page-1', ops: [{ op: 'set', id: 'B', attr: 'widthMode', val: 'fixed' }] });
+    expect(objs(eng.getState()!).B.width).toBe(40);
+    expect(objs(eng.getState()!).B.baseWidth).toBeUndefined();
   });
 
   it('undo of a master edit reverts its instances; redo re-propagates', () => {

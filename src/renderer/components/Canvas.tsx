@@ -13,6 +13,34 @@ import { api } from '../ipc/api';
 import { makeDefaultShape, Shape, PathSegment, Page, AnchorPoint } from '../../shared/types';
 import { createAutoLayoutFromSelection } from '../../shared/createAutoLayout';
 import { applyAutoLayoutToPage } from '../../shared/autoLayout';
+import { constraintOps } from '../../shared/constraints';
+import { gridSnapPositions } from '../../shared/layoutGrid';
+import { shapeToSegments, toLocal, segmentsBounds, regularPolygon } from '../../shared/flatten';
+
+// During a resize drag, run the previewed container's constraints so its children move and
+// stretch LIVE rather than snapping into place on mouse-up. Mirrors what the engine emits on
+// commit, so what you see during the drag is what you get after it.
+function withConstraintsPreview(page: Page, preview: Map<string, ShapePreview>): Map<string, ShapePreview> {
+  if (preview.size === 0) return preview;
+  let out: Map<string, ShapePreview> | null = null;
+  for (const [id, box] of preview) {
+    const s = page.objects[id];
+    if (!s || s.childIds.length === 0) continue;
+    const after = { x: box.x ?? s.x, y: box.y ?? s.y, width: box.width ?? s.width, height: box.height ?? s.height };
+    if (after.width === s.width && after.height === s.height) continue;
+    const ops = constraintOps(page, id, { x: s.x, y: s.y, width: s.width, height: s.height }, after);
+    if (ops.length === 0) continue;
+    out = out ?? new Map(preview);
+    for (const op of ops) {
+      if (op.op !== 'set' || typeof op.val !== 'number') continue;
+      const c = page.objects[op.id];
+      if (!c) continue;
+      const cur = out.get(op.id) ?? { x: c.x, y: c.y, width: c.width, height: c.height };
+      out.set(op.id, { ...cur, [op.attr]: op.val });
+    }
+  }
+  return out ?? preview;
+}
 
 // During a drag, `preview` overrides the dragged shape(s) box. If the page has any auto-layout
 // container, reflow a throwaway clone with those overrides applied so children reposition/
@@ -60,6 +88,12 @@ const SNAP_ENGAGE_PX = 8;           // screen pixels — snap engage threshold
 const SNAP_RELEASE_PX = 12;         // screen pixels — snap release threshold
 const SNAP_COLOR = '#E040FB';       // magenta snap lines
 const ZOOM_STEPS = [0.01, 0.02, 0.04, 0.08, 0.16, 0.25, 0.5, 1, 2, 4, 8, 16, 256];
+// Window for combining two typed digits into one opacity value (Figma behaviour).
+const OPACITY_DIGIT_MS = 800;
+// Layer names for boolean groups, matching Figma's wording.
+const BOOL_NAMES: Record<NonNullable<Shape['boolType']>, string> = {
+  union: 'Union', difference: 'Subtract', intersection: 'Intersect', exclusion: 'Exclude',
+};
 const PEN_CLOSE_PX = 10; // screen-px radius around first anchor that closes the path
 
 const PEN_CURSOR = `url("data:image/svg+xml,${encodeURIComponent(
@@ -113,7 +147,7 @@ type DragMode =
       // frame's direct children.
       frameId?: string | null;
     }
-  | { mode: 'create'; tool: 'rect' | 'ellipse' | 'frame'; startDocX: number; startDocY: number; currentDocX: number; currentDocY: number }
+  | { mode: 'create'; tool: 'rect' | 'ellipse' | 'frame' | 'line' | 'polygon' | 'star'; startDocX: number; startDocY: number; currentDocX: number; currentDocY: number }
   | { mode: 'text-create'; startDocX: number; startDocY: number; currentDocX: number; currentDocY: number }
   | {
       // Reordering a single child within its auto-layout parent. The engine snaps
@@ -181,7 +215,9 @@ function pointInShape(s: Shape, x: number, y: number): boolean {
 // body (secondary); see onMouseDown / FrameLabels.
 function isDrillableContainer(s: Shape | undefined): boolean {
   if (!s) return false;
-  if (s.type === 'group') return true;
+  // Boolean groups behave like groups: clicking one selects the whole result, and you
+  // double-click to reach the operands.
+  if (s.type === 'group' || s.type === 'bool') return true;
   return s.type === 'frame' && s.parentId != null;
 }
 
@@ -232,6 +268,19 @@ function resolveSelectionTarget(
   // Not inside a container → select the outermost group/asset, else the element itself.
   // (Top-level frames are click-through; their children select directly — Figma behaviour.)
   return outermostGroup(page, hitId) ?? hitId;
+}
+
+// Digit for a number-row key. e.code is authoritative (layout- and shift-independent),
+// but synthetic events don't always carry it — fall back to e.key, including the shifted
+// punctuation a US layout produces.
+const SHIFTED_DIGITS: Record<string, string> = {
+  ')': '0', '!': '1', '@': '2', '#': '3', '$': '4',
+  '%': '5', '^': '6', '&': '7', '*': '8', '(': '9',
+};
+function digitKey(e: KeyboardEvent): string | null {
+  if (/^Digit[0-9]$/.test(e.code)) return e.code.slice(5);
+  if (/^[0-9]$/.test(e.key)) return e.key;
+  return SHIFTED_DIGITS[e.key] ?? null;
 }
 
 // Compute the insertion slot for a drag-to-reorder inside an auto-layout container.
@@ -590,6 +639,16 @@ function getSnapTargets(page: Page, movedIds: Set<string>): { x: number[]; y: nu
     if (parent) {
       addX(parent.x); addX(parent.x + parent.width); addX(parent.x + parent.width / 2);
       addY(parent.y); addY(parent.y + parent.height); addY(parent.y + parent.height / 2);
+      // Track edges of the parent's layout grids — the whole point of a grid is that
+      // things line up to it.
+      for (const g of parent.layoutGrids ?? []) {
+        if (g.type === 'rows') gridSnapPositions(g, parent.y, parent.height).forEach(addY);
+        else if (g.type === 'columns') gridSnapPositions(g, parent.x, parent.width).forEach(addX);
+        else {
+          gridSnapPositions(g, parent.x, parent.width).forEach(addX);
+          gridSnapPositions(g, parent.y, parent.height).forEach(addY);
+        }
+      }
     }
   }
   return { x: [...xs], y: [...ys] };
@@ -1013,10 +1072,25 @@ export default function Canvas() {
 
 
   // ── Fit to page ───────────────────────────────────────────────────────────
-  const fitToPage = useCallback(() => {
+  // Centre a doc-space rect in the viewport, scaled to fit (never zooming past 100%).
+  const zoomToRect = useCallback((minX: number, minY: number, maxX: number, maxY: number) => {
     const container = containerRef.current;
+    if (!container) return;
+    const PADDING = 48;
+    const cw = container.clientWidth - PADDING * 2;
+    const ch = container.clientHeight - PADDING * 2;
+    const dw = maxX - minX; const dh = maxY - minY;
+    if (dw <= 0 || dh <= 0 || cw <= 0 || ch <= 0) return;
+    const zoom = Math.min(1, Math.min(cw / dw, ch / dh));
+    setViewport({ x: PADDING + (cw - dw * zoom) / 2 - minX * zoom, y: PADDING + (ch - dh * zoom) / 2 - minY * zoom, zoom });
+  }, []);
+
+  // Digit buffer for the opacity shortcut (see OPACITY_DIGIT_MS).
+  const opacityKeyRef = useRef<{ buf: string; at: number }>({ buf: '', at: 0 });
+
+  const fitToPage = useCallback(() => {
     const page = activePage();
-    if (!container || !page || page.childIds.length === 0) return;
+    if (!page || page.childIds.length === 0) return;
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
     for (const id of page.childIds) {
       const s = page.objects[id];
@@ -1025,14 +1099,23 @@ export default function Canvas() {
       maxX = Math.max(maxX, s.selrect.x + s.selrect.width);
       maxY = Math.max(maxY, s.selrect.y + s.selrect.height);
     }
-    const PADDING = 48;
-    const cw = container.clientWidth - PADDING * 2;
-    const ch = container.clientHeight - PADDING * 2;
-    const dw = maxX - minX; const dh = maxY - minY;
-    if (dw <= 0 || dh <= 0 || cw <= 0 || ch <= 0) return;
-    const zoom = Math.min(1, Math.min(cw / dw, ch / dh));
-    setViewport({ x: PADDING + (cw - dw * zoom) / 2 - minX * zoom, y: PADDING + (ch - dh * zoom) / 2 - minY * zoom, zoom });
-  }, [activePage]);
+    zoomToRect(minX, minY, maxX, maxY);
+  }, [activePage, zoomToRect]);
+
+  // Figma ⇧2 — frame the current selection (falls back to the page when nothing is selected).
+  const zoomToSelection = useCallback(() => {
+    const page = activePage();
+    if (!page || selectedIds.size === 0) { fitToPage(); return; }
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const id of selectedIds) {
+      const s = page.objects[id];
+      if (!s) continue;
+      minX = Math.min(minX, s.selrect.x); minY = Math.min(minY, s.selrect.y);
+      maxX = Math.max(maxX, s.selrect.x + s.selrect.width);
+      maxY = Math.max(maxY, s.selrect.y + s.selrect.height);
+    }
+    zoomToRect(minX, minY, maxX, maxY);
+  }, [activePage, selectedIds, fitToPage, zoomToRect]);
 
   useEffect(() => { if (!file) didFit.current = false; }, [file]);
 
@@ -1114,8 +1197,9 @@ export default function Canvas() {
     const rawPreview = externalDragPreview.size > 0
       ? new Map([...previewRef.current, ...externalDragPreview])
       : previewRef.current;
-    // Reflow auto-layout live so children move/resize with the dragged frame (not just on release).
-    const combinedPreview = withAutoLayoutPreview(page, rawPreview);
+    // Resolve constraints first (they own plain frames), then reflow auto layout (which owns
+    // its own children) — same order the engine applies them on commit.
+    const combinedPreview = withAutoLayoutPreview(page, withConstraintsPreview(page, rawPreview));
     renderPage(ctx, page, vp, selectedIds, images.current, combinedPreview, marquee, file ?? undefined, editingTextId, undefined, hiddenOverlayIds);
 
     // Live selection outline during a transform drag. The React handle overlay is hidden
@@ -1193,7 +1277,7 @@ export default function Canvas() {
       const y = Math.min(startDocY, currentDocY);
       const w = Math.abs(currentDocX - startDocX);
       const h = Math.abs(currentDocY - startDocY);
-      if (w > 2 && h > 2) {
+      if (drag.tool === 'line' ? (w > 2 || h > 2) : (w > 2 && h > 2)) {
         ctx.save();
         ctx.translate(vp.x, vp.y);
         ctx.scale(vp.zoom, vp.zoom);
@@ -1204,6 +1288,20 @@ export default function Canvas() {
         if (drag.tool === 'ellipse') {
           ctx.beginPath();
           ctx.ellipse(x + w / 2, y + h / 2, w / 2, h / 2, 0, 0, Math.PI * 2);
+          ctx.fill(); ctx.stroke();
+        } else if (drag.tool === 'line') {
+          ctx.beginPath();
+          ctx.moveTo(drag.startDocX, drag.startDocY);
+          ctx.lineTo(drag.currentDocX, drag.currentDocY);
+          ctx.stroke();
+        } else if (drag.tool === 'polygon' || drag.tool === 'star') {
+          const pts = regularPolygon(w, h, drag.tool === 'star' ? 5 : 3, drag.tool === 'star' ? 0.382 : undefined);
+          ctx.beginPath();
+          for (const seg of pts) {
+            if (seg.verb === 'M') ctx.moveTo(x + seg.coords[0], y + seg.coords[1]);
+            else if (seg.verb === 'L') ctx.lineTo(x + seg.coords[0], y + seg.coords[1]);
+            else if (seg.verb === 'Z') ctx.closePath();
+          }
           ctx.fill(); ctx.stroke();
         } else {
           ctx.fillRect(x, y, w, h);
@@ -1327,6 +1425,135 @@ export default function Canvas() {
     return () => cancelAnimationFrame(raf);
   }, [draw]);
 
+  // Lock (⌘⇧L) / hide (⌘⇧H) the selection. Both toggle off the first shape's state so a
+  // mixed selection resolves one way rather than flip-flopping per layer.
+  const toggleShapeFlag = useCallback(async (attr: 'locked' | 'hidden') => {
+    const page = activePage();
+    if (!page || selectedIds.size === 0) return;
+    const ids = topLevelSelection(page, [...selectedIds]).filter(id => page.objects[id]);
+    if (ids.length === 0) return;
+    const next = !page.objects[ids[0]]![attr];
+    const res = await api.applyChanges({
+      pageId: page.id,
+      ops: ids.map(id => ({ op: 'set' as const, id, attr, val: next })),
+    });
+    if (res.ok && res.data) setFile(res.data);
+  }, [activePage, selectedIds, setFile]);
+
+  // Mirror the selection (Figma ⇧H / ⇧V). Descendants are mirrored positionally about
+  // the selection's bounding box and each shape's own drawing is flagged, so nested
+  // content flips as one piece instead of each layer flipping in place.
+  const flipSelection = useCallback(async (axis: 'h' | 'v') => {
+    const page = activePage();
+    if (!page || selectedIds.size === 0) return;
+    const roots = topLevelSelection(page, [...selectedIds]);
+    const all = withDescendants(page, roots);
+    const rootShapes = roots.map(id => page.objects[id]).filter(Boolean) as Shape[];
+    if (rootShapes.length === 0) return;
+    const minX = Math.min(...rootShapes.map(s => s.selrect.x));
+    const maxX = Math.max(...rootShapes.map(s => s.selrect.x + s.selrect.width));
+    const minY = Math.min(...rootShapes.map(s => s.selrect.y));
+    const maxY = Math.max(...rootShapes.map(s => s.selrect.y + s.selrect.height));
+
+    const ops = all.flatMap(id => {
+      const s = page.objects[id];
+      if (!s) return [];
+      if (axis === 'h') {
+        return [
+          { op: 'set' as const, id, attr: 'x', val: Math.round(minX + maxX - (s.x + s.width)) },
+          { op: 'set' as const, id, attr: 'flipH', val: !s.flipH ? true : undefined },
+        ];
+      }
+      return [
+        { op: 'set' as const, id, attr: 'y', val: Math.round(minY + maxY - (s.y + s.height)) },
+        { op: 'set' as const, id, attr: 'flipV', val: !s.flipV ? true : undefined },
+      ];
+    });
+    const res = await api.applyChanges({ pageId: page.id, ops });
+    if (res.ok && res.data) setFile(res.data);
+  }, [activePage, selectedIds, setFile]);
+
+  // ── Boolean groups, masks, flatten ────────────────────────────────────────
+  // Booleans and masks are non-destructive (Figma model): the operands stay as editable
+  // children and the renderer composes them. Flatten is the destructive one.
+
+  const booleanOp = useCallback(async (boolType: NonNullable<Shape['boolType']>) => {
+    const page = activePage();
+    if (!page || selectedIds.size < 2) return;
+    const ids = topLevelSelection(page, [...selectedIds]);
+    const shapes = ids.map(id => page.objects[id]).filter(Boolean) as Shape[];
+    if (shapes.length < 2) return;
+    const minX = Math.min(...shapes.map(s => s.selrect.x));
+    const minY = Math.min(...shapes.map(s => s.selrect.y));
+    const maxX = Math.max(...shapes.map(s => s.selrect.x + s.selrect.width));
+    const maxY = Math.max(...shapes.map(s => s.selrect.y + s.selrect.height));
+    const boolId = genId();
+    const commonParent = shapes.every(s => s.parentId === shapes[0].parentId) ? shapes[0].parentId ?? null : null;
+    const boolShape = makeDefaultShape({
+      id: boolId, type: 'bool', name: BOOL_NAMES[boolType],
+      frameId: shapes[0].frameId, parentId: commonParent,
+      x: minX, y: minY, width: maxX - minX, height: maxY - minY,
+      boolType,
+      // The group takes the first operand's fill, as Figma does.
+      fills: shapes[0].fills.length ? structuredClone(shapes[0].fills) : [],
+      strokes: [],
+      selrect: { x: minX, y: minY, width: maxX - minX, height: maxY - minY },
+    });
+    const ops = [
+      { op: 'add' as const, shape: boolShape },
+      ...ids.map((id, i) => ({ op: 'move' as const, id, parentId: boolId, index: i })),
+    ];
+    const res = await api.applyChanges({ pageId: page.id, ops });
+    if (res.ok && res.data) { setFile(res.data); setSelectedIds([boolId]); setGroupEditId(null); }
+  }, [activePage, selectedIds, setFile, setSelectedIds, setGroupEditId]);
+
+  // Figma "Use as mask": the selected layer clips its later siblings. Toggles off again.
+  const toggleMask = useCallback(async () => {
+    const page = activePage();
+    if (!page || selectedIds.size === 0) return;
+    const ids = topLevelSelection(page, [...selectedIds]).filter(id => page.objects[id]);
+    if (ids.length === 0) return;
+    const turningOn = !page.objects[ids[0]]!.isMask;
+    const res = await api.applyChanges({
+      pageId: page.id,
+      ops: ids.map(id => ({ op: 'set' as const, id, attr: 'isMask', val: turningOn ? true : undefined })),
+    });
+    if (res.ok && res.data) { setFile(res.data); showToast(turningOn ? 'Used as mask' : 'Mask removed'); }
+  }, [activePage, selectedIds, setFile, showToast]);
+
+  // Collapse the selection into one editable vector path.
+  const flattenSelection = useCallback(async () => {
+    const page = activePage();
+    if (!page || selectedIds.size === 0) return;
+    const ids = topLevelSelection(page, [...selectedIds]);
+    const shapes = ids.map(id => page.objects[id]).filter(Boolean) as Shape[];
+    const segments = shapes.flatMap(s => shapeToSegments(s, page.objects));
+    if (segments.length === 0) { showToast('Nothing to flatten — text and images have no path form'); return; }
+    const bounds = segmentsBounds(segments);
+    if (!bounds) return;
+    const first = shapes[0];
+    const pathId = genId();
+    const path = makeDefaultShape({
+      id: pathId, type: 'path', name: 'Vector',
+      frameId: first.frameId, parentId: first.parentId ?? null,
+      x: bounds.x, y: bounds.y, width: bounds.width, height: bounds.height,
+      content: toLocal(segments, bounds.x, bounds.y),
+      fills: first.fills.length ? structuredClone(first.fills) : [],
+      strokes: first.strokes.length ? structuredClone(first.strokes) : [],
+      selrect: { ...bounds },
+    });
+    const siblings = first.parentId ? (page.objects[first.parentId]?.childIds ?? []) : page.childIds;
+    const res = await api.applyChanges({
+      pageId: page.id,
+      ops: [
+        { op: 'add', shape: path },
+        { op: 'move', id: pathId, parentId: first.parentId ?? null, index: Math.max(0, siblings.indexOf(first.id)) },
+        ...ids.map(id => ({ op: 'del' as const, id })),
+      ],
+    });
+    if (res.ok && res.data) { setFile(res.data); setSelectedIds([pathId]); }
+  }, [activePage, selectedIds, setFile, setSelectedIds, showToast]);
+
   // ── Keyboard shortcuts ────────────────────────────────────────────────────
   useEffect(() => {
     const onKey = async (e: KeyboardEvent) => {
@@ -1334,8 +1561,9 @@ export default function Canvas() {
       const meta = e.metaKey || e.ctrlKey;
 
       // Tool shortcuts
-      const toolKeys: Record<string, ToolType> = { v: 'select', f: 'frame', r: 'rect', o: 'ellipse', t: 'text', p: 'pen', i: 'image' };
-      if (!e.metaKey && !e.ctrlKey && !e.altKey && toolKeys[e.key.toLowerCase()]) {
+      const toolKeys: Record<string, ToolType> = { v: 'select', f: 'frame', r: 'rect', o: 'ellipse', t: 'text', p: 'pen', i: 'image', l: 'line' };
+      // Shift is excluded: ⇧V / ⇧H are Figma's flip commands, not the Move tool.
+      if (!e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey && toolKeys[e.key.toLowerCase()]) {
         setActiveTool(toolKeys[e.key.toLowerCase()]);
         if (penSegments) { setPenSegments(null); setPenContinueShapeId(null); }
         return;
@@ -1394,6 +1622,35 @@ export default function Canvas() {
         // Otherwise: a node is selected but we're not inside a container → deselect.
         if (selectedIds.size > 0) { clearSelection(); setActiveTool('select'); return; }
         setActiveTool('select');
+        return;
+      }
+
+      // Lock (⌘⇧L) / hide (⌘⇧H) — Figma bindings.
+      if (meta && e.shiftKey && !e.altKey && (e.key.toLowerCase() === 'l' || e.key.toLowerCase() === 'h')) {
+        e.preventDefault();
+        await toggleShapeFlag(e.key.toLowerCase() === 'l' ? 'locked' : 'hidden');
+        return;
+      }
+
+      // Flip horizontal / vertical (⇧H / ⇧V)
+      const flipKey = !meta && e.shiftKey && !e.altKey ? e.key.toLowerCase() : '';
+      if (flipKey === 'h' || flipKey === 'v') {
+        e.preventDefault();
+        await flipSelection(flipKey as 'h' | 'v');
+        return;
+      }
+
+      // Flatten selection (⌘E) — Figma's binding; Export moved to ⇧⌘E.
+      if (meta && !e.shiftKey && !e.altKey && e.key.toLowerCase() === 'e') {
+        e.preventDefault();
+        await flattenSelection();
+        return;
+      }
+
+      // Use as mask (⌃⌘M)
+      if (e.metaKey && e.ctrlKey && e.key.toLowerCase() === 'm') {
+        e.preventDefault();
+        await toggleMask();
         return;
       }
 
@@ -1572,18 +1829,50 @@ export default function Canvas() {
         });
         return;
       }
+      // Figma zoom bindings: ⇧0 = 100%, ⇧1 = zoom to fit, ⇧2 = zoom to selection.
+      // Matched on e.code — shifted digits produce ')', '!', '@' in e.key.
+      const zoomDigit = e.shiftKey && !meta ? digitKey(e) : null;
+      if (zoomDigit === '0' || zoomDigit === '1' || zoomDigit === '2') {
+        e.preventDefault();
+        if (zoomDigit === '1') fitToPage();
+        else if (zoomDigit === '2') zoomToSelection();
+        else {
+          const c = canvasRef.current;
+          if (c) setViewport({ zoom: 1, x: c.clientWidth / 2 - 400, y: 60 });
+        }
+        return;
+      }
       if (meta && e.key === '0') {
         e.preventDefault();
         const c = canvasRef.current;
         if (c) setViewport({ zoom: 1, x: c.clientWidth / 2 - 400, y: 60 });
         return;
       }
-      if (!meta && e.key === '0') { fitToPage(); return; }
-      if (e.key === '1') {
-        const c = canvasRef.current;
-        if (c) setViewport({ x: c.clientWidth / 2 - 400, y: 60, zoom: 1 });
+
+      // Figma opacity bindings: bare digits set the selection's opacity — 1→10% … 9→90%,
+      // 0→100%. A second digit typed within OPACITY_DIGIT_MS combines ("4","5" → 45%).
+      const opacityDigit = !meta && !e.altKey && !e.shiftKey ? digitKey(e) : null;
+      if (opacityDigit !== null && selectedIds.size > 0) {
+        e.preventDefault();
+        const page2 = activePage();
+        if (!page2) return;
+        const digit = opacityDigit;
+        const now = Date.now();
+        const prev = opacityKeyRef.current;
+        const buf = now - prev.at < OPACITY_DIGIT_MS && prev.buf.length === 1 ? prev.buf + digit : digit;
+        opacityKeyRef.current = { buf, at: now };
+        const pct = buf.length === 1
+          ? (digit === '0' ? 100 : Number(digit) * 10)
+          : Math.min(100, Number(buf));
+        const ops = topLevelSelection(page2, [...selectedIds])
+          .filter(id => page2.objects[id])
+          .map(id => ({ op: 'set' as const, id, attr: 'opacity', val: pct / 100 }));
+        if (ops.length === 0) return;
+        const res = await api.applyChanges({ pageId: page2.id, ops });
+        if (res.ok && res.data) setFile(res.data);
         return;
       }
+      if (opacityDigit === '0' && selectedIds.size === 0) { fitToPage(); return; }
 
       // Pixel grid toggle (Shift+')
       if (!meta && e.shiftKey && e.code === 'Quote') {
@@ -1863,7 +2152,7 @@ export default function Canvas() {
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [fitToPage, activePage, selectedIds, setFile, clearSelection, penSegments, setActiveTool, setPenSegments, setPenCurrentDoc, setPenContinueShapeId, setEditingTextId, setGroupEditId, setSelectedIds, vectorEditShapeId, setVectorEditShapeId, setVectorEditChildId, pathEditShapeId, editingPoints, setPathEditShapeId, setEditingPoints, setSelectedPointIndices, svgEditShapeId, setSvgEditShapeId, setLivePreviewSvg, groupEditId]);
+  }, [fitToPage, zoomToSelection, flattenSelection, toggleMask, flipSelection, toggleShapeFlag, activePage, selectedIds, setFile, clearSelection, penSegments, setActiveTool, setPenSegments, setPenCurrentDoc, setPenContinueShapeId, setEditingTextId, setGroupEditId, setSelectedIds, vectorEditShapeId, setVectorEditShapeId, setVectorEditChildId, pathEditShapeId, editingPoints, setPathEditShapeId, setEditingPoints, setSelectedPointIndices, svgEditShapeId, setSvgEditShapeId, setLivePreviewSvg, groupEditId]);
 
   // ── Pen path commit ───────────────────────────────────────────────────────
   const finishPenPath = useCallback(async (closed = false) => {
@@ -2173,7 +2462,8 @@ export default function Canvas() {
     }
 
     // ── Shape creation tools ────────────────────────────────────────────────
-    if (activeTool === 'rect' || activeTool === 'ellipse' || activeTool === 'frame') {
+    if (activeTool === 'rect' || activeTool === 'ellipse' || activeTool === 'frame'
+        || activeTool === 'line' || activeTool === 'polygon' || activeTool === 'star') {
       let startDocX = doc.x, startDocY = doc.y;
       if (page) {
         const frame = frameAtPoint(page, doc.x, doc.y);
@@ -2308,7 +2598,11 @@ export default function Canvas() {
       // shape itself when it has no container ancestor). Select it and allow dragging it —
       // from its label OR anywhere on its body. To marquee-select children or grab a child
       // directly, double-click to enter the container first (handled by the editing branch).
-      const target = resolveSelectionTarget(page, hitId, null);
+      // …unless the hit already sits under the current selection. Re-resolving then would
+      // grab the container and drag the whole thing, so a child selected from the Layers
+      // panel could never be dragged (or reordered inside its auto-layout parent) on canvas.
+      const selectedOnPath = shift ? null : ancestorChain(page, hitId).find(id => selectedIds.has(id));
+      const target = selectedOnPath ?? resolveSelectionTarget(page, hitId, null);
       selectAndDrag(target);
       e.preventDefault(); return;
     }
@@ -2892,25 +3186,58 @@ export default function Canvas() {
         break;
       }
       case 'create': {
-        const x = Math.round(Math.min(drag.startDocX, drag.currentDocX));
-        const y = Math.round(Math.min(drag.startDocY, drag.currentDocY));
-        const w = Math.round(Math.abs(drag.currentDocX - drag.startDocX));
-        const h = Math.round(Math.abs(drag.currentDocY - drag.startDocY));
-        if (w < 4 || h < 4) break; // too small, ignore
+        // Size from the release point, falling back to the last move. A drag whose
+        // mousemoves were coalesced (or never delivered) would otherwise commit a
+        // zero-size box and silently create nothing.
+        const upDoc = screenToDoc(getScreenPoint(e).sx, getScreenPoint(e).sy, vpRef.current);
+        const endX = Math.abs(upDoc.x - drag.startDocX) > Math.abs(drag.currentDocX - drag.startDocX) ? upDoc.x : drag.currentDocX;
+        const endY = Math.abs(upDoc.y - drag.startDocY) > Math.abs(drag.currentDocY - drag.startDocY) ? upDoc.y : drag.currentDocY;
+        const x = Math.round(Math.min(drag.startDocX, endX));
+        const y = Math.round(Math.min(drag.startDocY, endY));
+        const w = Math.round(Math.abs(endX - drag.startDocX));
+        const h = Math.round(Math.abs(endY - drag.startDocY));
+        // A line can legitimately be zero-height (or zero-width), so it only needs one axis.
+        if (drag.tool === 'line' ? (w < 4 && h < 4) : (w < 4 || h < 4)) break;
 
-        const type = drag.tool === 'frame' ? 'frame' : drag.tool === 'ellipse' ? 'circle' : 'rect';
+        const type: Shape['type'] =
+          drag.tool === 'frame' ? 'frame'
+          : drag.tool === 'ellipse' ? 'circle'
+          : (drag.tool === 'line' || drag.tool === 'polygon' || drag.tool === 'star') ? 'path'
+          : 'rect';
         const newId = genId();
         const placement = placementForPoint(page, x, y, type);
+        // The three path tools generate their geometry from the dragged box. A line is
+        // stroke-only (a fill on a two-point path would render nothing).
+        const content =
+          drag.tool === 'line' ? [
+            // Follow the actual drag direction, so a diagonal drag draws a diagonal line.
+            { verb: 'M' as const, coords: [Math.round(drag.startDocX) - x, Math.round(drag.startDocY) - y] },
+            { verb: 'L' as const, coords: [Math.round(endX) - x, Math.round(endY) - y] },
+          ]
+          : drag.tool === 'polygon' ? regularPolygon(w, h, 3)
+          : drag.tool === 'star' ? regularPolygon(w, h, 5, 0.382)
+          : undefined;
         const shape = makeDefaultShape({
           id: newId,
           type,
-          name: drag.tool === 'frame' ? 'Frame' : drag.tool === 'ellipse' ? 'Ellipse' : 'Rectangle',
+          name: drag.tool === 'frame' ? 'Frame'
+            : drag.tool === 'ellipse' ? 'Ellipse'
+            : drag.tool === 'line' ? 'Line'
+            : drag.tool === 'polygon' ? 'Polygon'
+            : drag.tool === 'star' ? 'Star'
+            : 'Rectangle',
           frameId: type === 'frame' ? newId : placement.frameId,
           parentId: placement.parentId,
           x, y, width: w, height: h,
+          content,
           fills: drag.tool === 'frame'
             ? [{ type: 'solid', color: '#FFFFFF', opacity: 1 }]
+            : drag.tool === 'line'
+            ? []
             : [{ type: 'solid', color: '#5C7CFA', opacity: 1 }],
+          strokes: drag.tool === 'line'
+            ? [{ color: '#1A1A1A', opacity: 1, width: 1, align: 'center', cap: 'none', style: 'solid' }]
+            : [],
           clipContent: drag.tool === 'frame',
           selrect: { x, y, width: w, height: h },
         });
@@ -3402,6 +3729,30 @@ export default function Canvas() {
             const res = await api.applyChanges({ pageId: page.id, ops: allOps });
             if (res.ok && res.data) { setFile(res.data); setSelectedIds(rootCloneIds); }
           }}
+          onBoolean={booleanOp}
+          onMask={toggleMask}
+          onFlatten={flattenSelection}
+          onFlip={flipSelection}
+          onToggleLock={() => toggleShapeFlag('locked')}
+          onToggleHidden={() => toggleShapeFlag('hidden')}
+          onCreateComponent={async () => {
+            const page = activePage();
+            if (!page || selectedIds.size !== 1) return;
+            const res = await api.createComponent([...selectedIds][0], page.id);
+            if (res.ok && res.data) setFile(res.data);
+          }}
+          onAddAutoLayout={async () => {
+            const page = activePage();
+            if (!page || selectedIds.size === 0) return;
+            const plan = createAutoLayoutFromSelection(page, [...selectedIds], genId);
+            if (!plan) return;
+            const res = await api.applyChanges({ pageId: page.id, ops: plan.ops });
+            if (res.ok && res.data) { setFile(res.data); setSelectedIds([plan.containerId]); }
+          }}
+          multiSelection={selectedIds.size > 1}
+          isMask={selectedIds.size === 1 && !!activePage()?.objects[[...selectedIds][0]]?.isMask}
+          isLocked={selectedIds.size === 1 && !!activePage()?.objects[[...selectedIds][0]]?.locked}
+          isHidden={selectedIds.size === 1 && !!activePage()?.objects[[...selectedIds][0]]?.hidden}
           onGroup={async () => {
             const page = activePage();
             if (!page || selectedIds.size < 2) return;
@@ -3524,6 +3875,12 @@ interface CtxMenuProps {
   onDuplicate: () => Promise<void>; onGroup: () => Promise<void>;
   onFrameSelection: () => Promise<void>;
   onUngroup: () => Promise<void>; onBringToFront: () => Promise<void>;
+  onBoolean: (op: NonNullable<Shape['boolType']>) => Promise<void>;
+  onMask: () => Promise<void>; onFlatten: () => Promise<void>;
+  onFlip: (axis: 'h' | 'v') => Promise<void>;
+  onCreateComponent: () => Promise<void>; onAddAutoLayout: () => Promise<void>;
+  onToggleLock: () => Promise<void>; onToggleHidden: () => Promise<void>;
+  multiSelection: boolean; isMask: boolean; isLocked: boolean; isHidden: boolean;
   onBringForward: () => Promise<void>; onSendBackward: () => Promise<void>;
   onSendToBack: () => Promise<void>; onDelete: () => Promise<void>;
 }
@@ -3576,6 +3933,21 @@ function CanvasContextMenu(props: CtxMenuProps) {
       {item('Group',           '⌘G',    () => void props.onGroup(),        !hasSelection)}
       {item('Frame selection', '⌘⌥G',  () => void props.onFrameSelection(), !hasSelection)}
       {item('Ungroup',         '⌘⇧G',  () => void props.onUngroup(),       !hasSelection)}
+      {sep()}
+      {item('Create component', '⌘K',  () => void props.onCreateComponent(), !hasSelection)}
+      {item('Add auto layout',  '⇧A',  () => void props.onAddAutoLayout(),   !hasSelection)}
+      {sep()}
+      {item('Flip horizontal', '⇧H', () => void props.onFlip('h'), !hasSelection)}
+      {item('Flip vertical',   '⇧V', () => void props.onFlip('v'), !hasSelection)}
+      {item(props.isLocked ? 'Unlock' : 'Lock',        '⌘⇧L', () => void props.onToggleLock(),   !hasSelection)}
+      {item(props.isHidden ? 'Show' : 'Hide',          '⌘⇧H', () => void props.onToggleHidden(), !hasSelection)}
+      {sep()}
+      {item('Union',     '', () => void props.onBoolean('union'),        !props.multiSelection)}
+      {item('Subtract',  '', () => void props.onBoolean('difference'),   !props.multiSelection)}
+      {item('Intersect', '', () => void props.onBoolean('intersection'), !props.multiSelection)}
+      {item('Exclude',   '', () => void props.onBoolean('exclusion'),    !props.multiSelection)}
+      {item('Flatten',   '⌘E', () => void props.onFlatten(),             !hasSelection)}
+      {item(props.isMask ? 'Remove mask' : 'Use as mask', '⌃⌘M', () => void props.onMask(), !hasSelection)}
       {sep()}
       {item('Bring to front',  '⌘⌥]',  () => void props.onBringToFront(),  !hasSelection)}
       {item('Bring forward',   '⌘]',   () => void props.onBringForward(),  !hasSelection)}

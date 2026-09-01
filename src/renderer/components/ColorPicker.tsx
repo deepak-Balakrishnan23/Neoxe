@@ -1,5 +1,8 @@
 import React, { useRef, useEffect, useState, useCallback } from 'react';
 import { Fill, GradientStop } from '../../shared/types';
+import { useDesignStore } from '../store/useDesignStore';
+import { api } from '../ipc/api';
+import { importImageFiles, IMAGE_ACCEPT_ATTR } from '../io/imageImport';
 
 // ── Color math ─────────────────────────────────────────────────────────────
 
@@ -73,7 +76,24 @@ export default function ColorPicker({ color, opacity, onChange, onClose, anchorR
   const allowGradient = !!onFillChange;
   const fillIsGradient = fill?.type === 'linear-gradient' || fill?.type === 'radial-gradient';
 
-  const [mode, setMode] = useState<'solid' | 'gradient'>(fillIsGradient ? 'gradient' : 'solid');
+  const fillIsImage = fill?.type === 'image';
+  const [mode, setMode] = useState<'solid' | 'gradient' | 'image'>(
+    fillIsImage ? 'image' : fillIsGradient ? 'gradient' : 'solid');
+  const imageInputRef = useRef<HTMLInputElement>(null);
+  const { activePage, setFile } = useDesignStore();
+
+  // Import a file, store it on the document, and switch this paint to an image fill.
+  const chooseImage = async (files: File[]) => {
+    const page = activePage();
+    if (!page || files.length === 0 || !onFillChange) return;
+    const [img] = await importImageFiles(files);
+    if (!img) return;
+    const imageId = `img-${Math.random().toString(36).slice(2, 10)}`;
+    const res = await api.applyChanges({ pageId: page.id, ops: [{ op: 'setImage', id: imageId, dataUrl: img.dataUrl }] });
+    if (res.ok && res.data) setFile(res.data);
+    setMode('image');
+    onFillChange({ type: 'image', imageId, scaleMode: 'fill', opacity: fill?.opacity ?? 1 });
+  };
   const [gradType, setGradType] = useState<'linear-gradient' | 'radial-gradient'>(
     fill?.type === 'radial-gradient' ? 'radial-gradient' : 'linear-gradient',
   );
@@ -316,6 +336,31 @@ export default function ColorPicker({ color, opacity, onChange, onClose, anchorR
           <button title="Gradient" style={modeBtnStyle(mode === 'gradient')} onClick={switchToGradient}>
             <span style={{ ...styles.modeSwatch, background: 'linear-gradient(135deg,#fff,#000)' }} />
           </button>
+          <button title="Image" style={modeBtnStyle(mode === 'image')} onClick={() => imageInputRef.current?.click()}>
+            <span style={{ ...styles.modeSwatch, background: 'repeating-conic-gradient(#bbb 0% 25%, #fff 0% 50%) 50% / 8px 8px' }} />
+          </button>
+          <input
+            ref={imageInputRef} type="file" accept={IMAGE_ACCEPT_ATTR} style={{ display: 'none' }}
+            onChange={e => { const files = Array.from(e.target.files ?? []); e.target.value = ''; void chooseImage(files); }}
+          />
+        </div>
+      )}
+
+      {/* Image paint: how the picture is fitted to the layer's box. */}
+      {mode === 'image' && fill?.type === 'image' && (
+        <div style={{ padding: '8px 10px 0' }}>
+          <select
+            style={styles.gradTypeSelect}
+            value={fill.scaleMode}
+            onChange={e => onFillChange?.({ ...fill, scaleMode: e.target.value as typeof fill.scaleMode })}
+          >
+            <option value="fill">Fill</option>
+            <option value="fit">Fit</option>
+            <option value="stretch">Stretch</option>
+            <option value="tile">Tile</option>
+          </select>
+          <button style={{ ...styles.gradTypeSelect, marginTop: 6, cursor: 'pointer' }}
+            onClick={() => imageInputRef.current?.click()}>Replace image…</button>
         </div>
       )}
 

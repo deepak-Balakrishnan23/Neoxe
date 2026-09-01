@@ -181,6 +181,10 @@ export async function saveExportFile(opts: {
   extension: string;          // 'svg' | 'png' | 'jpg' | 'pdf'
   description: string;
   mime: string;
+  // Skip the save dialog and download straight to the browser's download folder. A batch
+  // export needs this: only the first picker call has transient activation, so the rest
+  // would throw.
+  forceDownload?: boolean;
 }): Promise<ExportResult> {
   const { text, blob, dataUrl, extension, description, mime } = opts;
   const extNoDot = extension.replace(/^\./, '');
@@ -192,7 +196,7 @@ export async function saveExportFile(opts: {
   // first await after the click — otherwise transient activation is lost and it throws.
   const payload: string | Blob = text != null ? text : (blob ?? (dataUrl ? dataUrlToBlob(dataUrl, mime) : ''));
 
-  if (win.showSaveFilePicker) {
+  if (win.showSaveFilePicker && !opts.forceDownload) {
     try {
       const handle = await win.showSaveFilePicker({
         suggestedName,

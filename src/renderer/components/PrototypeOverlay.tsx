@@ -102,7 +102,9 @@ export default function PrototypeOverlay({ viewport }: { viewport: Viewport }) {
       const s = page.objects[id];
       if (!s) return;
       for (const it of (s.interactions ?? [])) {
-        if (it.action === 'navigate' && it.targetFrameId && page.objects[it.targetFrameId]) out.push({ source: s, it });
+        // Overlays are connections too — Figma draws a cable for those as well.
+        const connects = it.action === 'navigate' || it.action === 'overlay' || it.action === 'swap-overlay';
+        if (connects && it.targetFrameId && page.objects[it.targetFrameId]) out.push({ source: s, it });
       }
       s.childIds.forEach(walk);
     };
@@ -168,7 +170,7 @@ export default function PrototypeOverlay({ viewport }: { viewport: Viewport }) {
       if (!src) return;
       const next: Interaction[] = [
         ...(src.interactions ?? []),
-        { id: genId(), trigger: 'click', action: 'navigate', targetFrameId: target.id, transition: 'dissolve' },
+        { id: genId(), trigger: 'click', action: 'navigate', targetFrameId: target.id, transition: 'dissolve', duration: 300, easing: 'ease-out' },
       ];
       const res = await api.applyChanges({ pageId: page.id, ops: [{ op: 'set', id: src.id, attr: 'interactions', val: next }] });
       if (res.ok && res.data) setFile(res.data);

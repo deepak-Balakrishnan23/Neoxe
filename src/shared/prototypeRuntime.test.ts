@@ -235,3 +235,187 @@ describe('exported prototype runtime — live navigation (jsdom)', () => {
     expect(html).toContain('body.comment-mode .comment-layer { pointer-events:auto;');
   });
 });
+
+// ── Triggers, overlays, scrolling ─────────────────────────────────────────────
+// Everything below drives the exported runtime the way a viewer would: real events on
+// real elements, asserting what the screen actually does.
+
+/** Two frames, with `interactions` attached to the FIRST frame itself. */
+function twoFrames(interactions: Shape['interactions']): { file: DesignFile; page: Page } {
+  const a = frame('f0', 'Home', 0);
+  const b = frame('f1', 'Detail', 500);
+  a.interactions = interactions;
+  const page: Page = { id: 'p1', name: 'Page 1', background: '#fff', childIds: ['f0', 'f1'], objects: { f0: a, f1: b } };
+  const file: DesignFile = {
+    id: 'fx', name: 'Test', version: 1, pages: [page], activePageId: 'p1',
+    images: {}, components: {}, colors: [], typographies: [], tokens: [], themes: [], activeThemeId: 'default',
+    prototypeStartFrameId: 'f0',
+  };
+  return { file, page };
+}
+
+const activeId = () => (document.querySelector('.screen.active') as HTMLElement | null)?.id;
+
+describe('exported prototype runtime — triggers', () => {
+  beforeEach(() => { document.body.innerHTML = ''; });
+
+  it('a key trigger navigates when its key is pressed, and ignores other keys', () => {
+    const { file, page } = twoFrames([
+      { id: 'k', trigger: 'key', action: 'navigate', targetFrameId: 'f1', transition: 'none', keyCode: 'Enter' },
+    ]);
+    mount(generatePrototypeHtml(file, page));
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'x', bubbles: true }));
+    expect(activeId()).toBe('screen-f0');
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+    expect(activeId()).toBe('screen-f1');
+  });
+
+  it('an after-delay trigger fires once the screen has been up for its delay', async () => {
+    const { file, page } = twoFrames([
+      { id: 'd', trigger: 'after-delay', action: 'navigate', targetFrameId: 'f1', transition: 'none', delay: 20 },
+    ]);
+    mount(generatePrototypeHtml(file, page));
+    expect(activeId()).toBe('screen-f0');
+    await new Promise(r => setTimeout(r, 60));
+    expect(activeId()).toBe('screen-f1');
+  });
+
+  it('mouse-enter and mouse-leave fire on their own events', () => {
+    const { file, page } = twoFrames([
+      { id: 'm', trigger: 'mouse-enter', action: 'navigate', targetFrameId: 'f1', transition: 'none' },
+    ]);
+    mount(generatePrototypeHtml(file, page));
+    const hs = document.querySelector('#screen-f0 .hotspot') as HTMLElement;
+    hs.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
+    expect(activeId()).toBe('screen-f1');
+  });
+
+  it('"while hovering" reverts when the pointer leaves', () => {
+    const { file, page } = twoFrames([
+      { id: 'h', trigger: 'hover', action: 'navigate', targetFrameId: 'f1', transition: 'none' },
+    ]);
+    mount(generatePrototypeHtml(file, page));
+    const hs = document.querySelector('#screen-f0 .hotspot') as HTMLElement;
+    hs.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
+    expect(activeId()).toBe('screen-f1');
+    hs.dispatchEvent(new MouseEvent('mouseout', { bubbles: true }));
+    expect(activeId()).toBe('screen-f0');
+  });
+
+  it('a drag trigger waits for real movement rather than firing on press', () => {
+    const { file, page } = twoFrames([
+      { id: 'g', trigger: 'drag', action: 'navigate', targetFrameId: 'f1', transition: 'none' },
+    ]);
+    mount(generatePrototypeHtml(file, page));
+    const hs = document.querySelector('#screen-f0 .hotspot') as HTMLElement;
+    hs.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, clientX: 100, clientY: 100 }));
+    document.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: 103, clientY: 100 }));
+    expect(activeId()).toBe('screen-f0');   // 3px is a click, not a drag
+    document.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: 160, clientY: 100 }));
+    expect(activeId()).toBe('screen-f1');
+  });
+});
+
+describe('exported prototype runtime — overlays', () => {
+  beforeEach(() => { document.body.innerHTML = ''; });
+
+  it('opens an overlay over the current screen and closes it again', () => {
+    const { file, page } = twoFrames([
+      { id: 'o', trigger: 'click', action: 'overlay', targetFrameId: 'f1', transition: 'none',
+        overlay: { position: 'center', background: 'dim', closeOnClickOutside: true } },
+    ]);
+    mount(generatePrototypeHtml(file, page));
+    (document.querySelector('#screen-f0 .hotspot') as HTMLElement).click();
+
+    // The screen underneath stays current — an overlay is not a navigation.
+    expect(activeId()).toBe('screen-f0');
+    expect(document.querySelectorAll('#screen-f0 .ov-item').length).toBe(1);
+    expect(document.querySelectorAll('#screen-f0 .ov-backdrop').length).toBe(1);
+
+    (document.querySelector('.ov-backdrop') as HTMLElement).click();
+    expect(document.querySelectorAll('.ov-item').length).toBe(0);
+  });
+
+  it('honours "no dim" and "do not close on click outside"', () => {
+    const { file, page } = twoFrames([
+      { id: 'o', trigger: 'click', action: 'overlay', targetFrameId: 'f1', transition: 'none',
+        overlay: { position: 'top-right', background: 'none', closeOnClickOutside: false } },
+    ]);
+    mount(generatePrototypeHtml(file, page));
+    (document.querySelector('#screen-f0 .hotspot') as HTMLElement).click();
+    expect(document.querySelectorAll('.ov-backdrop').length).toBe(0);
+    const item = document.querySelector('.ov-item') as HTMLElement;
+    expect(item.style.top).toBe('0px');
+    expect(item.style.right).toBe('0px');
+  });
+
+  it('navigating away clears any open overlay', () => {
+    const { file, page } = twoFrames([
+      { id: 'o', trigger: 'click', action: 'overlay', targetFrameId: 'f1', transition: 'none' },
+      { id: 'k', trigger: 'key', action: 'navigate', targetFrameId: 'f1', transition: 'none', keyCode: 'Enter' },
+    ]);
+    mount(generatePrototypeHtml(file, page));
+    (document.querySelector('#screen-f0 .hotspot') as HTMLElement).click();
+    expect(document.querySelectorAll('.ov-item').length).toBe(1);
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+    expect(activeId()).toBe('screen-f1');
+    expect(document.querySelectorAll('.ov-item').length).toBe(0);
+  });
+});
+
+describe('exported prototype — scrolling and timing attributes', () => {
+  beforeEach(() => { document.body.innerHTML = ''; });
+
+  it('a scrolling frame gets a scroller sized to its content, with pinned layers lifted out', () => {
+    const f = frame('f0', 'Home', 0);
+    f.scrollBehavior = 'vertical';
+    const tall = makeDefaultShape({ id: 'tall', type: 'rect', name: 'Body', frameId: 'f0', parentId: 'f0',
+      x: 0, y: 0, width: 400, height: 900, selrect: { x: 0, y: 0, width: 400, height: 900 } });
+    const bar = makeDefaultShape({ id: 'bar', type: 'rect', name: 'Nav', frameId: 'f0', parentId: 'f0',
+      x: 0, y: 0, width: 400, height: 60, selrect: { x: 0, y: 0, width: 400, height: 60 } });
+    bar.scrollPosition = 'fixed';
+    f.childIds = ['tall', 'bar'];
+    const page: Page = { id: 'p1', name: 'P', background: '#fff', childIds: ['f0'], objects: { f0: f, tall, bar } };
+    const file: DesignFile = { id: 'fz', name: 'T', version: 1, pages: [page], activePageId: 'p1',
+      images: {}, components: {}, colors: [], typographies: [], tokens: [], themes: [], activeThemeId: 'default',
+      prototypeStartFrameId: 'f0' };
+
+    const html = generatePrototypeHtml(file, page);
+    expect(html).toContain('overflow:hidden auto');
+    expect(html).toContain('height:900px');
+    // The pinned bar is drawn in its own layer, not inside the scrolling body.
+    document.body.innerHTML = html.match(/<body>([\s\S]*?)<script>/)![1];
+    expect(document.querySelectorAll('.fixed-layer [data-layer="Nav"]').length).toBe(1);
+    expect(document.querySelectorAll('.scroll-content [data-layer="Nav"]').length).toBe(0);
+    expect(document.querySelectorAll('.scroll-content [data-layer="Body"]').length).toBe(1);
+  });
+
+  it('carries each interaction\'s own duration and easing into the markup', () => {
+    const { file, page } = twoFrames([
+      { id: 'n', trigger: 'click', action: 'navigate', targetFrameId: 'f1',
+        transition: 'push-left', duration: 640, easing: 'ease-in-out' },
+    ]);
+    const html = generatePrototypeHtml(file, page);
+    expect(html).toContain('data-transition="push-left"');
+    expect(html).toContain('data-duration="640"');
+    expect(html).toContain('data-easing="ease-in-out"');
+  });
+
+  it('drops a scroll-to whose target has been deleted, and keeps a valid one', () => {
+    const { file, page } = twoFrames([
+      { id: 's', trigger: 'click', action: 'scroll-to', transition: 'none', scrollTargetId: 'ghost' },
+    ]);
+    expect(generatePrototypeHtml(file, page)).not.toContain('data-action="scroll-to"');
+
+    const target = makeDefaultShape({ id: 'sec', type: 'rect', name: 'Section', frameId: 'f0', parentId: 'f0',
+      x: 0, y: 700, width: 400, height: 100, selrect: { x: 0, y: 700, width: 400, height: 100 } });
+    page.objects['sec'] = target;
+    page.objects['f0'].childIds = ['sec'];
+    page.objects['f0'].interactions = [
+      { id: 's', trigger: 'click', action: 'scroll-to', transition: 'none', scrollTargetId: 'sec' },
+    ];
+    const html = generatePrototypeHtml(file, page);
+    expect(html).toContain('data-action="scroll-to"');
+    expect(html).toContain('data-scroll-y="700"');
+  });
+});

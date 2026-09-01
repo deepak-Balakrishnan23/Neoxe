@@ -129,3 +129,108 @@ describe('CSS inspect output is parent-relative (Figma handoff model)', () => {
     expect(props['top']).toBe('0px');
   });
 });
+
+describe('codegen — path placement', () => {
+  it('places a path by its origin, since its content is shape-local', () => {
+    const path = makeDefaultShape({
+      id: 'p1', type: 'path', name: 'Vector', frameId: 'p1', parentId: null,
+      x: 40, y: 25, width: 10, height: 10, selrect: { x: 40, y: 25, width: 10, height: 10 },
+      content: [{ verb: 'M', coords: [0, 0] }, { verb: 'L', coords: [10, 10] }],
+    });
+    const page: Page = { id: 'p', name: 'P', background: '#fff', childIds: ['p1'], objects: { p1: path } };
+    const svg = pageToSvg(page);
+    expect(svg).toContain('translate(40 25)');
+    expect(svg).toContain('d="M0 0 L10 10"');
+  });
+
+  it('exports a boolean group\'s operands rather than an empty path', () => {
+    const bool = makeDefaultShape({
+      id: 'b', type: 'bool', name: 'Subtract', frameId: 'b', parentId: null,
+      x: 0, y: 0, width: 50, height: 50, selrect: { x: 0, y: 0, width: 50, height: 50 },
+      boolType: 'difference', childIds: ['k'],
+    });
+    const kid = makeDefaultShape({
+      id: 'k', type: 'rect', name: 'Box', frameId: 'b', parentId: 'b',
+      x: 0, y: 0, width: 20, height: 20, selrect: { x: 0, y: 0, width: 20, height: 20 },
+    });
+    const page: Page = { id: 'p', name: 'P', background: '#fff', childIds: ['b'], objects: { b: bool, k: kid } };
+    const svg = pageToSvg(page);
+    expect(svg).toContain('<rect');
+    expect(svg).not.toContain('d=""');
+  });
+});
+
+describe('codegen — boolean groups and masks', () => {
+  function boolScene() {
+    const bool = makeDefaultShape({
+      id: 'b', type: 'bool', name: 'Subtract', frameId: 'b', parentId: null,
+      x: 0, y: 0, width: 100, height: 100, selrect: { x: 0, y: 0, width: 100, height: 100 },
+      boolType: 'difference', childIds: ['sq', 'circ'],
+      content: [{ verb: 'M', coords: [0, 0] }, { verb: 'L', coords: [100, 0] }, { verb: 'Z', coords: [] }],
+    });
+    const sq = makeDefaultShape({ id: 'sq', type: 'rect', name: 'sq', frameId: 'b', parentId: 'b',
+      x: 0, y: 0, width: 100, height: 100, selrect: { x: 0, y: 0, width: 100, height: 100 } });
+    const circ = makeDefaultShape({ id: 'circ', type: 'circle', name: 'circ', frameId: 'b', parentId: 'b',
+      x: 50, y: 50, width: 100, height: 100, selrect: { x: 50, y: 50, width: 100, height: 100 } });
+    const page: Page = { id: 'p', name: 'P', background: '#fff', childIds: ['b'], objects: { b: bool, sq, circ } };
+    return page;
+  }
+
+  it('exports the computed outline instead of the operands', () => {
+    const svg = pageToSvg(boolScene());
+    expect(svg).toContain('<path');
+    // The operands must not also be drawn — they would cover the subtraction.
+    expect(svg).not.toContain('<ellipse');
+    expect(svg.match(/<rect/g) ?? []).toHaveLength(0);
+  });
+
+  it('exports a mask layer as an SVG mask rather than drawing it flat', () => {
+    const maskShape = makeDefaultShape({ id: 'm', type: 'circle', name: 'Mask', frameId: 'f', parentId: 'f',
+      x: 0, y: 0, width: 50, height: 50, selrect: { x: 0, y: 0, width: 50, height: 50 }, isMask: true });
+    const covered = makeDefaultShape({ id: 'c', type: 'rect', name: 'Covered', frameId: 'f', parentId: 'f',
+      x: 0, y: 0, width: 200, height: 200, selrect: { x: 0, y: 0, width: 200, height: 200 } });
+    const frame = makeDefaultShape({ id: 'f', type: 'frame', name: 'F', frameId: 'f', parentId: null,
+      x: 0, y: 0, width: 200, height: 200, selrect: { x: 0, y: 0, width: 200, height: 200 }, childIds: ['m', 'c'] });
+    const page: Page = { id: 'p', name: 'P', background: '#fff', childIds: ['f'], objects: { f: frame, m: maskShape, c: covered } };
+    const svg = frameToSvg(frame, page);
+    expect(svg).toContain('<mask id="mask-m"');
+    expect(svg).toContain('mask="url(#mask-m)"');
+  });
+});
+
+describe('codegen — image paints', () => {
+  function imagePaintPage(scaleMode: 'fill' | 'fit' | 'stretch' | 'tile') {
+    const rect = makeDefaultShape({
+      id: 'r', type: 'rect', name: 'Card', frameId: 'r', parentId: null,
+      x: 10, y: 20, width: 200, height: 100, selrect: { x: 10, y: 20, width: 200, height: 100 },
+      fills: [{ type: 'image', imageId: 'i1', scaleMode, opacity: 1 }],
+    });
+    const page: Page = { id: 'p', name: 'P', background: '#fff', childIds: ['r'], objects: { r: rect } };
+    return page;
+  }
+
+  it('emits an image paint as a pattern holding the embedded picture', () => {
+    const svg = pageToSvg(imagePaintPage('fill'), { i1: PNG });
+    expect(svg).toContain('<pattern id="paint-r"');
+    expect(svg).toContain(`href="${PNG}"`);
+    expect(svg).toContain('fill="url(#paint-r)"');
+  });
+
+  it('maps each scale mode onto preserveAspectRatio', () => {
+    expect(pageToSvg(imagePaintPage('fit'), { i1: PNG })).toContain('preserveAspectRatio="xMidYMid meet"');
+    expect(pageToSvg(imagePaintPage('stretch'), { i1: PNG })).toContain('preserveAspectRatio="none"');
+    expect(pageToSvg(imagePaintPage('fill'), { i1: PNG })).toContain('preserveAspectRatio="xMidYMid slice"');
+  });
+
+  it('falls back to no fill when the image is missing from the export', () => {
+    const svg = pageToSvg(imagePaintPage('fill'));
+    expect(svg).toContain('fill="none"');
+    expect(svg).not.toContain('<pattern');
+  });
+
+  it('carries corner radius onto the exported rect', () => {
+    const page = imagePaintPage('fill');
+    page.objects['r'].cornerRadii = { tl: 12, tr: 12, br: 12, bl: 12 };
+    expect(pageToSvg(page, { i1: PNG })).toContain('rx="12"');
+  });
+});

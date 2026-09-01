@@ -47,7 +47,19 @@ export type RadialGradientFill = {
   opacity: number;
 };
 
-export type Fill = SolidFill | LinearGradientFill | RadialGradientFill;
+// An image used as paint. `imageId` keys into DesignFile.images, the same store the
+// image SHAPE type uses, so a photo can be dropped on any shape without changing its type.
+export type ImageFill = {
+  type: 'image';
+  imageId: string;
+  // How the image is fitted to the box — the four modes Figma offers.
+  scaleMode: 'fill' | 'fit' | 'stretch' | 'tile';
+  // 'tile' only: the tile's size relative to the image's natural size.
+  tileScale?: number;
+  opacity: number;
+};
+
+export type Fill = SolidFill | LinearGradientFill | RadialGradientFill | ImageFill;
 
 // Stroke
 export type StrokeAlign = 'inner' | 'outer' | 'center';
@@ -158,6 +170,36 @@ export interface ComponentEntry {
   name: string;
   pageId: string;
   shapeId: string;   // ID of the master shape
+  // Set when this component is one variant inside a component set.
+  setId?: string;
+  // Component properties exposed on every instance of this component.
+  props?: ComponentPropDef[];
+}
+
+// A property an instance can set without detaching. `boolean` shows/hides the layers
+// bound to it; `text` replaces their text content.
+export interface ComponentPropDef {
+  id: string;
+  name: string;
+  type: 'boolean' | 'text';
+  defaultValue: string | boolean;
+}
+
+// Which component property drives which aspect of a layer inside the master.
+export interface PropBindings {
+  visible?: string;    // ComponentPropDef id (boolean)
+  characters?: string; // ComponentPropDef id (text)
+}
+
+// A set of components that differ only by their variant property values — Figma's
+// component set. `properties` fixes the property order and the values each one offers;
+// `variants` says which combination each component implements.
+export interface ComponentSetEntry {
+  id: string;
+  name: string;
+  properties: Record<string, string[]>;
+  variants: Record<string, Record<string, string>>;
+  defaultComponentId: string;
 }
 
 export interface ColorEntry {
@@ -171,6 +213,22 @@ export interface TypographyEntry {
   id: string;
   name: string;
   style: Partial<TextStyle>;
+}
+
+// A named effect stack (Figma's effect styles) — shadows plus the single blur a shape
+// can carry, saved together so a card elevation can be reused and updated in one place.
+export interface EffectEntry {
+  id: string;
+  name: string;
+  shadows: Shadow[];
+  blur: BlurEffect | null;
+}
+
+// A named set of layout grids (Figma's grid styles), applied to a frame as a unit.
+export interface GridStyleEntry {
+  id: string;
+  name: string;
+  grids: LayoutGrid[];
 }
 
 // ── W3C Design Tokens ─────────────────────────────────────────────────────────
@@ -203,17 +261,119 @@ export type TokenBindings = Record<string, string>; // bindingKey → tokenName
 
 // ── Prototyping interactions ──────────────────────────────────────────────────
 
-export type InteractionTrigger = 'click' | 'hover';
-export type InteractionAction = 'navigate' | 'back' | 'overlay' | 'close-overlay' | 'url';
-export type Transition = 'none' | 'dissolve' | 'slide-left' | 'slide-right' | 'slide-up' | 'smart';
+// Figma's trigger list. 'hover' and 'press' are the two that REVERT when the pointer
+// leaves or the button is released; the mouse-* ones fire once.
+export type InteractionTrigger =
+  | 'click' | 'drag' | 'hover' | 'press' | 'key'
+  | 'mouse-enter' | 'mouse-leave' | 'mouse-down' | 'mouse-up'
+  | 'after-delay';
+
+export type InteractionAction =
+  | 'navigate' | 'back' | 'overlay' | 'swap-overlay' | 'close-overlay'
+  | 'url' | 'scroll-to' | 'none';
+
+export type Transition =
+  | 'none' | 'dissolve' | 'smart'
+  | 'slide-left' | 'slide-right' | 'slide-up' | 'slide-down'
+  | 'push-left' | 'push-right' | 'push-up' | 'push-down'
+  | 'move-in-left' | 'move-in-right' | 'move-in-up' | 'move-in-down'
+  | 'move-out-left' | 'move-out-right' | 'move-out-up' | 'move-out-down';
+
+export type Easing = 'linear' | 'ease-in' | 'ease-out' | 'ease-in-out' | 'ease-out-back';
+
+// Where an overlay sits over the screen beneath it.
+export type OverlayPosition =
+  | 'center' | 'top-left' | 'top-center' | 'top-right'
+  | 'bottom-left' | 'bottom-center' | 'bottom-right' | 'manual';
+
+export interface OverlaySettings {
+  position: OverlayPosition;
+  // 'manual' only — offset from the screen's top-left, in frame coordinates.
+  x?: number;
+  y?: number;
+  // Dim the screen behind the overlay.
+  background: 'none' | 'dim';
+  closeOnClickOutside: boolean;
+}
 
 export interface Interaction {
   id: string;
   trigger: InteractionTrigger;
   action: InteractionAction;
-  targetFrameId?: string; // navigate / overlay
+  targetFrameId?: string; // navigate / overlay / swap-overlay
   url?: string;           // url action
   transition: Transition;
+  // Animation timing. Defaults: 300ms, ease-out.
+  duration?: number;      // ms
+  easing?: Easing;
+  // 'after-delay' trigger: how long after the screen appears, in ms.
+  delay?: number;
+  // 'key' trigger: the KeyboardEvent.key to match, e.g. 'Enter' or 'ArrowRight'.
+  keyCode?: string;
+  // overlay / swap-overlay
+  overlay?: OverlaySettings;
+  // 'scroll-to': the layer to bring into view on the current screen.
+  scrollTargetId?: string;
+}
+
+export function makeDefaultOverlaySettings(): OverlaySettings {
+  return { position: 'center', background: 'dim', closeOnClickOutside: true };
+}
+
+// ── Layout grids ──────────────────────────────────────────────────────────────
+// Figma's frame overlays: a uniform square grid, or column/row tracks. Purely visual —
+// they guide placement (and snapping) and never affect layout or exports.
+
+export type LayoutGridType = 'columns' | 'rows' | 'grid';
+// How the track block sits in the frame. 'stretch' divides the frame minus margins;
+// the others lay fixed-size tracks from the start edge, the end edge, or the centre.
+export type LayoutGridAlign = 'min' | 'max' | 'center' | 'stretch';
+
+export interface LayoutGrid {
+  id: string;
+  type: LayoutGridType;
+  visible: boolean;
+  color: string;    // hex
+  opacity: number;  // 0–1
+  size: number;         // 'grid': cell size in px
+  count: number;        // columns/rows: number of tracks
+  gutter: number;       // gap between tracks
+  offset: number;       // distance from the start ('min') or end ('max') edge
+  margin: number;       // 'stretch': inset on both ends
+  sectionSize: number;  // fixed track size when alignment isn't 'stretch'
+  alignment: LayoutGridAlign;
+}
+
+export function makeDefaultLayoutGrid(type: LayoutGridType, id: string): LayoutGrid {
+  return {
+    id, type, visible: true,
+    color: type === 'grid' ? '#000000' : '#FF0000',
+    opacity: 0.1,
+    size: 8, count: 12, gutter: 20, offset: 0, margin: 0,
+    sectionSize: 64, alignment: 'stretch',
+  };
+}
+
+// ── Resize constraints ────────────────────────────────────────────────────────
+// The behaviours live in shared/constraints.ts; the stored setting lives here so Shape
+// stays the single source of truth for document data.
+
+export type ConstraintMode = 'min' | 'max' | 'stretch' | 'center' | 'scale';
+
+export interface Constraints {
+  horizontal: ConstraintMode;
+  vertical: ConstraintMode;
+}
+
+// ── Per-layer export presets ──────────────────────────────────────────────────
+
+export type ExportFormat = 'png' | 'jpeg' | 'webp' | 'svg';
+
+export interface ExportSetting {
+  id: string;
+  format: ExportFormat;
+  scale: number;   // raster only; SVG ignores it
+  suffix: string;  // appended to the layer name, e.g. "@2x" or "-dark"
 }
 
 // ── Padding (shared by Auto Layout) ───────────────────────────────────────────
@@ -320,12 +480,28 @@ export interface Shape {
   // Clip content (frames only — clips children to frame bounds)
   clipContent: boolean;
 
+  // Layout grid overlays (frames only). View-only: never exported, never affects layout.
+  layoutGrids?: LayoutGrid[];
+
   // Figma-style Auto Layout. When `autoLayout` is set on a shape, the autoLayout
   // engine reflows its children on every change. Sizing fields apply to ANY shape
   // (they say how the shape sizes within its parent if the parent is auto-layout).
   autoLayout?: AutoLayoutSettings | null;
   widthMode?: 'hug' | 'fill' | 'fixed';
   heightMode?: 'hug' | 'fill' | 'fixed';
+  // Declared (intrinsic) size on an axis the layout engine resolves for the shape
+  // ('fill'). width/height always hold the RESOLVED size — that's what renders and
+  // hit-tests — so without this the stretched size would overwrite what the user
+  // typed: switching back to Fixed would keep the stretched number, and a hugging
+  // ancestor would measure the stretched child and ratchet itself wider every reflow.
+  // Captured when the engine first stretches an axis, restored (and cleared) when the
+  // axis leaves 'fill' or the user sets the size explicitly.
+  baseWidth?: number;
+  baseHeight?: number;
+  // How this shape responds when its parent is resized (Figma constraints). Unset =
+  // pinned to the left/top edges, Figma's default. Ignored while the auto-layout engine
+  // owns the shape's box; absolute-positioned children still follow it.
+  constraints?: Constraints;
   // Excludes this shape from its auto-layout parent's flow (Figma "Absolute position").
   // The shape keeps its own x/y/size and is not counted in the parent's hug measurement.
   layoutPositioning?: 'auto' | 'absolute';
@@ -341,7 +517,15 @@ export interface Shape {
   // Component system
   componentId?: string;              // set on master shapes
   masterId?: string;                 // set on instances — points to a componentId
+  // Set on every shape inside an instance (root included): the id of the shape it
+  // mirrors in the master's subtree. Master edits find their counterparts through this,
+  // so a component with children stays linked all the way down.
+  masterShapeId?: string;
   overrides?: Record<string, unknown>; // locally-touched properties on instances
+  // Master-side: which component properties drive this layer.
+  propBindings?: PropBindings;
+  // Instance-side (root only): the values chosen for the component's properties.
+  componentProps?: Record<string, string | boolean>;
 
   // Token bindings: property path → token name
   tokenBindings?: TokenBindings;
@@ -349,11 +533,24 @@ export interface Shape {
   // Prototyping interactions (any shape can be a hotspot)
   interactions?: Interaction[];
 
+  // Prototype scrolling. On a FRAME: which axes its content scrolls on. On a child of a
+  // scrolling frame: whether it moves with the content or stays put (Figma's
+  // "Scroll behavior → Position").
+  scrollBehavior?: 'none' | 'vertical' | 'horizontal' | 'both';
+  scrollPosition?: 'scrolls' | 'fixed';
+
+  // Saved export presets for this layer (Figma's per-layer Export list). Each entry
+  // produces one file; `suffix` is appended to the layer name.
+  exportSettings?: ExportSetting[];
+
   // Shape-specific payloads
   content?: PathSegment[];     // type='path' or 'bool'
   paragraphs?: TextParagraph[]; // type='text'
   textStyle?: TextStyle;        // type='text' base style
   textAutoWidth?: boolean;      // type='text': true=grows horizontally (click-created), false=fixed-width (drag-created)
+  // type='text': false pins the box height, so the text clips instead of re-fitting.
+  // Undefined behaves as true (auto height), which is Figma's default for a text box.
+  textAutoHeight?: boolean;
   imageId?: string;             // type='image'
   svgContent?: string;          // type='svg'/'vector': raw SVG markup
   svgInnerHTML?: string;        // type='vector': innerHTML of <svg> (no outer tag) for inline DOM rendering
@@ -361,11 +558,21 @@ export interface Shape {
   svgOriginalHeight?: number;  // viewBox height at import time
   vectorChildren?: VectorChildNode[]; // type='vector': parsed editable SVG tree
   isSVGImport?: boolean;             // type='frame': marks a frame created by SVG import (children are individual svg elements)
+  // Mirrored content (Figma ⇧H / ⇧V). Positions of a container's descendants are
+  // mirrored by the flip command itself; this flag mirrors the shape's OWN drawing.
+  flipH?: boolean;
+  flipV?: boolean;
+  // Text: vertical placement of the text block inside the shape's box.
+  textVerticalAlign?: 'top' | 'middle' | 'bottom';
   aspectRatioLocked?: boolean;  // lock W:H ratio in panel + drag
   lockedAspectRatio?: number;   // width/height at lock time
 
   // Boolop type
   boolType?: 'union' | 'difference' | 'intersection' | 'exclusion'; // type='bool'
+
+  // Figma "Use as mask": this layer clips every later sibling in its parent to its own
+  // alpha. Masking is non-destructive — the masked layers keep their own geometry.
+  isMask?: boolean;
 
   // Computed bounding rect (denormalized for hit-testing — updated after transform)
   selrect: Rect;
@@ -436,8 +643,11 @@ export interface DesignFile {
   // Assets
   images: Record<string, string>;              // id → base64 data-url
   components: Record<string, ComponentEntry>;  // componentId → entry
+  componentSets?: Record<string, ComponentSetEntry>; // setId → variant set
   colors: ColorEntry[];
   typographies: TypographyEntry[];
+  effects?: EffectEntry[];
+  gridStyles?: GridStyleEntry[];
   // Design tokens
   tokens: DesignToken[];
   themes: ThemeSet[];

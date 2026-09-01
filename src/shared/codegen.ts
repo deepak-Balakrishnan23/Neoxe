@@ -29,6 +29,8 @@ function fillToCss(fill: Fill): string {
     const stops = fill.stops.map(s => `${cssColor(s.color, s.opacity)} ${round(s.offset * 100)}%`).join(', ');
     return `radial-gradient(circle, ${stops})`;
   }
+  // Image paints need the data-url, which fillToCss doesn't receive — callers with the
+  // image map handle them (see shapeToCss); here they read as no paint.
   return 'transparent';
 }
 
@@ -58,7 +60,9 @@ export function shapeToCssProps(shape: Shape, page?: Page): Record<string, strin
   // Background
   if (shape.fills.length > 0) {
     const solid = shape.fills.find(f => f.type === 'solid');
-    const grad = shape.fills.find(f => f.type !== 'solid');
+    // Image paints carry no colour — they're emitted as background-image by the HTML
+    // exporter, which has the data-urls. Only gradients belong in `background` here.
+    const grad = shape.fills.find(f => f.type === 'linear-gradient' || f.type === 'radial-gradient');
     if (grad) props['background'] = fillToCss(grad);
     else if (solid) props['background'] = fillToCss(solid);
   }
@@ -167,9 +171,31 @@ function renderSvgShape(shape: Shape, page: Page, images?: Record<string, string
     : '';
   const opacity = shape.opacity < 1 ? ` opacity="${round(shape.opacity, 2)}"` : '';
 
-  const fill = shape.fills.find(f => f.type === 'solid');
-  const fillAttr = fill && fill.type === 'solid' ? ` fill="${fill.color}"` : ' fill="none"';
-  const fillOp = fill && fill.opacity < 1 ? ` fill-opacity="${round(fill.opacity, 2)}"` : '';
+  // An image paint becomes a <pattern> holding the embedded picture; anything else falls
+  // back to the topmost solid fill (SVG has no stacked-paint equivalent).
+  const imageFill = shape.fills.find(f => f.type === 'image');
+  const imageHref = imageFill && imageFill.type === 'image' ? images?.[imageFill.imageId] : undefined;
+  let defs = '';
+  let fillAttr: string;
+  let fillOp = '';
+  if (imageFill && imageFill.type === 'image' && imageHref) {
+    const patternId = `paint-${shape.id}`;
+    // 'fit' letterboxes, 'stretch' distorts, 'fill'/'tile' cover — SVG expresses the first
+    // three directly; 'tile' is approximated as cover, since a tiled pattern would need
+    // the image's natural size, which isn't stored.
+    const aspect = imageFill.scaleMode === 'fit' ? 'xMidYMid meet'
+      : imageFill.scaleMode === 'stretch' ? 'none'
+      : 'xMidYMid slice';
+    defs = `<defs><pattern id="${patternId}" patternUnits="userSpaceOnUse" x="${round(shape.x)}" y="${round(shape.y)}" width="${round(shape.width)}" height="${round(shape.height)}">`
+      + `<image href="${imageHref}" width="${round(shape.width)}" height="${round(shape.height)}" preserveAspectRatio="${aspect}" />`
+      + `</pattern></defs>`;
+    fillAttr = ` fill="url(#${patternId})"`;
+    if (imageFill.opacity < 1) fillOp = ` fill-opacity="${round(imageFill.opacity, 2)}"`;
+  } else {
+    const fill = shape.fills.find(f => f.type === 'solid');
+    fillAttr = fill && fill.type === 'solid' ? ` fill="${fill.color}"` : ' fill="none"';
+    fillOp = fill && fill.opacity < 1 ? ` fill-opacity="${round(fill.opacity, 2)}"` : '';
+  }
 
   const stroke = shape.strokes[0];
   const strokeAttr = stroke ? ` stroke="${stroke.color}" stroke-width="${stroke.width}"` : '';
@@ -178,10 +204,14 @@ function renderSvgShape(shape: Shape, page: Page, images?: Record<string, string
 
   switch (shape.type) {
     case 'rect':
-    case 'frame':
-      return `<rect x="${round(shape.x)}" y="${round(shape.y)}" width="${round(shape.width)}" height="${round(shape.height)}"${common} />`;
+    case 'frame': {
+      const r = shape.cornerRadii;
+      const radius = r && (r.tl || r.tr || r.br || r.bl)
+        ? ` rx="${round(Math.max(r.tl, r.tr, r.br, r.bl))}"` : '';
+      return `${defs}<rect x="${round(shape.x)}" y="${round(shape.y)}" width="${round(shape.width)}" height="${round(shape.height)}"${radius}${common} />`;
+    }
     case 'circle':
-      return `<ellipse cx="${round(shape.x + shape.width / 2)}" cy="${round(shape.y + shape.height / 2)}" rx="${round(shape.width / 2)}" ry="${round(shape.height / 2)}"${common} />`;
+      return `${defs}<ellipse cx="${round(shape.x + shape.width / 2)}" cy="${round(shape.y + shape.height / 2)}" rx="${round(shape.width / 2)}" ry="${round(shape.height / 2)}"${common} />`;
     case 'text': {
       const ts = shape.textStyle;
       const text = (shape.paragraphs ?? []).flatMap(p => p.spans.map(s => s.text)).join('');
@@ -190,10 +220,27 @@ function renderSvgShape(shape: Shape, page: Page, images?: Record<string, string
     }
     case 'path':
     case 'bool': {
+      // Path content is SHAPE-LOCAL (that's how the canvas draws it), while this SVG is in
+      // page coordinates — so the node's origin has to be applied as a transform, after any
+      // rotation (which is already expressed about the absolute centre).
+      const place = `${shape.rotation ? ` transform="rotate(${round(shape.rotation)} ${round(shape.x + shape.width / 2)} ${round(shape.y + shape.height / 2)}) translate(${round(shape.x)} ${round(shape.y)})"` : ` transform="translate(${round(shape.x)} ${round(shape.y)})"`}`;
+      const localCommon = `${fillAttr}${fillOp}${strokeAttr}${opacity}${place}`;
       const d = (shape.content ?? []).map(seg => {
         return seg.verb + seg.coords.map(c => round(c, 1)).join(' ');
       }).join(' ');
-      return `<path d="${d}"${common} />`;
+      if (d) return `${defs}<path d="${d}"${localCommon} />`;
+      // A non-destructive boolean group holds no geometry of its own — its operands are
+      // real children. Emit them so the node doesn't vanish from the export; SVG has no
+      // direct equivalent of the canvas composite, so the result reads as a union.
+      if (shape.type === 'bool') {
+        const kids = shape.childIds
+          .map(id => page.objects[id])
+          .filter((c): c is Shape => !!c && !c.hidden)
+          .map(c => renderSvgShape(c, page, images))
+          .join('');
+        return kids ? `<g${opacity}>${kids}</g>` : '';
+      }
+      return '';
     }
     // Imported SVG / vector group: embed the stored inner markup, scaled from its original
     // viewBox to the node's current box and translated to the node's position.
@@ -248,22 +295,60 @@ export function exportShapeSvg(shape: Shape, page: Page, images?: Record<string,
   return frameToSvg(shape, page, images);
 }
 
+// A boolean group's computed outline stands in for its operands, so exporters must not
+// also emit the children — they'd draw on top and undo the subtraction.
+function exportChildIds(shape: Shape): string[] {
+  if (shape.type === 'bool' && shape.content && shape.content.length > 0) return [];
+  return shape.childIds;
+}
+
+/**
+ * Render a node and its subtree to SVG. Unlike the flat collectors this nests, which is
+ * what lets mask layers become a real `<mask>` rather than being drawn unmasked.
+ */
+function renderNodeSvg(id: string, page: Page, images?: Record<string, string>): string {
+  const shape = page.objects[id];
+  if (!shape || shape.hidden) return '';
+  const self = renderSvgShape(shape, page, images);
+  const kids = renderChildListSvg(exportChildIds(shape), page, images);
+  return kids ? `${self}${kids}` : self;
+}
+
+/**
+ * Render a sibling list, honouring mask layers: a child with `isMask` clips every later
+ * sibling. Emitted as a luminance `<mask>` painted white, which matches an opaque mask
+ * shape; a semi-transparent mask exports as fully opaque.
+ */
+function renderChildListSvg(childIds: string[], page: Page, images?: Record<string, string>): string {
+  let out = '';
+  for (let i = 0; i < childIds.length; i++) {
+    const shape = page.objects[childIds[i]];
+    if (!shape || shape.hidden) continue;
+    if (!shape.isMask) { out += renderNodeSvg(childIds[i], page, images); continue; }
+
+    const masked = childIds.slice(i + 1);
+    if (masked.length === 0) return out;
+    const body = renderChildListSvg(masked, page, images);
+    if (!body) return out;
+    const white = { ...shape, fills: [{ type: 'solid' as const, color: '#ffffff', opacity: 1 }], strokes: [], isMask: false };
+    const maskId = `mask-${shape.id}`;
+    out += `<defs><mask id="${maskId}" maskUnits="userSpaceOnUse">`
+      + `<rect x="${round(shape.x)}" y="${round(shape.y)}" width="${round(shape.width)}" height="${round(shape.height)}" fill="#000000" />`
+      + `${renderSvgShape(white, page, images)}${renderChildListSvg(exportChildIds(white), page, images)}`
+      + `</mask></defs><g mask="url(#${maskId})">${body}</g>`;
+    return out;
+  }
+  return out;
+}
+
 // Render a single frame + its descendants to a self-contained SVG, with the
 // viewBox set to the frame's bounds (coordinates stay absolute/page-space).
 // images: imageId → base64 data-url, embedded inline for portability.
 export function frameToSvg(frame: Shape, page: Page, images?: Record<string, string>): string {
-  const flat: Shape[] = [];
-  const collect = (id: string) => {
-    const s = page.objects[id];
-    if (!s || s.hidden) return;
-    flat.push(s);
-    s.childIds.forEach(collect);
-  };
-  // Frame's own fill draws as the screen background; include it then children
-  flat.push(frame);
-  frame.childIds.forEach(collect);
-
-  const body = flat.map(s => renderSvgShape(s, page, images)).join('\n    ');
+  // Frame's own fill draws as the screen background; then its subtree, nested so masks
+  // and boolean groups export the way they render.
+  const body = renderSvgShape(frame, page, images)
+    + renderChildListSvg(exportChildIds(frame), page, images);
 
   // Emit a FRAME-LOCAL, 0-based SVG: viewBox starts at 0,0 and a single translate group
   // shifts the frame's absolute child coords into frame space. This renders identically in
@@ -316,23 +401,26 @@ function textToHtml(shape: Shape): string {
 function shapeToHtmlEl(s: Shape, page: Page, images: Record<string, string> | undefined, ox: number, oy: number): string {
   const left = round(s.x - ox), top = round(s.y - oy);
   const w = round(s.width), h = round(s.height);
+  // Identity for the prototype runtime: `data-layer` is what Smart Animate matches
+  // between two screens, exactly as Figma matches on layer name.
+  const ident = ` data-id="${escapeXml(s.id)}" data-layer="${escapeXml(s.name)}"`;
 
   // Vector / path / bool → inline SVG positioned over the box (viewBox = page coords).
   if (s.type === 'path' || s.type === 'bool' || s.type === 'vector') {
     const style = `position:absolute;left:${left}px;top:${top}px;width:${w}px;height:${h}px;overflow:visible`;
-    return `<svg style="${style}" viewBox="${round(s.x)} ${round(s.y)} ${w} ${h}">${renderSvgShape(s, page)}</svg>`;
+    return `<svg${ident} style="${style}" viewBox="${round(s.x)} ${round(s.y)} ${w} ${h}">${renderSvgShape(s, page)}</svg>`;
   }
   // Imported SVG markup → embed, scaled into the box.
   if (s.type === 'svg' && (s.svgInnerHTML || s.svgContent)) {
     const style = `position:absolute;left:${left}px;top:${top}px;width:${w}px;height:${h}px`;
     if (s.svgInnerHTML) {
       const vb = s.svgOriginalWidth && s.svgOriginalHeight ? `0 0 ${s.svgOriginalWidth} ${s.svgOriginalHeight}` : `0 0 ${w} ${h}`;
-      return `<svg style="${style}" viewBox="${vb}" preserveAspectRatio="none">${s.svgInnerHTML}</svg>`;
+      return `<svg${ident} style="${style}" viewBox="${vb}" preserveAspectRatio="none">${s.svgInnerHTML}</svg>`;
     }
     // svgContent is RAW imported file text (unlike svgInnerHTML, which was sanitized on
     // import) — sanitize before embedding in the exported/presented HTML or a crafted SVG
     // could run script when the prototype is opened.
-    return `<div style="${style};overflow:hidden">${sanitizeSvgMarkup(s.svgContent!)}</div>`;
+    return `<div${ident} style="${style};overflow:hidden">${sanitizeSvgMarkup(s.svgContent!)}</div>`;
   }
 
   const props = shapeToCssProps(s);
@@ -361,17 +449,29 @@ function shapeToHtmlEl(s: Shape, page: Page, images: Record<string, string> | un
   if (cr && s.type !== 'circle') props['border-radius'] = cr;
   if (s.clipContent) props['overflow'] = 'hidden';
 
+  // An image PAINT on any shape (Figma's image fill) — same treatment as an image node.
+  const imgPaint = s.fills.find(f => f.type === 'image');
+  if (imgPaint && imgPaint.type === 'image' && images?.[imgPaint.imageId]) {
+    props['background-image'] = `url(${images[imgPaint.imageId]})`;
+    props['background-size'] = imgPaint.scaleMode === 'fit' ? 'contain'
+      : imgPaint.scaleMode === 'stretch' ? '100% 100%'
+      : imgPaint.scaleMode === 'tile' ? 'auto'
+      : 'cover';
+    props['background-position'] = 'center';
+    props['background-repeat'] = imgPaint.scaleMode === 'tile' ? 'repeat' : 'no-repeat';
+    return `<div${ident} style="${propsToInline(props)}"></div>`;
+  }
   if (s.type === 'image' && s.imageId && images?.[s.imageId]) {
     props['background-image'] = `url(${images[s.imageId]})`;
     props['background-size'] = '100% 100%';
     props['background-repeat'] = 'no-repeat';
-    return `<div style="${propsToInline(props)}"></div>`;
+    return `<div${ident} style="${propsToInline(props)}"></div>`;
   }
   if (s.type === 'text') {
-    return `<div style="${propsToInline(props)}">${textToHtml(s)}</div>`;
+    return `<div${ident} style="${propsToInline(props)}">${textToHtml(s)}</div>`;
   }
   // rect / frame / group / circle / fallback
-  return `<div style="${propsToInline(props)}"></div>`;
+  return `<div${ident} style="${propsToInline(props)}"></div>`;
 }
 
 export function frameToHtml(frame: Shape, page: Page, images?: Record<string, string>): string {
@@ -384,10 +484,10 @@ export function frameToHtml(frame: Shape, page: Page, images?: Record<string, st
     if (!s || s.hidden) return;
     seen.add(id);
     flat.push(s);
-    s.childIds.forEach(collect);
+    exportChildIds(s).forEach(collect);
   };
   flat.push(frame); seen.add(frame.id);   // frame fill = screen backdrop
-  frame.childIds.forEach(collect);
+  exportChildIds(frame).forEach(collect);
 
   // Adopt loose top-level shapes that visually sit inside this frame. A shape can look
   // like it's "in" a frame while actually being a page-level sibling (drawn before the
@@ -419,13 +519,15 @@ export function pageToSvg(page: Page, images?: Record<string, string>): string {
     minX = Math.min(minX, s.selrect.x); minY = Math.min(minY, s.selrect.y);
     maxX = Math.max(maxX, s.selrect.x + s.selrect.width);
     maxY = Math.max(maxY, s.selrect.y + s.selrect.height);
-    s.childIds.forEach(collect);
+    exportChildIds(s).forEach(collect);
   };
   page.childIds.forEach(collect);
   if (!isFinite(minX)) { minX = 0; minY = 0; maxX = 100; maxY = 100; }
 
   const w = maxX - minX, h = maxY - minY;
-  const body = flat.map(s => renderSvgShape(s, page, images)).join('\n    ');
+  // `flat` measures the bounds; the markup itself is rendered nested so masks and
+  // boolean groups export the way they render.
+  const body = renderChildListSvg(page.childIds, page, images);
   // 0-based viewBox + translate group (see frameToSvg) so the file round-trips on re-import.
   return `<svg xmlns="http://www.w3.org/2000/svg" width="${round(w)}" height="${round(h)}" viewBox="0 0 ${round(w)} ${round(h)}">\n  <g transform="translate(${round(-minX)} ${round(-minY)})">\n    ${body}\n  </g>\n</svg>`;
 }

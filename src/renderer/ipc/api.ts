@@ -1,4 +1,4 @@
-import { DesignFile, ChangeSet, IPCResponse, TokenType, DesignToken } from '../../shared/types';
+import { DesignFile, ChangeSet, IPCResponse, TokenType, DesignToken, ComponentPropDef, Shadow, BlurEffect, LayoutGrid } from '../../shared/types';
 import { makeEmptyFile } from '../../shared/sampleFile';
 import { DocumentEngine, EngineSession } from '../mockEngine';
 
@@ -47,6 +47,18 @@ const compMock = {
   },
   detachInstance: async (shapeId: string, pageId: string): Promise<IPCResponse<DesignFile>> => {
     const f = engine.detachInstance(shapeId, pageId);
+    return f ? { ok: true, data: f } : { ok: false, error: 'failed' };
+  },
+  setComponentProps: async (componentId: string, props: ComponentPropDef[]): Promise<IPCResponse<DesignFile>> => {
+    const f = engine.setComponentProps(componentId, props);
+    return f ? { ok: true, data: f } : { ok: false, error: 'failed' };
+  },
+  combineAsVariants: async (shapeIds: string[], pageId: string, propName?: string): Promise<IPCResponse<DesignFile>> => {
+    const f = engine.combineAsVariants(shapeIds, pageId, propName);
+    return f ? { ok: true, data: f } : { ok: false, error: 'failed' };
+  },
+  setInstanceVariant: async (shapeId: string, pageId: string, props: Record<string, string>): Promise<IPCResponse<DesignFile>> => {
+    const f = engine.setInstanceVariant(shapeId, pageId, props);
     return f ? { ok: true, data: f } : { ok: false, error: 'failed' };
   },
   resetOverrides: async (shapeId: string, pageId: string): Promise<IPCResponse<DesignFile>> => {
@@ -151,12 +163,32 @@ export const api = {
   createInstance: (componentId: string, pageId: string, x: number, y: number) => compMock.createInstance(componentId, pageId, x, y),
   detachInstance: (shapeId: string, pageId: string) => compMock.detachInstance(shapeId, pageId),
   resetOverrides: (shapeId: string, pageId: string) => compMock.resetOverrides(shapeId, pageId),
+  setComponentProps: (componentId: string, props: ComponentPropDef[]) => compMock.setComponentProps(componentId, props),
+  combineAsVariants: (shapeIds: string[], pageId: string, propName?: string) => compMock.combineAsVariants(shapeIds, pageId, propName),
+  setInstanceVariant: (shapeId: string, pageId: string, props: Record<string, string>) => compMock.setInstanceVariant(shapeId, pageId, props),
   addColor: (name: string, color: string, opacity: number) => compMock.addColor(name, color, opacity),
   updateColor: (id: string, patch: { name?: string; color?: string; opacity?: number }) => compMock.updateColor(id, patch),
   deleteColor: (id: string) => compMock.deleteColor(id),
   addTypography: (name: string, style: Record<string, unknown>) => compMock.addTypography(name, style),
   deleteTypography: (id: string) => compMock.deleteTypography(id),
   // Design tokens
+  // Effect & grid styles
+  addEffectStyle: async (name: string, shadows: Shadow[], blur: BlurEffect | null): Promise<IPCResponse<DesignFile>> => {
+    const f = engine.addEffectStyle(name, shadows, blur);
+    return f ? { ok: true, data: f } : { ok: false, error: 'failed' };
+  },
+  deleteEffectStyle: async (id: string): Promise<IPCResponse<DesignFile>> => {
+    const f = engine.deleteEffectStyle(id);
+    return f ? { ok: true, data: f } : { ok: false, error: 'failed' };
+  },
+  addGridStyle: async (name: string, grids: LayoutGrid[]): Promise<IPCResponse<DesignFile>> => {
+    const f = engine.addGridStyle(name, grids);
+    return f ? { ok: true, data: f } : { ok: false, error: 'failed' };
+  },
+  deleteGridStyle: async (id: string): Promise<IPCResponse<DesignFile>> => {
+    const f = engine.deleteGridStyle(id);
+    return f ? { ok: true, data: f } : { ok: false, error: 'failed' };
+  },
   addToken: (name: string, type: TokenType, value: string | number) => tokenMock.addToken(name, type, value),
   updateToken: (id: string, patch: Partial<DesignToken>) => tokenMock.updateToken(id, patch),
   deleteToken: (id: string) => tokenMock.deleteToken(id),

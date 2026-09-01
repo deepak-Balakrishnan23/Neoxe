@@ -1,4 +1,5 @@
-import { Shape, Page, Fill, GradientStop, TextStyle, TextParagraph, DesignFile } from '../../shared/types';
+import { Shape, Page, Fill, GradientStop, TextStyle, TextParagraph, DesignFile, ImageFill } from '../../shared/types';
+import { gridTracks } from '../../shared/layoutGrid';
 import { canvasColors as CC } from '../theme';
 import { wrapLines } from './textLayout';
 import { ensureFontLoaded } from './fontLoader';
@@ -10,6 +11,11 @@ let _editingTextId: string | null = null;
 // drawing these so the crisp editable overlay shows instead. Everything else (including
 // non-edited vectors) draws on the canvas so the drag preview moves it live.
 let _overlayHiddenIds: Set<string> = new Set();
+// Suppresses the layout-grid overlay for export renders.
+let _hideLayoutGrids = false;
+// Decoded images for the current render, so image FILLS can be painted without threading
+// the map through every fill call site.
+let _fillImages: Record<string, HTMLImageElement> = {};
 
 // External drag preview — written by FrameLabels during label-initiated drag, read on
 // every rAF tick by draw(). Keyed by shape id; values override the stored position.
@@ -99,9 +105,13 @@ export function renderPage(
   editingTextId?: string | null,
   skipBackground?: boolean,
   hiddenOverlayIds?: Set<string>,
+  // Layout grids are an editing aid — exports pass true so they never reach the output.
+  hideLayoutGrids?: boolean,
 ) {
   _editingTextId = editingTextId ?? null;
   _overlayHiddenIds = hiddenOverlayIds ?? new Set();
+  _hideLayoutGrids = hideLayoutGrids ?? false;
+  _fillImages = images;
   const { width, height } = ctx.canvas;
 
   // Opaque background fill already overwrites the whole canvas, so clearRect is only needed
@@ -126,13 +136,7 @@ export function renderPage(
   };
 
   // Draw root shapes in order (with preview overrides + instance resolution)
-  for (const id of page.childIds) {
-    let shape = page.objects[id];
-    if (!shape || shape.hidden) continue;
-    if (preview?.has(id)) shape = { ...shape, ...preview.get(id) };
-    if (file && shape.masterId) shape = resolveInstance(shape, file);
-    drawShape(ctx, shape, page, images, preview, file);
-  }
+  drawChildList(ctx, page.childIds, page, images, preview, file);
 
   ctx.restore();
 
@@ -152,6 +156,8 @@ export function renderPage(
 
   _editingTextId = null;
   _overlayHiddenIds = new Set();
+  _hideLayoutGrids = false;
+  _fillImages = {};
   _cullRect = null;
 }
 
@@ -191,6 +197,9 @@ function drawShape(
   // Move to shape's top-left in document space, rotating around its center
   ctx.translate(shape.x + shape.width / 2, shape.y + shape.height / 2);
   if (shape.rotation) ctx.rotate((shape.rotation * Math.PI) / 180);
+  // Mirror the shape's own drawing. A container's descendants are mirrored positionally
+  // by the flip command, and each carries its own flag, so this must not cascade.
+  if (shape.flipH || shape.flipV) ctx.scale(shape.flipH ? -1 : 1, shape.flipV ? -1 : 1);
   // Now (0,0) is the center; shift so top-left is (0,0) for drawing primitives
   ctx.translate(-shape.width / 2, -shape.height / 2);
 
@@ -212,8 +221,10 @@ function drawShape(
       if (!_overlayHiddenIds.has(shape.id)) drawSVG(ctx, shape);
       break;
     case 'path':
-    case 'bool':
       drawPath(ctx, shape);
+      break;
+    case 'bool':
+      drawBool(ctx, shape, page, images, preview, file);
       break;
     case 'vector':
       // Draw on the canvas so the drag preview moves it live (same as 'svg'). The DOM
@@ -254,19 +265,15 @@ function drawRect(
   // rotation — before drawing them; staying inside the parent's rotation would rotate
   // them twice. (The clip path above intentionally stays in the frame's rotated space.)
   const drawChildren = () => {
-    for (const childId of shape.childIds) {
-      let child = page.objects[childId];
-      if (!child || child.hidden) continue;
-      if (preview?.has(childId)) child = { ...child, ...preview.get(childId) };
-      if (file && child.masterId) child = resolveInstance(child, file);
-      ctx.save();
-      // Inverse of drawShape's translate(cx,cy)·rotate(θ)·translate(-w/2,-h/2).
-      ctx.translate(shape.width / 2, shape.height / 2);
-      if (shape.rotation) ctx.rotate((-shape.rotation * Math.PI) / 180);
-      ctx.translate(-(shape.x + shape.width / 2), -(shape.y + shape.height / 2));
-      drawShape(ctx, child, page, images, preview, file);
-      ctx.restore();
-    }
+    ctx.save();
+    // Inverse of drawShape's translate(cx,cy)·rotate(θ)·scale(flip)·translate(-w/2,-h/2)
+    // — back to document space, where children's absolute coordinates make sense.
+    ctx.translate(shape.width / 2, shape.height / 2);
+    if (shape.flipH || shape.flipV) ctx.scale(shape.flipH ? -1 : 1, shape.flipV ? -1 : 1);
+    if (shape.rotation) ctx.rotate((-shape.rotation * Math.PI) / 180);
+    ctx.translate(-(shape.x + shape.width / 2), -(shape.y + shape.height / 2));
+    drawChildList(ctx, shape.childIds, page, images, preview, file);
+    ctx.restore();
   };
 
   if (shape.type === 'frame' && shape.clipContent) {
@@ -277,6 +284,56 @@ function drawRect(
     ctx.restore();
   } else if (shape.type === 'frame') {
     drawChildren();
+  }
+
+  // Layout grids overlay the frame's contents (Figma) — they're an alignment aid, so
+  // they have to stay visible over whatever sits on top of them.
+  if (shape.type === 'frame' && !_hideLayoutGrids && shape.layoutGrids?.length && !isOffscreen(shape)) {
+    ctx.save();
+    boxPath(ctx, 0, 0, width, height, radii);
+    ctx.clip();
+    for (const g of shape.layoutGrids) {
+      if (!g.visible) continue;
+      ctx.globalAlpha = g.opacity;
+      ctx.fillStyle = g.color;
+      if (g.type === 'grid') {
+        const step = Math.max(1, g.size);
+        // Hairlines rather than filled cells — a filled uniform grid would be a solid wash.
+        for (let x = step; x < width; x += step) ctx.fillRect(x, 0, 1, height);
+        for (let y = step; y < height; y += step) ctx.fillRect(0, y, width, 1);
+      } else if (g.type === 'columns') {
+        for (const t of gridTracks(g, width)) ctx.fillRect(t.start, 0, t.size, height);
+      } else {
+        for (const t of gridTracks(g, height)) ctx.fillRect(0, t.start, width, t.size);
+      }
+    }
+    ctx.restore();
+  }
+}
+
+/**
+ * Paint a fill stack into the path currently on `ctx`. Used by the shapes that build
+ * their own outline (ellipses, paths) so image paints work there too — a plain
+ * `fillStyle` can't express one, it has to be clipped and drawn.
+ */
+function fillCurrentPath(
+  ctx: CanvasRenderingContext2D,
+  shape: Shape,
+  rule: CanvasFillRule = 'nonzero',
+) {
+  const { width: w, height: h } = shape;
+  for (let i = shape.fills.length - 1; i >= 0; i--) {
+    const fill = shape.fills[i];
+    ctx.save();
+    ctx.globalAlpha = fill.opacity ?? 1;
+    if (fill.type === 'image') {
+      ctx.clip(rule);
+      paintImageFill(ctx, fill, w, h);
+    } else {
+      ctx.fillStyle = buildFillStyle(ctx, fill, 0, 0, w, h);
+      ctx.fill(rule);
+    }
+    ctx.restore();
   }
 }
 
@@ -290,14 +347,7 @@ function drawCircle(ctx: CanvasRenderingContext2D, shape: Shape) {
   ctx.beginPath();
   ctx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2);
 
-  for (let i = shape.fills.length - 1; i >= 0; i--) {
-    const fill = shape.fills[i];
-    ctx.save();
-    ctx.fillStyle = buildFillStyle(ctx, fill, 0, 0, width, height);
-    ctx.globalAlpha = fill.opacity ?? 1;
-    ctx.fill();
-    ctx.restore();
-  }
+  fillCurrentPath(ctx, shape);
 
   for (const stroke of shape.strokes) {
     applyStroke(ctx, stroke, 0, 0, width, height, 'ellipse');
@@ -334,7 +384,24 @@ function drawText(ctx: CanvasRenderingContext2D, shape: Shape) {
   const anchorX = (align: TextParagraph['align']) =>
     align === 'center' ? shape.width / 2 : align === 'right' ? shape.width : 0;
 
+  // Vertical placement: measure the block first so 'middle'/'bottom' can offset it.
+  // (Figma's vertical alignment — 'top' needs no measurement pass.)
+  const vAlign = shape.textVerticalAlign ?? 'top';
   let lineTop = 0; // top of current visual line, in shape-local coords
+  if (vAlign !== 'top') {
+    let total = 0;
+    for (const para of paragraphs) {
+      const span = para.spans[0] ?? { text: '' };
+      const s: TextStyle = { ...style, ...(span.style ?? {}) };
+      ctx.font = `${s.fontWeight} ${s.fontSize}px ${s.fontFamily}`;
+      ctx.letterSpacing = `${s.letterSpacing ?? 0}px`;
+      const text = para.spans.map(sp => sp.text).join('');
+      const count = autoWidth ? 1 : wrapLines(ctx, text, shape.width).length;
+      total += count * s.fontSize * s.lineHeight;
+    }
+    const slack = shape.height - total;
+    lineTop = vAlign === 'middle' ? slack / 2 : slack;
+  }
   for (const para of paragraphs) {
     ctx.textAlign = para.align as CanvasTextAlign;
     // Combine the paragraph's spans under the base style (these text shapes carry a
@@ -487,14 +554,7 @@ function drawPath(ctx: CanvasRenderingContext2D, shape: Shape) {
     }
   }
 
-  for (let i = shape.fills.length - 1; i >= 0; i--) {
-    const fill = shape.fills[i];
-    ctx.save();
-    ctx.fillStyle = buildFillStyle(ctx, fill, shape.x, shape.y, shape.width, shape.height);
-    ctx.globalAlpha = fill.opacity ?? 1;
-    ctx.fill('evenodd');
-    ctx.restore();
-  }
+  fillCurrentPath(ctx, shape, 'evenodd');
 
   for (const stroke of shape.strokes) {
     ctx.save();
@@ -506,6 +566,155 @@ function drawPath(ctx: CanvasRenderingContext2D, shape: Shape) {
   }
 }
 
+// Canvas composite op implementing each boolean, applied to every operand after the first.
+const BOOL_COMPOSITE: Record<NonNullable<Shape['boolType']>, GlobalCompositeOperation> = {
+  union: 'source-over',
+  difference: 'destination-out',
+  intersection: 'destination-in',
+  exclusion: 'xor',
+};
+
+// An offscreen canvas covering `box` at the current device scale, with its own context
+// pre-transformed into DOCUMENT space so shapes can be drawn by absolute coordinates.
+// Returns null when the box is degenerate or absurdly large.
+//
+// Composites are done by combining whole LAYERS, never by setting a composite mode and
+// then calling drawShape — drawShape sets its own composite from the shape's blend mode
+// and would wipe it out.
+function layerCanvas(
+  ctx: CanvasRenderingContext2D,
+  box: { x: number; y: number; width: number; height: number },
+  paint: (octx: CanvasRenderingContext2D) => void,
+): HTMLCanvasElement | null {
+  const t = ctx.getTransform();
+  const sx = Math.hypot(t.a, t.b) || 1;
+  const sy = Math.hypot(t.c, t.d) || 1;
+  const w = Math.ceil(box.width * sx);
+  const h = Math.ceil(box.height * sy);
+  if (w < 1 || h < 1 || w * h > 32e6) return null;
+  const canvas = document.createElement('canvas');
+  canvas.width = w; canvas.height = h;
+  const octx = canvas.getContext('2d');
+  if (!octx) return null;
+  octx.scale(sx, sy);
+  octx.translate(-box.x, -box.y);
+  paint(octx);
+  return canvas;
+}
+
+/**
+ * Draw a container's children in order, honouring mask layers: a child with `isMask`
+ * clips every later sibling to its own alpha (Figma's "Use as mask"). The mask and the
+ * layers it covers are composed offscreen so the clip can't touch anything already on
+ * the canvas beneath the container.
+ *
+ * `ctx` must already be in DOCUMENT space — children carry absolute coordinates.
+ */
+function drawChildList(
+  ctx: CanvasRenderingContext2D,
+  childIds: string[],
+  page: Page,
+  images: Record<string, HTMLImageElement>,
+  preview?: Map<string, ShapePreview>,
+  file?: DesignFile,
+) {
+  const resolve = (id: string): Shape | null => {
+    let child = page.objects[id];
+    if (!child || child.hidden) return null;
+    if (preview?.has(id)) child = { ...child, ...preview.get(id) };
+    if (file && child.masterId) child = resolveInstance(child, file);
+    return child;
+  };
+
+  for (let i = 0; i < childIds.length; i++) {
+    const child = resolve(childIds[i]);
+    if (!child) continue;
+
+    if (!child.isMask) { drawShape(ctx, child, page, images, preview, file); continue; }
+
+    // Mask: everything from here to the end of the list is clipped to this layer.
+    const masked = childIds.slice(i + 1).map(resolve).filter((s): s is Shape => !!s);
+    if (masked.length === 0) return;
+    const box = { x: child.x, y: child.y, width: child.width, height: child.height };
+    const content = layerCanvas(ctx, box, octx => {
+      for (const m of masked) drawShape(octx, m, page, images, preview, file);
+    });
+    const maskLayer = layerCanvas(ctx, box, octx => {
+      drawShape(octx, { ...child, opacity: 1, blendMode: 'normal' }, page, images, preview, file);
+    });
+    if (!content || !maskLayer) {
+      for (const m of masked) drawShape(ctx, m, page, images, preview, file);
+      return;
+    }
+    const cctx = content.getContext('2d')!;
+    cctx.setTransform(1, 0, 0, 1, 0, 0);
+    cctx.globalCompositeOperation = 'destination-in';
+    cctx.drawImage(maskLayer, 0, 0);
+    ctx.drawImage(content, box.x, box.y, box.width, box.height);
+    return;
+  }
+}
+
+// Boolean group: compose the operands as separate layers with the op's composite mode,
+// then tint the result with the group's own fill (Figma gives the result one style).
+function drawBool(
+  ctx: CanvasRenderingContext2D,
+  shape: Shape,
+  page: Page,
+  images: Record<string, HTMLImageElement>,
+  preview?: Map<string, ShapePreview>,
+  file?: DesignFile,
+) {
+  // The engine computes the real outline for boolean groups; draw that when it's there —
+  // it's exact, exportable, and far cheaper than compositing layers. The per-pixel path
+  // below is the fallback for geometry the clipper couldn't resolve.
+  if (shape.content && shape.content.length > 0) { drawPath(ctx, shape); return; }
+  if (shape.childIds.length === 0) { drawPath(ctx, shape); return; }
+  const box = { x: shape.x, y: shape.y, width: shape.width, height: shape.height };
+  const operands: Shape[] = [];
+  for (const childId of shape.childIds) {
+    let child = page.objects[childId];
+    if (!child || child.hidden) continue;
+    if (preview?.has(childId)) child = { ...child, ...preview.get(childId) };
+    operands.push(child);
+  }
+  if (operands.length === 0) return;
+
+  const base = layerCanvas(ctx, box, octx => {
+    drawShape(octx, operands[0], page, images, preview, file);
+  });
+  if (!base) return;
+  const bctx = base.getContext('2d')!;
+  const composite = BOOL_COMPOSITE[shape.boolType ?? 'union'];
+
+  for (let i = 1; i < operands.length; i++) {
+    const layer = layerCanvas(ctx, box, octx => {
+      drawShape(octx, operands[i], page, images, preview, file);
+    });
+    if (!layer) continue;
+    bctx.save();
+    bctx.setTransform(1, 0, 0, 1, 0, 0);
+    bctx.globalCompositeOperation = composite;
+    bctx.drawImage(layer, 0, 0);
+    bctx.restore();
+  }
+
+  if (shape.fills.length > 0) {
+    const tint = layerCanvas(ctx, box, octx => {
+      applyFills(octx, shape.fills, box.x, box.y, box.width, box.height);
+    });
+    if (tint) {
+      bctx.save();
+      bctx.setTransform(1, 0, 0, 1, 0, 0);
+      bctx.globalCompositeOperation = 'source-in';
+      bctx.drawImage(tint, 0, 0);
+      bctx.restore();
+    }
+  }
+  // ctx sits at the shape's top-left (drawShape's transform), so the box starts at 0,0.
+  ctx.drawImage(base, 0, 0, shape.width, shape.height);
+}
+
 function drawGroup(
   ctx: CanvasRenderingContext2D,
   shape: Shape,
@@ -514,19 +723,14 @@ function drawGroup(
   preview?: Map<string, ShapePreview>,
   file?: DesignFile,
 ) {
-  for (const childId of shape.childIds) {
-    let child = page.objects[childId];
-    if (!child || child.hidden) continue;
-    if (preview?.has(childId)) child = { ...child, ...preview.get(childId) };
-    if (file && child.masterId) child = resolveInstance(child, file);
-    ctx.save();
-    // Flat model: escape the group's full local transform (see drawRect.drawChildren).
-    ctx.translate(shape.width / 2, shape.height / 2);
-    if (shape.rotation) ctx.rotate((-shape.rotation * Math.PI) / 180);
-    ctx.translate(-(shape.x + shape.width / 2), -(shape.y + shape.height / 2));
-    drawShape(ctx, child, page, images, preview, file);
-    ctx.restore();
-  }
+  ctx.save();
+  // Flat model: escape the group's full local transform (see drawRect.drawChildren).
+  ctx.translate(shape.width / 2, shape.height / 2);
+  if (shape.flipH || shape.flipV) ctx.scale(shape.flipH ? -1 : 1, shape.flipV ? -1 : 1);
+  if (shape.rotation) ctx.rotate((-shape.rotation * Math.PI) / 180);
+  ctx.translate(-(shape.x + shape.width / 2), -(shape.y + shape.height / 2));
+  drawChildList(ctx, shape.childIds, page, images, preview, file);
+  ctx.restore();
 }
 
 type CornerRadii = { tl: number; tr: number; br: number; bl: number };
@@ -554,16 +758,50 @@ function applyFills(
   for (let i = fills.length - 1; i >= 0; i--) {
     const fill = fills[i];
     ctx.save();
-    ctx.fillStyle = buildFillStyle(ctx, fill, x, y, w, h);
     ctx.globalAlpha = fill.opacity ?? 1;
-    if (radii) {
-      boxPath(ctx, 0, 0, w, h, radii);
-      ctx.fill();
+    if (fill.type === 'image') {
+      // An image paint has to be clipped to the box — 'fill' and 'tile' both overflow it.
+      ctx.beginPath();
+      if (radii) boxPath(ctx, 0, 0, w, h, radii);
+      else ctx.rect(0, 0, w, h);
+      ctx.clip();
+      paintImageFill(ctx, fill, w, h);
     } else {
-      ctx.fillRect(0, 0, w, h);
+      ctx.fillStyle = buildFillStyle(ctx, fill, x, y, w, h);
+      if (radii) {
+        boxPath(ctx, 0, 0, w, h, radii);
+        ctx.fill();
+      } else {
+        ctx.fillRect(0, 0, w, h);
+      }
     }
     ctx.restore();
   }
+}
+
+// Paint an image paint into the box at (0,0,w,h). The caller has already clipped.
+function paintImageFill(ctx: CanvasRenderingContext2D, fill: ImageFill, w: number, h: number) {
+  const img = _fillImages[fill.imageId];
+  if (!img || !img.complete || img.naturalWidth === 0) return;
+  const iw = img.naturalWidth, ih = img.naturalHeight;
+
+  if (fill.scaleMode === 'tile') {
+    const pattern = ctx.createPattern(img, 'repeat');
+    if (!pattern) return;
+    const scale = fill.tileScale && fill.tileScale > 0 ? fill.tileScale : 1;
+    // setTransform isn't universally available on CanvasPattern; falling back to an
+    // untransformed pattern still tiles, just at the image's natural size.
+    pattern.setTransform?.(new DOMMatrix().scaleSelf(scale, scale));
+    ctx.fillStyle = pattern;
+    ctx.fillRect(0, 0, w, h);
+    return;
+  }
+  if (fill.scaleMode === 'stretch') { ctx.drawImage(img, 0, 0, w, h); return; }
+
+  // 'fill' covers the box (cropping the overflow); 'fit' contains the whole image.
+  const scale = fill.scaleMode === 'fit' ? Math.min(w / iw, h / ih) : Math.max(w / iw, h / ih);
+  const dw = iw * scale, dh = ih * scale;
+  ctx.drawImage(img, (w - dw) / 2, (h - dh) / 2, dw, dh);
 }
 
 function buildFillStyle(
@@ -574,6 +812,8 @@ function buildFillStyle(
   w: number,
   h: number,
 ): string | CanvasGradient {
+  // Image paints are drawn by paintImageFill — they never reach here.
+  if (fill.type === 'image') return 'transparent';
   if (fill.type === 'solid') return fill.color;
 
   if (fill.type === 'linear-gradient') {

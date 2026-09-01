@@ -9,6 +9,9 @@ const TOOLS: { id: ToolType; icon: IconName; shortcut: string; label: string }[]
   { id: 'frame',   icon: 'frame',   shortcut: 'F', label: 'Frame' },
   { id: 'rect',    icon: 'rect',    shortcut: 'R', label: 'Rectangle' },
   { id: 'ellipse', icon: 'ellipse', shortcut: 'O', label: 'Ellipse' },
+  { id: 'line',    icon: 'line',    shortcut: 'L', label: 'Line' },
+  { id: 'polygon', icon: 'polygon', shortcut: '',  label: 'Polygon' },
+  { id: 'star',    icon: 'star',    shortcut: '',  label: 'Star' },
   { id: 'text',    icon: 'text',    shortcut: 'T', label: 'Text' },
   { id: 'pen',     icon: 'pen',     shortcut: 'P', label: 'Pen' },
   { id: 'image',   icon: 'image',   shortcut: '⇧⌘K', label: 'Place image' },
@@ -42,8 +45,8 @@ export default function FloatingToolbar() {
       <div style={styles.pill}>
         {TOOLS.map((t, i) => (
           <React.Fragment key={t.id}>
-            {i === 1 && <div style={styles.sep} />}
-            {i === 5 && <div style={styles.sep} />}
+            {/* Separators bracket the shape tools, so they stay put as tools are added. */}
+            {(t.id === 'frame' || t.id === 'text') && <div style={styles.sep} />}
             <ToolButton tool={t} active={activeTool === t.id} onClick={() => onTool(t.id)} />
           </React.Fragment>
         ))}

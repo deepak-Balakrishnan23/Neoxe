@@ -1,9 +1,13 @@
 import React, { useState, useCallback, useRef, useEffect } from 'react';
-import { Shape, Fill, Stroke, Shadow, BlurEffect, TextStyle, BlendMode, makeDefaultShape, VectorChildNode } from '../../shared/types';
+import { Shape, Fill, Stroke, Shadow, BlurEffect, TextStyle, BlendMode, makeDefaultShape, VectorChildNode, ConstraintMode, Constraints, LayoutGrid, LayoutGridType, LayoutGridAlign, makeDefaultLayoutGrid, ComponentPropDef, Page, DesignFile, ExportSetting } from '../../shared/types';
+import { DEFAULT_CONSTRAINTS } from '../../shared/constraints';
+import { resolvePropDefs } from '../../shared/components';
 import { useDesignStore } from '../store/useDesignStore';
 import { api } from '../ipc/api';
 import ColorPicker from './ColorPicker';
 import { fitTextSize } from '../canvas/textLayout';
+import { exportRaster, exportSvg } from '../export/exporters';
+import { imageCache } from '../canvas/imageCache';
 import InspectPanel from './InspectPanel';
 import PrototypePanel from './PrototypePanel';
 import InteractionsSection from './InteractionsSection';
@@ -228,13 +232,22 @@ function ColorSwatch({ color, opacity = 1, onChange, fill, onFillChange }: Swatc
   const [open, setOpen] = useState(false);
   const [anchor, setAnchor] = useState<DOMRect | null>(null);
   const ref = useRef<HTMLDivElement>(null);
-  const bg = fill && (fill.type === 'linear-gradient' || fill.type === 'radial-gradient') ? gradientCss(fill) : color;
+  const { file } = useDesignStore();
+  const bg = fill && (fill.type === 'linear-gradient' || fill.type === 'radial-gradient') ? gradientCss(fill)
+    : fill?.type === 'image' ? undefined
+    : color;
+  // Image paints preview as the picture itself, cropped to the swatch.
+  const bgImage = fill?.type === 'image' ? file?.images[fill.imageId] : undefined;
 
   return (
     <>
       <div
         ref={ref}
-        style={{ ...swatchStyles.swatch, background: bg }}
+        style={{
+          ...swatchStyles.swatch,
+          background: bg,
+          ...(bgImage ? { backgroundImage: `url(${bgImage})`, backgroundSize: 'cover', backgroundPosition: 'center' } : {}),
+        }}
         onClick={() => { setAnchor(ref.current!.getBoundingClientRect()); setOpen(o => !o); }}
         title="Click to edit colour"
       />
@@ -608,6 +621,37 @@ export default function PropertiesPanel() {
           return parent?.autoLayout ? <ChildSizingSection shape={shape} set={set} /> : null;
         })()}
 
+        {/* ── Boolean group — swap the operation without rebuilding the group. */}
+        {!multi && shape.type === 'bool' && (
+          <Section label="Boolean">
+            <Row>
+              <select style={{ ...pStyles.select, flex: 1 }} value={shape.boolType ?? 'union'}
+                onChange={e => set(shape.id, 'boolType', e.target.value)}>
+                <option value="union">Union</option>
+                <option value="difference">Subtract</option>
+                <option value="intersection">Intersect</option>
+                <option value="exclusion">Exclude</option>
+              </select>
+            </Row>
+          </Section>
+        )}
+
+        {/* ── Component — master properties, or an instance's variant + property values. */}
+        <ComponentSection shapes={shapes} page={page} set={set} />
+
+        {/* ── Layout grid — frame-only alignment overlay (Figma's "Layout grid"). */}
+        {!multi && shape.type === 'frame' && <LayoutGridSection shape={shape} setAll={setAll} />}
+
+        {/* ── Constraints — how the shape reacts when its parent frame is resized.
+            Auto-layout children are placed by the layout engine, so the control only
+            appears for shapes the engine doesn't own (Figma does the same). */}
+        {!multi && (() => {
+          const parent = shape.parentId ? page?.objects[shape.parentId] : null;
+          if (!parent) return null;
+          if (parent.autoLayout && shape.layoutPositioning !== 'absolute') return null;
+          return <ConstraintsSection shape={shape} set={set} />;
+        })()}
+
         {/* Multi-selection sizing — when every selected shape lives in an auto-layout parent,
             expose W/H sizing modes applied to all at once (Fixed / Hug / Fill). */}
         {multi && page && shapes.every(s => s.parentId && page.objects[s.parentId]?.autoLayout) && (
@@ -670,6 +714,9 @@ export default function PropertiesPanel() {
 
         {/* ── Effects (shadows + blur, Figma-style add menu + popover) ───── */}
         <EffectsSection shape={shape} setAll={setAll} />
+
+        {/* ── Export presets (Figma's per-layer Export list) ── */}
+        {!multi && <ExportSection shape={shape} setAll={setAll} />}
         {/* (Prototype interactions intentionally NOT here — the Prototype tab owns them.) */}
       </div>
     </div>
@@ -689,9 +736,9 @@ function FillRow({ fill, index, shape, setAll }: {
   const replaceFill = (next: Fill) => setAll('fills', shape.fills.map((f, i) => (i === index ? next : f)));
   const removeFill = () => setAll('fills', shape.fills.filter((_, i) => i !== index));
 
-  // Fill = solid | linear-gradient | radial-gradient — the union is exhaustive here.
   const label = fill.type === 'solid'
     ? fill.color.replace('#', '').toUpperCase()
+    : fill.type === 'image' ? 'Image'
     : fill.type === 'linear-gradient' ? 'Linear' : 'Radial';
 
   return (
@@ -783,6 +830,15 @@ function EffectsSection({ shape, setAll }: { shape: Shape; setAll: (attr: string
         <EffectRow key={`shadow-${i}`} shape={shape} setAll={setAll} shadowIndex={i} />
       ))}
       {shape.blur && <EffectRow key="blur" shape={shape} setAll={setAll} />}
+      <StylePicker
+        kind="effect"
+        hasLocal={shape.shadows.length > 0 || !!shape.blur}
+        onApply={entry => {
+          setAll('shadows', structuredClone(entry.shadows));
+          setAll('blur', entry.blur ? structuredClone(entry.blur) : null);
+        }}
+        capture={() => ({ shadows: shape.shadows, blur: shape.blur })}
+      />
       {menuAnchor && (
         <DropMenu anchor={menuAnchor} onClose={() => setMenuAnchor(null)}
           items={EFFECT_OPTIONS.map(k => ({ label: EFFECT_LABELS[k], onClick: () => addEffect(k) }))} />
@@ -982,6 +1038,434 @@ const popStyles: Record<string, React.CSSProperties> = {
   body: { padding: 10, display: 'flex', flexDirection: 'column', gap: 8 },
   fieldRow: { display: 'flex', alignItems: 'center', gap: 8 },
   fieldLabel: { color: 'var(--text-secondary)', fontSize: 11, width: 56, flexShrink: 0 },
+};
+
+// ── Component section ─────────────────────────────────────────────────────────
+// Three faces, matching what's selected:
+//  • an instance  → variant pickers, component-property values, Detach / Reset
+//  • a master     → the component properties it exposes
+//  • a layer inside a master → which property drives it
+// Multi-selection of two or more shapes offers "Combine as variants".
+
+function ComponentSection({ shapes, page, set }: {
+  shapes: Shape[];
+  page: Page | null;
+  set: (id: string, attr: string, val: unknown) => void;
+}) {
+  const { file, setFile } = useDesignStore();
+  if (!file || !page || shapes.length === 0) return null;
+
+  const run = async (p: Promise<{ ok: boolean; data?: DesignFile }>) => {
+    const res = await p;
+    if (res.ok && res.data) setFile(res.data);
+  };
+
+  if (shapes.length > 1) {
+    return (
+      <Section label="Component">
+        <button style={pStyles.addRowBtn}
+          onClick={() => void run(api.combineAsVariants(shapes.map(s => s.id), page.id))}>
+          <Icon name="plus" size={13} /> Combine as variants
+        </button>
+      </Section>
+    );
+  }
+
+  const shape = shapes[0];
+
+  // ── Instance ──
+  if (shape.masterId) {
+    const comp = file.components[shape.masterId];
+    const set_ = comp?.setId ? file.componentSets?.[comp.setId] : null;
+    const current = set_?.variants[shape.masterId] ?? {};
+    const defs = resolvePropDefs(file, shape.masterId);
+    const values = shape.componentProps ?? {};
+    const valueOf = (d: ComponentPropDef) => (d.id in values ? values[d.id] : d.defaultValue);
+    const setProp = (id: string, val: string | boolean) =>
+      set(shape.id, 'componentProps', { ...values, [id]: val });
+
+    return (
+      <Section label="Instance">
+        <div style={compStyles.masterName}>{comp?.name ?? 'Component'}</div>
+
+        {set_ && Object.entries(set_.properties).map(([name, options]) => (
+          <Row key={name}>
+            <span style={pStyles.fieldLabel}>{name}</span>
+            <select style={{ ...pStyles.select, flex: 1 }} value={current[name] ?? ''}
+              onChange={e => void run(api.setInstanceVariant(shape.id, page.id, { ...current, [name]: e.target.value }))}>
+              {options.map(o => <option key={o} value={o}>{o}</option>)}
+            </select>
+          </Row>
+        ))}
+
+        {defs.map(d => (
+          <Row key={d.id}>
+            <span style={pStyles.fieldLabel}>{d.name}</span>
+            {d.type === 'boolean' ? (
+              <input type="checkbox" checked={valueOf(d) !== false}
+                onChange={e => setProp(d.id, e.target.checked)} />
+            ) : (
+              <input style={pStyles.textInput} value={String(valueOf(d) ?? '')}
+                onChange={e => setProp(d.id, e.target.value)} />
+            )}
+          </Row>
+        ))}
+
+        <div style={compStyles.actions}>
+          <button style={pStyles.addRowBtn} onClick={() => void run(api.resetOverrides(shape.id, page.id))}>Reset overrides</button>
+          <button style={pStyles.addRowBtn} onClick={() => void run(api.detachInstance(shape.id, page.id))}>Detach</button>
+        </div>
+      </Section>
+    );
+  }
+
+  // ── Master ──
+  if (shape.componentId) {
+    const comp = file.components[shape.componentId];
+    const defs = comp?.props ?? [];
+    const write = (next: ComponentPropDef[]) => void run(api.setComponentProps(shape.componentId!, next));
+    const add = (type: ComponentPropDef['type']) => write([...defs, {
+      id: `cp-${Math.random().toString(36).slice(2, 9)}`,
+      name: type === 'boolean' ? `Show ${defs.length + 1}` : `Text ${defs.length + 1}`,
+      type,
+      defaultValue: type === 'boolean' ? true : 'Text',
+    }]);
+
+    return (
+      <Section label="Component properties">
+        {defs.map((d, i) => (
+          <Row key={d.id}>
+            <input style={pStyles.textInput} value={d.name}
+              onChange={e => write(defs.map((x, xi) => (xi === i ? { ...x, name: e.target.value } : x)))} />
+            <span style={compStyles.propType}>{d.type}</span>
+            <RemoveBtn onClick={() => write(defs.filter((_, xi) => xi !== i))} />
+          </Row>
+        ))}
+        <div style={compStyles.actions}>
+          <button style={pStyles.addRowBtn} onClick={() => add('boolean')}><Icon name="plus" size={13} /> Boolean</button>
+          <button style={pStyles.addRowBtn} onClick={() => add('text')}><Icon name="plus" size={13} /> Text</button>
+        </div>
+      </Section>
+    );
+  }
+
+  // ── Layer inside a master: bind it to one of the component's properties ──
+  const masterId = masterAncestorComponentId(page, shape.id);
+  const defs = resolvePropDefs(file, masterId ?? undefined);
+  if (!masterId || defs.length === 0) return null;
+  const bind = shape.propBindings ?? {};
+  const booleans = defs.filter(d => d.type === 'boolean');
+  const texts = defs.filter(d => d.type === 'text');
+
+  return (
+    <Section label="Bound to">
+      {booleans.length > 0 && (
+        <Row>
+          <span style={pStyles.fieldLabel}>Visible</span>
+          <select style={{ ...pStyles.select, flex: 1 }} value={bind.visible ?? ''}
+            onChange={e => set(shape.id, 'propBindings', { ...bind, visible: e.target.value || undefined })}>
+            <option value="">None</option>
+            {booleans.map(d => <option key={d.id} value={d.id}>{d.name}</option>)}
+          </select>
+        </Row>
+      )}
+      {texts.length > 0 && shape.type === 'text' && (
+        <Row>
+          <span style={pStyles.fieldLabel}>Text</span>
+          <select style={{ ...pStyles.select, flex: 1 }} value={bind.characters ?? ''}
+            onChange={e => set(shape.id, 'propBindings', { ...bind, characters: e.target.value || undefined })}>
+            <option value="">None</option>
+            {texts.map(d => <option key={d.id} value={d.id}>{d.name}</option>)}
+          </select>
+        </Row>
+      )}
+    </Section>
+  );
+}
+
+// The componentId of the master this shape sits inside, if any.
+function masterAncestorComponentId(page: Page, id: string): string | null {
+  let cur: string | null = id;
+  while (cur) {
+    const s: Shape | undefined = page.objects[cur];
+    if (!s) return null;
+    if (s.componentId) return s.componentId;
+    cur = s.parentId;
+  }
+  return null;
+}
+
+const compStyles: Record<string, React.CSSProperties> = {
+  masterName: { fontSize: 12, color: 'var(--text-muted)', marginBottom: 8 },
+  actions: { display: 'flex', gap: 6, marginTop: 6 },
+  propType: { fontSize: 10, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '.06em' },
+};
+
+// ── Layout grid section ───────────────────────────────────────────────────────
+// Frame overlays that guide placement and feed snapping. Column/row grids expose the
+// track controls Figma does; a uniform grid only needs a cell size.
+
+const GRID_TYPE_LABELS: Record<LayoutGridType, string> = { grid: 'Grid', columns: 'Columns', rows: 'Rows' };
+const GRID_ALIGN_LABELS: Record<LayoutGridAlign, string> = { stretch: 'Stretch', min: 'Left', center: 'Center', max: 'Right' };
+const ROW_ALIGN_LABELS: Record<LayoutGridAlign, string> = { stretch: 'Stretch', min: 'Top', center: 'Center', max: 'Bottom' };
+
+function LayoutGridSection({ shape, setAll }: { shape: Shape; setAll: (attr: string, val: unknown) => void }) {
+  const grids = shape.layoutGrids ?? [];
+  const write = (next: LayoutGrid[]) => setAll('layoutGrids', next);
+  const update = (i: number, patch: Partial<LayoutGrid>) =>
+    write(grids.map((g, gi) => (gi === i ? { ...g, ...patch } : g)));
+  const add = () => write([...grids, makeDefaultLayoutGrid(grids.length === 0 ? 'columns' : 'grid', `lg-${Math.random().toString(36).slice(2, 9)}`)]);
+
+  return (
+    <Section label="Layout grid" action={<AddBtn onClick={add} title="Add layout grid" />}>
+      {grids.map((g, i) => (
+        <div key={g.id} style={gridStyles.item}>
+          <div style={pStyles.row}>
+            <select style={{ ...pStyles.select, flex: 1 }} value={g.type}
+              onChange={e => update(i, { type: e.target.value as LayoutGridType })}>
+              {(Object.keys(GRID_TYPE_LABELS) as LayoutGridType[]).map(t => <option key={t} value={t}>{GRID_TYPE_LABELS[t]}</option>)}
+            </select>
+            <ColorSwatch color={g.color} opacity={g.opacity}
+              onChange={(color, opacity) => update(i, { color, opacity })} />
+            <button style={pStyles.iconGhost} title={g.visible ? 'Hide grid' : 'Show grid'}
+              onClick={() => update(i, { visible: !g.visible })}>
+              <Icon name={g.visible ? 'eye' : 'eye-off'} size={14} />
+            </button>
+            <RemoveBtn onClick={() => write(grids.filter((_, gi) => gi !== i))} />
+          </div>
+
+          {g.type === 'grid' ? (
+            <div style={pStyles.row}>
+              <NumInput label="Size" value={g.size} min={1} onChange={v => update(i, { size: v })} />
+            </div>
+          ) : (
+            <>
+              <div style={pStyles.row}>
+                <NumInput label="Count" value={g.count} min={1} step={1} onChange={v => update(i, { count: Math.round(v) })} />
+                <select style={{ ...pStyles.select, flex: 1 }} value={g.alignment}
+                  onChange={e => update(i, { alignment: e.target.value as LayoutGridAlign })}>
+                  {(Object.keys(GRID_ALIGN_LABELS) as LayoutGridAlign[]).map(a => (
+                    <option key={a} value={a}>{(g.type === 'rows' ? ROW_ALIGN_LABELS : GRID_ALIGN_LABELS)[a]}</option>
+                  ))}
+                </select>
+              </div>
+              <div style={pStyles.row}>
+                <NumInput label="Gutter" value={g.gutter} min={0} onChange={v => update(i, { gutter: v })} />
+                {g.alignment === 'stretch'
+                  ? <NumInput label="Margin" value={g.margin} min={0} onChange={v => update(i, { margin: v })} />
+                  : <NumInput label="Size" value={g.sectionSize} min={1} onChange={v => update(i, { sectionSize: v })} />}
+              </div>
+              {g.alignment !== 'stretch' && g.alignment !== 'center' && (
+                <div style={pStyles.row}>
+                  <NumInput label="Offset" value={g.offset} onChange={v => update(i, { offset: v })} />
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      ))}
+      <StylePicker
+        kind="grid"
+        hasLocal={grids.length > 0}
+        onApply={entry => write(structuredClone(entry.grids))}
+        capture={() => ({ grids })}
+      />
+    </Section>
+  );
+}
+
+const gridStyles: Record<string, React.CSSProperties> = {
+  item: { display: 'flex', flexDirection: 'column', gap: 6, paddingBottom: 8 },
+};
+
+// ── Export presets ────────────────────────────────────────────────────────────
+// Figma's per-layer Export list: each row is one output file. Exporting more than one at
+// a time downloads them rather than opening a save dialog per file — only the first
+// dialog would have the click's activation.
+
+function ExportSection({ shape, setAll }: { shape: Shape; setAll: (attr: string, val: unknown) => void }) {
+  const { file, activePage, showToast } = useDesignStore();
+  const settings = shape.exportSettings ?? [];
+  const write = (next: ExportSetting[]) => setAll('exportSettings', next);
+  const update = (i: number, patch: Partial<ExportSetting>) =>
+    write(settings.map((x, xi) => (xi === i ? { ...x, ...patch } : x)));
+  const add = () => write([...settings, {
+    id: `ex-${Math.random().toString(36).slice(2, 9)}`, format: 'png', scale: 1, suffix: '',
+  }]);
+
+  const runExport = async () => {
+    const page = activePage();
+    if (!file || !page || settings.length === 0) return;
+    const many = settings.length > 1;
+    for (const setting of settings) {
+      const opts = { suffix: setting.suffix, forceDownload: many };
+      if (setting.format === 'svg') await exportSvg(file, page, [shape.id], opts);
+      else await exportRaster(file, page, setting.scale, [shape.id], imageCache, setting.format, opts);
+    }
+    showToast(settings.length === 1 ? 'Exported' : `Exported ${settings.length} files`);
+  };
+
+  return (
+    <Section label="Export" action={<AddBtn onClick={add} title="Add export preset" />}>
+      {settings.map((setting, i) => (
+        <div key={setting.id} style={pStyles.row}>
+          <div style={{ width: 62 }}>
+            <NumInput label="" value={setting.scale} min={0.1} max={8} step={0.5} decimals={1} unit="x"
+              onChange={v => update(i, { scale: v })} />
+          </div>
+          <input style={pStyles.textInput} value={setting.suffix} placeholder="Suffix"
+            onChange={e => update(i, { suffix: e.target.value })} />
+          <select style={{ ...pStyles.select, width: 78 }} value={setting.format}
+            onChange={e => update(i, { format: e.target.value as ExportSetting['format'] })}>
+            <option value="png">PNG</option>
+            <option value="jpeg">JPG</option>
+            <option value="webp">WEBP</option>
+            <option value="svg">SVG</option>
+          </select>
+          <RemoveBtn onClick={() => write(settings.filter((_, xi) => xi !== i))} />
+        </div>
+      ))}
+      {settings.length > 0 && (
+        <button style={pStyles.addRowBtn} onClick={() => void runExport()}>
+          Export {shape.name}
+        </button>
+      )}
+    </Section>
+  );
+}
+
+// ── Style picker (effect + grid styles) ───────────────────────────────────────
+// Figma keeps reusable effect and grid styles alongside colour and text styles. This is
+// the pair of controls that live on the section: apply a saved one, or save what the
+// layer currently has as a new one.
+
+type StyleKind = 'effect' | 'grid';
+
+function StylePicker({ kind, hasLocal, onApply, capture }: {
+  kind: StyleKind;
+  hasLocal: boolean;
+  onApply: (entry: { shadows: Shadow[]; blur: BlurEffect | null; grids: LayoutGrid[] }) => void;
+  capture: () => { shadows?: Shadow[]; blur?: BlurEffect | null; grids?: LayoutGrid[] };
+}) {
+  const { file, setFile } = useDesignStore();
+  const entries = (kind === 'effect' ? file?.effects : file?.gridStyles) ?? [];
+  if (entries.length === 0 && !hasLocal) return null;
+
+  const save = async () => {
+    const local = capture();
+    const res = kind === 'effect'
+      ? await api.addEffectStyle(`${file?.effects?.length ? `Effect ${file.effects.length + 1}` : 'Effect'}`, local.shadows ?? [], local.blur ?? null)
+      : await api.addGridStyle(`${file?.gridStyles?.length ? `Grid ${file.gridStyles.length + 1}` : 'Grid'}`, local.grids ?? []);
+    if (res.ok && res.data) setFile(res.data);
+  };
+
+  return (
+    <div style={{ ...pStyles.row, marginTop: 6 }}>
+      {entries.length > 0 && (
+        <select style={{ ...pStyles.select, flex: 1 }} value=""
+          onChange={e => {
+            const entry = entries.find(x => x.id === e.target.value);
+            if (!entry) return;
+            onApply({
+              shadows: (entry as { shadows?: Shadow[] }).shadows ?? [],
+              blur: (entry as { blur?: BlurEffect | null }).blur ?? null,
+              grids: (entry as { grids?: LayoutGrid[] }).grids ?? [],
+            });
+          }}>
+          <option value="">Apply style…</option>
+          {entries.map(x => <option key={x.id} value={x.id}>{x.name}</option>)}
+        </select>
+      )}
+      {hasLocal && (
+        <button style={pStyles.addRowBtn} onClick={() => void save()} title={`Save as a reusable ${kind} style`}>
+          Save style
+        </button>
+      )}
+    </div>
+  );
+}
+
+// ── Constraints section ───────────────────────────────────────────────────────
+// Figma's resize-constraint control: a schematic of the parent with pin bars on each
+// edge, plus a dropdown per axis for the two modes bars can't express (Center, Scale).
+// Clicking a bar toggles that edge; both edges pinned = stretch.
+
+const H_LABELS: Record<ConstraintMode, string> = {
+  min: 'Left', max: 'Right', stretch: 'Left and right', center: 'Center', scale: 'Scale',
+};
+const V_LABELS: Record<ConstraintMode, string> = {
+  min: 'Top', max: 'Bottom', stretch: 'Top and bottom', center: 'Center', scale: 'Scale',
+};
+
+function ConstraintsSection({ shape, set }: { shape: Shape; set: (id: string, attr: string, val: unknown) => void }) {
+  const con = shape.constraints ?? DEFAULT_CONSTRAINTS;
+  const update = (patch: Partial<Constraints>) => set(shape.id, 'constraints', { ...con, ...patch });
+
+  // Which edge bars read as active for a mode.
+  const pins = (mode: ConstraintMode): [boolean, boolean] =>
+    mode === 'stretch' ? [true, true] : mode === 'min' ? [true, false] : mode === 'max' ? [false, true] : [false, false];
+  const [pinL, pinR] = pins(con.horizontal);
+  const [pinT, pinB] = pins(con.vertical);
+
+  // Toggling an edge: on + the opposite already on = stretch; turning the last one off
+  // leaves Center, which is the only mode with neither edge pinned.
+  const toggleH = (edge: 'min' | 'max') => {
+    const on = edge === 'min' ? pinL : pinR;
+    const other = edge === 'min' ? pinR : pinL;
+    const next: ConstraintMode = on ? (other ? (edge === 'min' ? 'max' : 'min') : 'center')
+      : (other ? 'stretch' : edge);
+    update({ horizontal: next });
+  };
+  const toggleV = (edge: 'min' | 'max') => {
+    const on = edge === 'min' ? pinT : pinB;
+    const other = edge === 'min' ? pinB : pinT;
+    const next: ConstraintMode = on ? (other ? (edge === 'min' ? 'max' : 'min') : 'center')
+      : (other ? 'stretch' : edge);
+    update({ vertical: next });
+  };
+
+  const bar = (active: boolean, style: React.CSSProperties, onClick: () => void, title: string) => (
+    <button title={title} onClick={onClick} aria-pressed={active}
+      style={{ ...conStyles.bar, ...style, background: active ? 'var(--color-accent, #0d99ff)' : 'var(--border-strong)' }} />
+  );
+
+  return (
+    <Section label="Constraints">
+      <div style={conStyles.wrap}>
+        <div style={conStyles.diagram}>
+          <div style={conStyles.inner} />
+          {bar(pinT, { top: 4, left: '50%', width: 2, height: 12, transform: 'translateX(-50%)' }, () => toggleV('min'), V_LABELS.min)}
+          {bar(pinB, { bottom: 4, left: '50%', width: 2, height: 12, transform: 'translateX(-50%)' }, () => toggleV('max'), V_LABELS.max)}
+          {bar(pinL, { left: 4, top: '50%', height: 2, width: 12, transform: 'translateY(-50%)' }, () => toggleH('min'), H_LABELS.min)}
+          {bar(pinR, { right: 4, top: '50%', height: 2, width: 12, transform: 'translateY(-50%)' }, () => toggleH('max'), H_LABELS.max)}
+        </div>
+        <div style={conStyles.selects}>
+          <select style={pStyles.select} value={con.horizontal}
+            onChange={e => update({ horizontal: e.target.value as ConstraintMode })}>
+            {(Object.keys(H_LABELS) as ConstraintMode[]).map(m => <option key={m} value={m}>{H_LABELS[m]}</option>)}
+          </select>
+          <select style={pStyles.select} value={con.vertical}
+            onChange={e => update({ vertical: e.target.value as ConstraintMode })}>
+            {(Object.keys(V_LABELS) as ConstraintMode[]).map(m => <option key={m} value={m}>{V_LABELS[m]}</option>)}
+          </select>
+        </div>
+      </div>
+    </Section>
+  );
+}
+
+const conStyles: Record<string, React.CSSProperties> = {
+  wrap: { display: 'flex', gap: 10, alignItems: 'center' },
+  diagram: {
+    position: 'relative', width: 62, height: 62, flexShrink: 0,
+    border: '1px solid var(--border)', borderRadius: 4, background: 'var(--bg-inset)',
+  },
+  inner: {
+    position: 'absolute', left: 20, top: 20, right: 20, bottom: 20,
+    border: '1px solid var(--border-strong)', borderRadius: 2,
+  },
+  bar: { position: 'absolute', border: 'none', borderRadius: 1, padding: 0, cursor: 'pointer' },
+  selects: { display: 'flex', flexDirection: 'column', gap: 6, flex: 1, minWidth: 0 },
 };
 
 // ── Auto Layout section (Figma Shift+A panel) ─────────────────────────────────
@@ -1549,16 +2033,33 @@ function TypographySection({ shape, set, emit }: {
   const ts = shape.textStyle!;
   // Changing any type metric re-fits the box (Figma): auto-width grows width+height,
   // fixed-width keeps width and re-wraps to a new height.
+  const autoHeight = shape.textAutoHeight !== false;
+  const resizeMode: 'auto-width' | 'auto-height' | 'fixed' =
+    shape.textAutoWidth ? 'auto-width' : autoHeight ? 'auto-height' : 'fixed';
   const updateTs = (patch: Partial<TextStyle>) => {
     const nextStyle = { ...ts, ...patch };
     const fitted = fitTextSize({ ...shape, textStyle: nextStyle });
     const ops: Parameters<typeof api.applyChanges>[0]['ops'] = [
       { op: 'set', id: shape.id, attr: 'textStyle', val: nextStyle },
-      { op: 'set', id: shape.id, attr: 'height', val: fitted.height },
     ];
-    if (shape.textAutoWidth) ops.push({ op: 'set', id: shape.id, attr: 'width', val: fitted.width });
+    // Fixed size keeps the box the user drew; the other two modes re-fit to the text.
+    if (resizeMode !== 'fixed') ops.push({ op: 'set', id: shape.id, attr: 'height', val: fitted.height });
+    if (resizeMode === 'auto-width') ops.push({ op: 'set', id: shape.id, attr: 'width', val: fitted.width });
     emit(ops);
   };
+  const setResizeMode = (mode: 'auto-width' | 'auto-height' | 'fixed') => {
+    const ops: Parameters<typeof api.applyChanges>[0]['ops'] = [
+      { op: 'set', id: shape.id, attr: 'textAutoWidth', val: mode === 'auto-width' },
+      { op: 'set', id: shape.id, attr: 'textAutoHeight', val: mode !== 'fixed' },
+    ];
+    if (mode !== 'fixed') {
+      const fitted = fitTextSize({ ...shape, textAutoWidth: mode === 'auto-width' });
+      ops.push({ op: 'set', id: shape.id, attr: 'height', val: fitted.height });
+      if (mode === 'auto-width') ops.push({ op: 'set', id: shape.id, attr: 'width', val: fitted.width });
+    }
+    emit(ops);
+  };
+  const vAlign = shape.textVerticalAlign ?? 'top';
   const align = shape.paragraphs?.[0]?.align ?? 'left';
   const setAlign = (a: 'left' | 'center' | 'right' | 'justify') => {
     const paras = (shape.paragraphs ?? [{ spans: [{ text: '' }] }]).map(p => ({ ...p, align: a }));
@@ -1598,6 +2099,22 @@ function TypographySection({ shape, set, emit }: {
             </button>
           ))}
         </div>
+        <div style={pStyles.segGroup}>
+          {([['top', 'align-top'], ['middle', 'align-center-v'], ['bottom', 'align-bottom']] as const).map(([v, icon]) => (
+            <button key={v} title={`Align ${v}`} style={segBtnStyle(vAlign === v)}
+              onClick={() => set(shape.id, 'textVerticalAlign', v)}>
+              <Icon name={icon} size={15} />
+            </button>
+          ))}
+        </div>
+      </Row>
+      <Row>
+        <select style={{ ...pStyles.select, flex: 1 }} value={resizeMode}
+          onChange={e => setResizeMode(e.target.value as 'auto-width' | 'auto-height' | 'fixed')}>
+          <option value="auto-width">Auto width</option>
+          <option value="auto-height">Auto height</option>
+          <option value="fixed">Fixed size</option>
+        </select>
         <div style={pStyles.segGroup}>
           <button title="Underline" style={segBtnStyle(ts.textDecoration === 'underline')}
             onClick={() => updateTs({ textDecoration: ts.textDecoration === 'underline' ? 'none' : 'underline' })}>
@@ -1984,6 +2501,13 @@ const pStyles: Record<string, React.CSSProperties> = {
     background: 'var(--bg-inset)', border: '1px solid var(--border)',
     borderRadius: 7, color: 'var(--text)', fontSize: 12, padding: '0 8px',
     outline: 'none', cursor: 'pointer', height: 30,
+  },
+  // Free-text field (component property names/values) — same chrome as `select`.
+  textInput: {
+    minWidth: 0, flex: 1,
+    background: 'var(--bg-inset)', border: '1px solid var(--border)',
+    borderRadius: 7, color: 'var(--text)', fontSize: 12, padding: '0 8px',
+    outline: 'none', height: 30, fontFamily: 'inherit',
   },
   alignIconBtn: {
     background: 'var(--bg-inset)', border: '1px solid var(--border)', borderRadius: 6,
