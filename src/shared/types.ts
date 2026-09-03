@@ -270,7 +270,14 @@ export type InteractionTrigger =
 
 export type InteractionAction =
   | 'navigate' | 'back' | 'overlay' | 'swap-overlay' | 'close-overlay'
-  | 'url' | 'scroll-to' | 'none';
+  | 'url' | 'scroll-to'
+  // Figma's "Change to": swap an instance to a sibling variant in place, without leaving
+  // the screen. This is how interactive components (a button's hover state) are built.
+  | 'change-to'
+  // Figma's "Set variable mode": switch which mode a token collection resolves under.
+  // Neoxe's ThemeSet IS that concept, so the action targets a theme id.
+  | 'set-variable-mode'
+  | 'none';
 
 export type Transition =
   | 'none' | 'dissolve' | 'smart'
@@ -301,6 +308,11 @@ export interface Interaction {
   trigger: InteractionTrigger;
   action: InteractionAction;
   targetFrameId?: string; // navigate / overlay / swap-overlay
+  // 'change-to': the componentId of the sibling variant to swap this instance to. A
+  // component id rather than a shape id, because that is what identifies a variant.
+  targetComponentId?: string;
+  // 'set-variable-mode': the ThemeSet id to switch to, or 'default' for the base values.
+  targetThemeId?: string;
   url?: string;           // url action
   transition: Transition;
   // Animation timing. Defaults: 300ms, ease-out.
@@ -543,6 +555,11 @@ export interface Shape {
   // produces one file; `suffix` is appended to the layer name.
   exportSettings?: ExportSetting[];
 
+  // Open-path endpoint decoration (type='path'). StrokeCap has existed since the first
+  // stroke model but nothing read it; the Arrow tool is its first consumer.
+  strokeCapStart?: StrokeCap;
+  strokeCapEnd?: StrokeCap;
+
   // Shape-specific payloads
   content?: PathSegment[];     // type='path' or 'bool'
   paragraphs?: TextParagraph[]; // type='text'
@@ -551,6 +568,15 @@ export interface Shape {
   // type='text': false pins the box height, so the text clips instead of re-fitting.
   // Undefined behaves as true (auto height), which is Figma's default for a text box.
   textAutoHeight?: boolean;
+  /** type='text': lay the glyphs along this baseline instead of in a box (Text on path).
+   *  Stored in shape-local coordinates, so moving the text moves its baseline with it. */
+  textPath?: PathSegment[];
+  /** type='text': generate the baseline from the shape's own box instead of storing it.
+   *  This is what makes a Text-on-path resizable - the curve is re-derived from w/h each
+   *  frame, so dragging a handle reflows the glyphs instead of stretching a frozen path. */
+  textPathShape?: 'ellipse';
+  /** type='text': how far along `textPath` the first glyph starts, in document units. */
+  textPathOffset?: number;
   imageId?: string;             // type='image'
   svgContent?: string;          // type='svg'/'vector': raw SVG markup
   svgInnerHTML?: string;        // type='vector': innerHTML of <svg> (no outer tag) for inline DOM rendering
@@ -623,13 +649,35 @@ export interface Page {
   background: string;             // hex color
 }
 
+/** The page background the app used to hard-code. Because it was always set it ALWAYS
+ *  won over the themed canvas backdrop, so in dark mode the canvas stayed light and a
+ *  white artboard sat on it at 1.14:1 contrast - effectively invisible, since frames are
+ *  drawn as a bare fill with no outline. Treated as "unset" so existing documents pick
+ *  up the themed backdrop too. */
+export const LEGACY_PAGE_BG = '#F0F0F4';
+
+/** True only when the user deliberately chose a page background. An empty value - or the
+ *  legacy default above - means "follow the app theme". */
+export function hasCustomBackground(page: Pick<Page, 'background'>): boolean {
+  return !!page.background && page.background.toUpperCase() !== LEGACY_PAGE_BG;
+}
+
+/** True when a text shape lays its glyphs along a baseline rather than inside a box.
+ *  Such a shape's width/height ARE its geometry (the curve is derived from them), so the
+ *  auto-resize-to-fit-content rules for ordinary text boxes must not touch it. */
+export function isTextOnPath(shape: Pick<Shape, 'type' | 'textPath' | 'textPathShape'>): boolean {
+  if (shape.type !== 'text') return false;
+  return shape.textPathShape === 'ellipse' || (!!shape.textPath && shape.textPath.length > 1);
+}
+
 export function makeDefaultPage(id: string, name: string): Page {
   return {
     id,
     name,
     objects: {},
     childIds: [],
-    background: '#F0F0F4',
+    // Empty = follow the app theme (see hasCustomBackground).
+    background: '',
   };
 }
 

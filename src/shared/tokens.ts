@@ -94,12 +94,25 @@ export function applyTokensToFile(file: DesignFile): boolean {
 }
 
 // Set a value at a dotted/indexed path: "fills.0.color", "textStyle.fontSize", "width"
+// Containers a binding is allowed to CREATE when the shape doesn't have one yet, with the
+// shape it must be created in. Everything else keeps the strict "must already exist" rule
+// below — that guard is what stops a `fills.0.color` binding from injecting a stray `color`
+// onto a gradient fill. A radius token has nowhere to land without this: a rect that has
+// never been rounded simply has no `cornerRadii`, so the binding silently did nothing.
+const CREATABLE: Record<string, () => unknown> = {
+  cornerRadii: () => ({ tl: 0, tr: 0, br: 0, bl: 0 }),
+};
+
 function setByPath(obj: any, path: string, value: string | number): boolean {
   const parts = path.split('.');
   let cur = obj;
   for (let i = 0; i < parts.length - 1; i++) {
     const key = parts[i];
-    if (cur[key] === undefined || cur[key] === null) return false;
+    if (cur[key] === undefined || cur[key] === null) {
+      const make = i === 0 ? CREATABLE[key] : undefined;
+      if (!make) return false;
+      cur[key] = make();
+    }
     cur = cur[key];
   }
   const last = parts[parts.length - 1];

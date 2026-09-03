@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { describe, it, expect, beforeEach } from 'vitest';
-import { makeDefaultShape, Page, DesignFile, Shape } from './types';
+import { makeDefaultShape, Page, DesignFile, Shape, Interaction } from './types';
 import { generatePrototypeHtml } from './prototype';
 
 // Full integration test of the EXPORTED runtime: build a multi-frame navigate chain,
@@ -189,6 +189,61 @@ describe('exported prototype runtime — live navigation (jsdom)', () => {
     // And clicking the loose rect navigates.
     (document.querySelector('#screen-f0 .hotspot') as HTMLElement).click();
     expect((document.querySelector('.screen.active') as HTMLElement).id).toBe('screen-f1');
+  });
+
+  it('a comment is signed, and an empty one is not saved', () => {
+    const { file, page } = buildChain(2);
+    mount(generatePrototypeHtml(file, page));
+    localStorage.clear();
+    localStorage.setItem('edit-proto-author', 'Deep');
+
+    (document.getElementById('commentBtn') as HTMLElement).click();
+    const layer = document.querySelector('#screen-f0 .comment-layer') as HTMLElement;
+    layer.dispatchEvent(new MouseEvent('click', { bubbles: true, clientX: 40, clientY: 40 }));
+    const pop = layer.querySelector('.comment-pop') as HTMLElement;
+
+    // The card names its author — an exported note with no author is useless to whoever
+    // receives it.
+    expect((pop.querySelector('.who') as HTMLElement).textContent).toBe('Deep');
+    expect((pop.querySelector('.avatar') as HTMLElement).textContent).toBe('D');
+
+    // Saving an empty note used to create a blank pin.
+    (pop.querySelector('.cbtn-save') as HTMLElement).click();
+    expect(layer.querySelector('.comment-pin')).toBeNull();
+
+    (pop.querySelector('textarea') as HTMLTextAreaElement).value = 'Signed feedback';
+    (pop.querySelector('.cbtn-save') as HTMLElement).click();
+    const stored = JSON.parse(localStorage.getItem(Object.keys(localStorage).find(k => k.startsWith('edit-proto-comments::'))!)!);
+    expect(stored.f0[0]).toMatchObject({ text: 'Signed feedback', author: 'Deep' });
+  });
+
+  it('importing a reviewer’s comments merges instead of wiping your own', async () => {
+    const { file, page } = buildChain(2);
+    mount(generatePrototypeHtml(file, page));
+    localStorage.clear();
+    localStorage.setItem('edit-proto-author', 'Me');
+
+    // One local comment.
+    (document.getElementById('commentBtn') as HTMLElement).click();
+    const layer = document.querySelector('#screen-f0 .comment-layer') as HTMLElement;
+    layer.dispatchEvent(new MouseEvent('click', { bubbles: true, clientX: 10, clientY: 10 }));
+    const pop = layer.querySelector('.comment-pop') as HTMLElement;
+    (pop.querySelector('textarea') as HTMLTextAreaElement).value = 'mine';
+    (pop.querySelector('.cbtn-save') as HTMLElement).click();
+
+    // A reviewer's file arrives with a different comment on the same screen.
+    const incoming = { comments: { f0: [
+      { id: 'theirs-1', x: 50, y: 60, text: 'theirs', t: Date.now(), author: 'Reviewer' },
+    ] } };
+    const input = document.getElementById('importFile') as HTMLInputElement;
+    const file2 = new File([JSON.stringify(incoming)], 'comments.json', { type: 'application/json' });
+    (input.onchange as (e: unknown) => void)({ target: { files: [file2], value: '' } });
+    await new Promise(r => setTimeout(r, 30));   // FileReader is async
+
+    const key = Object.keys(localStorage).find(k => k.startsWith('edit-proto-comments::'))!;
+    const stored = JSON.parse(localStorage.getItem(key)!);
+    // Both survive. Replacing wholesale destroyed the local notes.
+    expect(stored.f0.map((c: { text: string }) => c.text).sort()).toEqual(['mine', 'theirs']);
   });
 
   it('comment mode: place → save → pin renders at click point; persists to localStorage', () => {
@@ -417,5 +472,274 @@ describe('exported prototype — scrolling and timing attributes', () => {
     const html = generatePrototypeHtml(file, page);
     expect(html).toContain('data-action="scroll-to"');
     expect(html).toContain('data-scroll-y="700"');
+  });
+});
+
+// ── Figma-parity fixes: timing that was authored but discarded, and event precision ──
+// jsdom has no Web Animations, so the runtime's anim() bails out via `!el.animate`. Stub it
+// to record what the runtime ASKED for — that is exactly the authored-timing claim.
+function recordAnimations(): { calls: { duration: number; easing: string }[] } {
+  const rec: { calls: { duration: number; easing: string }[] } = { calls: [] };
+  Object.defineProperty(Element.prototype, 'animate', {
+    configurable: true, writable: true,
+    value: function (_frames: unknown, opts: { duration: number; easing: string }) {
+      rec.calls.push({ duration: opts.duration, easing: opts.easing });
+      return { onfinish: null, cancel() {} };
+    },
+  });
+  return rec;
+}
+
+describe('authored transition timing is honoured, not silently discarded', () => {
+  beforeEach(() => { document.body.innerHTML = ''; });
+
+  it('Back uses the interaction’s own duration and easing', () => {
+    const { file, page } = buildChain(2);
+    // Screen f1 carries a Back interaction with deliberately distinctive timing.
+    page.objects.f1.interactions = [{
+      id: 'b1', trigger: 'click', action: 'back',
+      transition: 'dissolve', duration: 900, easing: 'linear',
+    }];
+    mount(generatePrototypeHtml(file, page));
+    (document.querySelector('#screen-f0 .hotspot') as HTMLElement).click();   // f0 -> f1
+    const rec = recordAnimations();
+    (document.querySelector('#screen-f1 .hotspot[data-action="back"]') as HTMLElement).click();
+    // Before the fix goBack() hardcoded 220ms / ease-out and threw these away, so the
+    // Animation, Easing and Duration controls did nothing whatsoever for a Back action.
+    expect(rec.calls.some(c => c.duration === 900)).toBe(true);
+    expect(document.querySelector('.screen.active')!.id).toBe('screen-f0');
+  });
+
+  it('Close overlay uses the interaction’s own duration', () => {
+    const { file, page } = buildChain(2);
+    page.objects.f0.interactions = [{
+      id: 'o1', trigger: 'click', action: 'overlay', targetFrameId: 'f1',
+      transition: 'dissolve', duration: 10,
+    }];
+    page.objects.f1.interactions = [{
+      id: 'c1', trigger: 'click', action: 'close-overlay',
+      transition: 'dissolve', duration: 800, easing: 'linear',
+    }];
+    mount(generatePrototypeHtml(file, page));
+    (document.querySelector('#screen-f0 .hotspot[data-action="overlay"]') as HTMLElement).click();
+    const rec = recordAnimations();
+    const closer = document.querySelector('.ov-item .hotspot[data-action="close-overlay"]')
+      ?? document.querySelector('.hotspot[data-action="close-overlay"]');
+    (closer as HTMLElement).click();
+    expect(rec.calls.some(c => c.duration === 800)).toBe(true);   // was hardcoded 160
+  });
+
+  it('the toolbar Back button still works after Back gained parameters', () => {
+    // Regression: backBtn.onclick = goBack passed a MouseEvent as the transition, which
+    // reached transition.replace() and threw.
+    const { file, page } = buildChain(2);
+    mount(generatePrototypeHtml(file, page));
+    (document.querySelector('#screen-f0 .hotspot') as HTMLElement).click();
+    expect(document.querySelector('.screen.active')!.id).toBe('screen-f1');
+    (document.getElementById('backBtn') as HTMLElement).click();
+    expect(document.querySelector('.screen.active')!.id).toBe('screen-f0');
+  });
+});
+
+describe('slide-* is a distinct transition from move-in-*', () => {
+  beforeEach(() => { document.body.innerHTML = ''; });
+
+  const animateOutgoing = (transition: 'slide-left' | 'move-in-left') => {
+    const { file, page } = buildChain(2);
+    page.objects.f0.interactions = [{
+      id: 'n1', trigger: 'click', action: 'navigate', targetFrameId: 'f1',
+      transition, duration: 300,
+    }];
+    mount(generatePrototypeHtml(file, page));
+    const rec = recordAnimations();
+    (document.querySelector('#screen-f0 .hotspot') as HTMLElement).click();
+    return rec.calls.length;
+  };
+
+  it('slide moves the outgoing screen as well as the incoming one', () => {
+    // Two animations: incoming in, outgoing drifting. Figma's Slide moves both; before the
+    // fix the direction suffix was stripped and slide-* was byte-identical to move-in-*,
+    // making four of the eighteen dropdown options silent duplicates.
+    expect(animateOutgoing('slide-left')).toBe(2);
+  });
+
+  it('move-in leaves the outgoing screen where it is', () => {
+    expect(animateOutgoing('move-in-left')).toBe(1);
+  });
+});
+
+describe('mouse-enter fires on the hotspot boundary, not on every descendant', () => {
+  beforeEach(() => { document.body.innerHTML = ''; });
+
+  it('does not re-fire when the pointer moves between children of the same hotspot', () => {
+    const { file, page } = buildChain(3);
+    page.objects.f0.interactions = [{
+      id: 'm1', trigger: 'mouse-enter', action: 'navigate', targetFrameId: 'f1',
+      transition: 'none', duration: 0,
+    }];
+    mount(generatePrototypeHtml(file, page));
+    const hotspot = document.querySelector('#screen-f0 .hotspot') as HTMLElement;
+    const inner = document.createElement('span');
+    hotspot.appendChild(inner);
+
+    // Entering from outside: fires.
+    hotspot.dispatchEvent(new MouseEvent('mouseover', { bubbles: true, relatedTarget: document.body }));
+    expect(document.querySelector('.screen.active')!.id).toBe('screen-f1');
+
+    // Now back on f0 and slide the pointer onto a child of the SAME hotspot. mouseover
+    // bubbles from descendants, so this used to re-fire the navigate — moving from a
+    // button's padding onto its own label counted as a fresh mouse-enter.
+    (document.getElementById('homeBtn') as HTMLElement).click();
+    expect(document.querySelector('.screen.active')!.id).toBe('screen-f0');
+    inner.dispatchEvent(new MouseEvent('mouseover', { bubbles: true, relatedTarget: hotspot }));
+    expect(document.querySelector('.screen.active')!.id).toBe('screen-f0');
+  });
+});
+
+// ── Figma parity: "Change to" (variant swap) and "Set variable mode" (theme swap) ──
+
+/** One screen holding an instance of variant A, with variant B's master parked offscreen. */
+function buildVariantFile(trigger: Interaction['trigger'] = 'click') {
+  const mk = (o: Partial<Shape> & { id: string; name: string }) => makeDefaultShape({
+    type: 'frame', frameId: o.id, x: 0, y: 0, width: 100, height: 40,
+    selrect: { x: o.x ?? 0, y: o.y ?? 0, width: 100, height: 40 }, ...o,
+  } as Parameters<typeof makeDefaultShape>[0]);
+
+  const screen = mk({ id: 'f0', name: 'Screen', x: 0, y: 0, width: 400, height: 300,
+    selrect: { x: 0, y: 0, width: 400, height: 300 },
+    fills: [{ type: 'solid', color: '#ffffff', opacity: 1 }], childIds: ['inst'] });
+  // The instance sits at (50,60) inside the screen and points at variant A.
+  const inst = mk({ id: 'inst', name: 'Button', frameId: 'f0', parentId: 'f0', x: 50, y: 60,
+    selrect: { x: 50, y: 60, width: 100, height: 40 }, masterId: 'cmpA',
+    fills: [{ type: 'solid', color: '#5C7CFA', opacity: 1 }],
+    interactions: [{ id: 'sw', trigger, action: 'change-to', targetComponentId: 'cmpB', transition: 'none' }] });
+  // Variant B's master lives far away on the canvas — its coordinates must be translated
+  // onto the instance when the runtime swaps it in.
+  const masterB = mk({ id: 'mB', name: 'Button / Hover', frameId: 'mB', x: 900, y: 900,
+    selrect: { x: 900, y: 900, width: 100, height: 40 }, componentId: 'cmpB',
+    fills: [{ type: 'solid', color: '#3B5BDB', opacity: 1 }] });
+
+  const page: Page = { id: 'p1', name: 'Page 1', background: '#fff',
+    childIds: ['f0', 'mB'], objects: { f0: screen, inst, mB: masterB } };
+  const file: DesignFile = {
+    id: 'f1', name: 'Variants', version: 1, pages: [page], activePageId: 'p1',
+    images: {},
+    components: { cmpA: { name: 'Button / Default', pageId: 'p1', shapeId: 'inst', setId: 'set1' },
+      cmpB: { name: 'Button / Hover', pageId: 'p1', shapeId: 'mB', setId: 'set1' } },
+    colors: [], typographies: [], tokens: [], themes: [], activeThemeId: 'default',
+    prototypeStartFrameId: 'f0',
+  };
+  return { file, page };
+}
+
+describe('Change to — swaps an instance to a sibling variant in place', () => {
+  beforeEach(() => { document.body.innerHTML = ''; });
+
+  const shown = (variant: string) =>
+    [...document.querySelectorAll('#screen-f0 [data-vvariant="' + variant + '"]')]
+      .filter(el => (el as HTMLElement).style.display !== 'none').length;
+
+  it('renders both variants, with only the current one visible', () => {
+    const { file, page } = buildVariantFile();
+    mount(generatePrototypeHtml(file, page));
+    expect(document.querySelectorAll('#screen-f0 [data-vgroup="inst"]').length).toBeGreaterThan(1);
+    expect(shown('cmpA')).toBeGreaterThan(0);
+    expect(shown('cmpB')).toBe(0);       // the alternate ships hidden
+  });
+
+  it('positions the alternate variant over the instance, not at the master’s coordinates', () => {
+    const { file, page } = buildVariantFile();
+    const html = generatePrototypeHtml(file, page);
+    mount(html);
+    const alt = document.querySelector('#screen-f0 [data-vvariant="cmpB"]') as HTMLElement;
+    // Master B is at (900,900) on the canvas; the instance is at (50,60) in the screen.
+    expect(alt.style.left).toBe('50px');
+    expect(alt.style.top).toBe('60px');
+  });
+
+  it('clicking swaps which variant is displayed', () => {
+    const { file, page } = buildVariantFile('click');
+    mount(generatePrototypeHtml(file, page));
+    (document.querySelector('#screen-f0 .hotspot[data-action="change-to"]') as HTMLElement).click();
+    expect(shown('cmpB')).toBeGreaterThan(0);
+    expect(shown('cmpA')).toBe(0);
+    // …and it stays on the same screen. A variant swap is not navigation.
+    expect(document.querySelector('.screen.active')!.id).toBe('screen-f0');
+  });
+
+  it('a While-hovering swap reverts when the pointer leaves', () => {
+    const { file, page } = buildVariantFile('hover');
+    mount(generatePrototypeHtml(file, page));
+    const spot = document.querySelector('#screen-f0 .hotspot[data-action="change-to"]') as HTMLElement;
+    spot.dispatchEvent(new MouseEvent('mouseover', { bubbles: true, relatedTarget: document.body }));
+    expect(shown('cmpB')).toBeGreaterThan(0);
+    spot.dispatchEvent(new MouseEvent('mouseout', { bubbles: true, relatedTarget: document.body }));
+    expect(shown('cmpA')).toBeGreaterThan(0);   // back to the variant it started on
+    expect(shown('cmpB')).toBe(0);
+  });
+
+  it('a variant target that no longer exists emits no hotspot', () => {
+    const { file, page } = buildVariantFile();
+    page.objects.inst.interactions![0].targetComponentId = 'deleted';
+    expect(generatePrototypeHtml(file, page)).not.toContain('data-action="change-to"');
+  });
+});
+
+describe('Set variable mode — retheming without leaving the screen', () => {
+  beforeEach(() => { document.body.innerHTML = ''; });
+
+  function buildThemedFile() {
+    const { file, page } = buildChain(1);
+    file.tokens = [{ id: 't1', name: 'color.primary', $type: 'color', $value: '#5C7CFA' }];
+    file.themes = [{ id: 'dark', name: 'Dark', values: { 'color.primary': '#0EA5A5' } }];
+    // A box bound to the token, and a hotspot that switches to the Dark mode.
+    page.objects.box = makeDefaultShape({
+      id: 'box', type: 'rect', name: 'Box', frameId: 'f0', parentId: 'f0',
+      x: 10, y: 10, width: 80, height: 80, selrect: { x: 10, y: 10, width: 80, height: 80 },
+      fills: [{ type: 'solid', color: '#5C7CFA', opacity: 1 }],
+      tokenBindings: { 'fills.0.color': 'color.primary' },
+      interactions: [{ id: 'm1', trigger: 'click', action: 'set-variable-mode',
+        targetThemeId: 'dark', transition: 'none' }],
+    });
+    page.objects.f0.childIds = ['box'];
+    return { file, page };
+  }
+
+  it('emits a custom property per colour token, and a block per mode', () => {
+    const { file, page } = buildThemedFile();
+    const html = generatePrototypeHtml(file, page);
+    expect(html).toContain('--tok-color-primary:#5C7CFA');            // :root default
+    expect(html).toContain('body[data-proto-mode="dark"]');
+    expect(html).toContain('--tok-color-primary:#0EA5A5');            // the Dark override
+  });
+
+  it('re-expresses the bound colour as var() so the mode can win', () => {
+    const { file, page } = buildThemedFile();
+    mount(generatePrototypeHtml(file, page));
+    const box = document.querySelector('[data-id="box"]') as HTMLElement;
+    // The baked colour stays as the fallback; the var() is appended after it and wins.
+    expect(box.getAttribute('style')).toContain('background:var(--tok-color-primary)');
+  });
+
+  it('clicking sets the mode on <body>, and Default clears it', () => {
+    const { file, page } = buildThemedFile();
+    mount(generatePrototypeHtml(file, page));
+    (document.querySelector('.hotspot[data-action="set-variable-mode"]') as HTMLElement).click();
+    expect(document.body.getAttribute('data-proto-mode')).toBe('dark');
+
+    page.objects.box.interactions![0].targetThemeId = 'default';
+    mount(generatePrototypeHtml(file, page));
+    (document.querySelector('.hotspot[data-action="set-variable-mode"]') as HTMLElement).click();
+    expect(document.body.hasAttribute('data-proto-mode')).toBe(false);
+  });
+
+  it('an unknown mode emits no hotspot, and files with no mode switch carry no var()', () => {
+    const { file, page } = buildThemedFile();
+    page.objects.box.interactions![0].targetThemeId = 'nope';
+    expect(generatePrototypeHtml(file, page)).not.toContain('data-action="set-variable-mode"');
+
+    // No switcher anywhere -> no var() indirection is added to the export at all.
+    page.objects.box.interactions = [];
+    expect(generatePrototypeHtml(file, page)).not.toContain('background:var(--tok-');
   });
 });

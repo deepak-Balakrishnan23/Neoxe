@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { DesignToken, TokenType } from '../../shared/types';
+import { DesignToken, TokenType, Shape } from '../../shared/types';
 import { useDesignStore } from '../store/useDesignStore';
 import { api } from '../ipc/api';
 import { resolveToken, activeTheme, isAlias, exportTokensW3C } from '../../shared/tokens';
@@ -9,8 +9,44 @@ const TYPE_DOT: Record<TokenType, string> = {
   fontWeight: 'B', spacing: '⊟', borderRadius: '⌜', opacity: '◐',
 };
 
+/**
+ * The shape property each token type drives. A token type with nowhere to land returns an
+ * explanation instead of an empty result, so the Apply button always says something.
+ */
+function bindingPaths(type: TokenType, shape: Shape): { paths: string[]; why: string } {
+  const no = (why: string) => ({ paths: [], why });
+  switch (type) {
+    case 'color':
+      if (shape.type === 'text') return { paths: ['textStyle.color'], why: '' };
+      if (shape.fills.length > 0) return { paths: ['fills.0.color'], why: '' };
+      return no('This layer has no fill to bind a colour to. Add a fill first.');
+    case 'borderRadius':
+      // Radius lives per corner; bind all four so the token drives the whole shape.
+      return { paths: ['cornerRadii.tl', 'cornerRadii.tr', 'cornerRadii.br', 'cornerRadii.bl'], why: '' };
+    case 'opacity':
+      return { paths: ['opacity'], why: '' };
+    case 'fontFamily':
+      return shape.type === 'text'
+        ? { paths: ['textStyle.fontFamily'], why: '' }
+        : no('A font token applies to text layers only');
+    case 'fontWeight':
+      return shape.type === 'text'
+        ? { paths: ['textStyle.fontWeight'], why: '' }
+        : no('A font token applies to text layers only');
+    case 'spacing':
+      return shape.autoLayout
+        ? { paths: ['autoLayout.spacing'], why: '' }
+        : no('A spacing token drives auto-layout gap. Add auto layout to this frame first.');
+    case 'dimension':
+    case 'number':
+      // Deliberately unmapped: a bare number could be width, height, gap or stroke weight,
+      // and guessing would bind the wrong one. Alias it from a typed token instead.
+      return no(`A ${type} token has no single property to bind to. Use a spacing, radius or opacity token.`);
+  }
+}
+
 export default function TokensPanel() {
-  const { file, setFile, selectedIds, activePage } = useDesignStore();
+  const { file, setFile, selectedIds, activePage, showToast } = useDesignStore();
   const [adding, setAdding] = useState(false);
   const [newName, setNewName] = useState('');
   const [newType, setNewType] = useState<TokenType>('color');
@@ -74,20 +110,33 @@ export default function TokensPanel() {
                   onApply={async () => {
                     if (!selectedShape) return;
                     const page = activePage()!;
-                    // Determine binding path by token type
-                    let path: string | null = null;
-                    if (token.$type === 'color') {
-                      if (selectedShape.type === 'text') path = 'textStyle.color';
-                      else if (selectedShape.fills.length > 0) path = 'fills.0.color';
-                    } else if (token.$type === 'borderRadius') {
-                      path = 'borderRadius';
+                    // Which property this token type drives, and WHY it can't be applied
+                    // when it can't. Returning silently — as this did for every type
+                    // except color — makes a working button look broken.
+                    const { paths, why } = bindingPaths(token.$type, selectedShape);
+                    if (paths.length === 0) { showToast(why); return; }
+                    let updated = null;
+                    for (const path of paths) {
+                      const res = await api.bindToken(selectedShape.id, page.id, path, token.name);
+                      if (res.ok && res.data) updated = res.data;
                     }
-                    if (!path) return;
-                    const res = await api.bindToken(selectedShape.id, page.id, path, token.name);
-                    if (res.ok && res.data) setFile(res.data);
+                    if (updated) setFile(updated);
                   }}
                   onDelete={async () => {
                     const res = await api.deleteToken(token.id);
+                    if (res.ok && res.data) setFile(res.data);
+                  }}
+                  onValue={async (raw) => {
+                    // A token exists to be changed once and followed everywhere. The
+                    // engine re-resolves every binding on update, so editing here is what
+                    // makes the whole system worth having — there was no way to do it.
+                    const v: string | number = raw.trim();
+                    let next: string | number;
+                    if (token.$type === 'color' || isAlias(v)) next = v;
+                    else if (v === '') next = token.$value;          // empty = leave as-is
+                    else { const n = Number(v); next = Number.isFinite(n) ? n : v; }
+                    if (next === token.$value) return;
+                    const res = await api.updateToken(token.id, { $value: next });
                     if (res.ok && res.data) setFile(res.data);
                   }}
                 />
@@ -109,7 +158,7 @@ export default function TokensPanel() {
             <input style={styles.input} placeholder="value or {alias}"
               value={newValue} onChange={e => setNewValue(e.target.value)}
               onKeyDown={e => { if (e.key === 'Enter') addToken(); e.stopPropagation(); }} />
-            <div style={{ display: 'flex', gap: 6 }}>
+            <div style={{ display: 'flex', gap: 8 }}>
               <button style={styles.primaryBtn} onClick={addToken}>Add</button>
               <button style={styles.ghostBtn} onClick={() => setAdding(false)}>Cancel</button>
             </div>
@@ -133,7 +182,7 @@ export default function TokensPanel() {
 
 // ── TokenRow ──────────────────────────────────────────────────────────────────
 
-function TokenRow({ token, resolved, aliased, shortName, canApply, onApply, onDelete }: {
+function TokenRow({ token, resolved, aliased, shortName, canApply, onApply, onDelete, onValue }: {
   token: DesignToken;
   resolved: string | number | null;
   aliased: boolean;
@@ -141,6 +190,7 @@ function TokenRow({ token, resolved, aliased, shortName, canApply, onApply, onDe
   canApply: boolean;
   onApply: () => void;
   onDelete: () => void;
+  onValue: (raw: string) => void;
 }) {
   const isColor = token.$type === 'color';
   return (
@@ -151,10 +201,18 @@ function TokenRow({ token, resolved, aliased, shortName, canApply, onApply, onDe
         <span style={styles.typeDot}>{TYPE_DOT[token.$type]}</span>
       )}
       <span style={styles.tokenName}>{shortName}</span>
-      <span style={styles.tokenValue}>
-        {aliased ? <span style={styles.aliasTag}>{String(token.$value)}</span> : null}
-        {!aliased && String(resolved)}
-      </span>
+      <input
+        style={{ ...styles.tokenValue, ...styles.valueInput }}
+        defaultValue={String(token.$value)}
+        key={String(token.$value)}
+        title={aliased ? `alias → ${String(resolved)}` : 'Token value: edit to update every layer bound to it'}
+        onBlur={e => onValue(e.target.value)}
+        onKeyDown={e => {
+          if (e.key === 'Enter') (e.target as HTMLInputElement).blur();
+          if (e.key === 'Escape') { (e.target as HTMLInputElement).value = String(token.$value); (e.target as HTMLInputElement).blur(); }
+          e.stopPropagation();
+        }}
+      />
       {canApply && (
         <button style={styles.applyBtn} title="Apply to selection" onClick={onApply}>⊕</button>
       )}
@@ -176,7 +234,7 @@ function exportTokens(file: { tokens: DesignToken[] }) {
 }
 
 const styles: Record<string, React.CSSProperties> = {
-  panel: { flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden', fontFamily: 'system-ui' },
+  panel: { flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden', fontFamily: 'var(--font-ui)' },
   empty: { padding: 16, color: 'var(--text-secondary)', fontSize: 12 },
   themeBar: {
     display: 'flex', alignItems: 'center', gap: 8, padding: '8px 10px',
@@ -185,39 +243,44 @@ const styles: Record<string, React.CSSProperties> = {
   themeLabel: { fontSize: 11, color: 'var(--text-secondary)', textTransform: 'uppercase', letterSpacing: '0.06em' },
   themeSelect: {
     flex: 1, background: 'var(--border)', border: '1px solid var(--border-strong)',
-    borderRadius: 4, color: 'var(--text)', fontSize: 12, padding: '3px 6px', cursor: 'pointer', outline: 'none',
+    borderRadius: 4, color: 'var(--text)', fontSize: 12, padding: '0 6px', height: 24, cursor: 'pointer', outline: 'none',
   },
   scroll: { flex: 1, overflowY: 'auto', padding: '6px 8px' },
-  group: { marginBottom: 10 },
+  group: { marginBottom: 8 },
   groupHeader: {
-    fontSize: 10, fontWeight: 600, color: 'var(--text-secondary)',
+    fontSize: 11, fontWeight: 600, color: 'var(--text-secondary)',
     textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 4, paddingLeft: 2,
   },
   tokenRow: {
-    display: 'flex', alignItems: 'center', gap: 6, padding: '3px 4px',
+    display: 'flex', alignItems: 'center', gap: 8, padding: '4px 4px',
     fontSize: 12, borderRadius: 4,
   },
-  swatch: { width: 16, height: 16, borderRadius: 3, flexShrink: 0, border: '1px solid var(--border-strong)' },
+  swatch: { width: 16, height: 16, borderRadius: 4, flexShrink: 0, border: '1px solid var(--border-strong)' },
   typeDot: { width: 16, textAlign: 'center', color: 'var(--text-secondary)', fontSize: 11, flexShrink: 0 },
   tokenName: { flex: 1, color: 'var(--text)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
-  tokenValue: { color: 'var(--text-secondary)', fontSize: 10, fontFamily: 'monospace', flexShrink: 0, maxWidth: 80, overflow: 'hidden', textOverflow: 'ellipsis' },
+  tokenValue: { color: 'var(--text-secondary)', fontSize: 10, fontFamily: 'var(--font-mono)', flexShrink: 0, maxWidth: 80, overflow: 'hidden', textOverflow: 'ellipsis' },
   aliasTag: { color: 'var(--accent-hover)' },
   applyBtn: { background: 'transparent', border: 'none', color: 'var(--accent-hover)', fontSize: 13, cursor: 'pointer', padding: '0 2px', flexShrink: 0 },
   deleteBtn: { background: 'transparent', border: 'none', color: 'var(--text-secondary)', fontSize: 13, cursor: 'pointer', padding: '0 2px', flexShrink: 0 },
-  addForm: { display: 'flex', flexDirection: 'column', gap: 6, padding: '8px 4px' },
+  addForm: { display: 'flex', flexDirection: 'column', gap: 8, padding: '8px 4px' },
+  valueInput: {
+    background: 'transparent', border: '1px solid transparent', borderRadius: 4,
+    color: 'var(--text-secondary)', font: 'inherit', textAlign: 'right',
+    outline: 'none', padding: '1px 4px', minWidth: 0,
+  },
   input: {
     background: 'var(--border)', border: '1px solid var(--border-strong)',
-    borderRadius: 4, color: 'var(--text)', fontSize: 12, padding: '4px 6px', outline: 'none', fontFamily: 'system-ui',
+    borderRadius: 4, color: 'var(--text)', fontSize: 12, padding: '0 6px', height: 24, outline: 'none', fontFamily: 'var(--font-ui)',
   },
-  primaryBtn: { background: 'var(--accent)', color: '#fff', border: 'none', borderRadius: 4, padding: '4px 12px', fontSize: 12, cursor: 'pointer' },
-  ghostBtn: { background: 'var(--border)', color: 'var(--text)', border: 'none', borderRadius: 4, padding: '4px 12px', fontSize: 12, cursor: 'pointer' },
+  primaryBtn: { background: 'var(--accent)', color: '#fff', border: 'none', borderRadius: 4, padding: '0 12px', height: 24, fontSize: 12, cursor: 'pointer' },
+  ghostBtn: { background: 'var(--border)', color: 'var(--text)', border: 'none', borderRadius: 4, padding: '0 12px', height: 24, fontSize: 12, cursor: 'pointer' },
   addTokenBtn: {
     width: '100%', background: 'var(--border)', border: '1px dashed var(--border-strong)',
-    borderRadius: 6, color: 'var(--text-secondary)', fontSize: 12, padding: '6px', cursor: 'pointer', marginTop: 4,
+    borderRadius: 6, color: 'var(--text-secondary)', fontSize: 12, padding: '0 8px', height: 28, cursor: 'pointer', marginTop: 4,
   },
   exportBtn: {
     width: '100%', background: 'transparent', border: 'none',
-    color: 'var(--text-secondary)', fontSize: 11, padding: '8px', cursor: 'pointer', marginTop: 8,
+    color: 'var(--text-secondary)', fontSize: 11, padding: '0 8px', height: 28, cursor: 'pointer', marginTop: 8,
   },
   applyHint: { fontSize: 10, color: 'var(--text-muted)', textAlign: 'center', padding: '4px 8px', lineHeight: 1.5 },
 };

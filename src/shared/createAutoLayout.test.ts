@@ -108,3 +108,55 @@ describe('createAutoLayoutFromSelection', () => {
   });
 });
 
+
+describe('direction inference uses separation, not centre spread', () => {
+  const directionOf = (shapes: Shape[]) => {
+    const plan = createAutoLayoutFromSelection(makePage(shapes), shapes.map(s => s.id), fixedIdSeq())!;
+    return (plan.ops[0] as ChangeOp & { op: 'add'; shape: Shape }).shape.autoLayout!.direction;
+  };
+
+  it('reads a narrow bar above a wide card row as a column', () => {
+    // Centres spread 368 along X and 302 along Y, so a centre-spread test calls this a
+    // row — but the two boxes never share a scanline, so it is plainly a column.
+    expect(directionOf([
+      rect({ id: 'nav', x: 40, y: 40, width: 185, height: 51 }),
+      rect({ id: 'cards', x: 63, y: 249, width: 875, height: 238 }),
+    ])).toBe('vertical');
+  });
+
+  it('still reads a nav bar as a row', () => {
+    expect(directionOf([
+      rect({ id: 'logo', x: 40, y: 40, width: 100, height: 50 }),
+      rect({ id: 'links', x: 200, y: 40, width: 300, height: 50 }),
+      rect({ id: 'cta', x: 600, y: 40, width: 160, height: 50 }),
+    ])).toBe('horizontal');
+  });
+
+  it('reads a wide hero beside a narrow rail as a row', () => {
+    expect(directionOf([
+      rect({ id: 'hero', x: 0, y: 0, width: 700, height: 400 }),
+      rect({ id: 'rail', x: 740, y: 20, width: 120, height: 90 }),
+    ])).toBe('horizontal');
+  });
+});
+
+describe('wrapping a selection preserves a child that hugs its own content', () => {
+  it('keeps hug on both axes, and still pins fixed/fill children', () => {
+    const hugger = rect({ id: 'hugger', x: 0, y: 0, width: 300, height: 100 });
+    hugger.widthMode = 'hug';
+    hugger.heightMode = 'hug';
+    const filler = rect({ id: 'filler', x: 0, y: 140, width: 300, height: 100 });
+    filler.widthMode = 'fill';
+    const plan = createAutoLayoutFromSelection(makePage([hugger, filler]), ['hugger', 'filler'], fixedIdSeq())!;
+    const modeOf = (id: string, attr: 'widthMode' | 'heightMode') =>
+      (plan.ops.filter(o => o.op === 'set' && o.id === id && o.attr === attr) as
+        (ChangeOp & { op: 'set'; val: unknown })[]).map(o => o.val);
+
+    // The hugging child is left alone — no mode op is emitted for it at all.
+    expect(modeOf('hugger', 'widthMode')).toEqual([]);
+    expect(modeOf('hugger', 'heightMode')).toEqual([]);
+    // A fill child's sizing described its OLD parent, so it is pinned like an unset axis.
+    expect(modeOf('filler', 'widthMode')).toEqual(['fixed']);
+    expect(modeOf('filler', 'heightMode')).toEqual(['fixed']);
+  });
+});

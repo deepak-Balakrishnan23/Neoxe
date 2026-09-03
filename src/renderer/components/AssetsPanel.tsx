@@ -188,7 +188,7 @@ function TypographyTab() {
         <span>Typographies</span>
         <button style={styles.addBtn} title="Add typography" onClick={async () => {
           const res = await api.addTypography('New Style', {
-            fontFamily: 'system-ui, sans-serif',
+            fontFamily: 'var(--font-ui)',
             fontWeight: 400, fontSize: 16, lineHeight: 1.4, letterSpacing: 0,
           });
           if (res.ok && res.data) setFile(res.data);
@@ -225,12 +225,13 @@ function TypographyTab() {
 // ── Styles ────────────────────────────────────────────────────────────────────
 
 const styles: Record<string, React.CSSProperties> = {
-  panel: { flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden', fontFamily: 'system-ui' },
+  panel: { flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden', fontFamily: 'var(--font-ui)' },
   tabs: { display: 'flex', borderBottom: '1px solid var(--border)', flexShrink: 0 },
   tab: {
     flex: 1, background: 'transparent', borderWidth: 0, borderStyle: 'solid',
     borderBottomWidth: 2, borderBottomColor: 'transparent', color: 'var(--text-secondary)',
-    fontSize: 16, padding: '8px 4px', cursor: 'pointer',
+    fontSize: 16, padding: '0 4px', cursor: 'pointer',
+    height: 32, display: 'flex', alignItems: 'center', justifyContent: 'center',
   },
   tabActive: { color: 'var(--text)', borderBottomColor: 'var(--accent)' },
   content: { flex: 1, overflowY: 'auto', padding: '8px 8px' },
@@ -256,20 +257,20 @@ const styles: Record<string, React.CSSProperties> = {
   },
   sectionHeader: {
     display: 'flex', justifyContent: 'space-between', alignItems: 'center',
-    fontSize: 10, fontWeight: 600, color: 'var(--text-secondary)',
+    fontSize: 11, fontWeight: 600, color: 'var(--text-secondary)',
     letterSpacing: '0.06em', textTransform: 'uppercase',
     marginBottom: 8, paddingBottom: 4, borderBottom: '1px solid var(--border)',
   },
   addBtn: { background: 'transparent', border: 'none', color: 'var(--text-secondary)', fontSize: 16, cursor: 'pointer' },
-  colorRow: { display: 'flex', alignItems: 'center', gap: 6, padding: '4px 0', fontSize: 12 },
+  colorRow: { display: 'flex', alignItems: 'center', gap: 8, padding: '4px 0', fontSize: 12 },
   colorSwatch: {
-    width: 18, height: 18, borderRadius: 4, flexShrink: 0,
+    width: 16, height: 16, borderRadius: 4, flexShrink: 0,
     border: '1px solid var(--border-strong)', cursor: 'pointer',
   },
   colorName: { flex: 1, color: 'var(--text)', overflow: 'hidden', textOverflow: 'ellipsis' },
-  colorHex: { color: 'var(--text-secondary)', fontSize: 11, fontFamily: 'monospace' },
+  colorHex: { color: 'var(--text-secondary)', fontSize: 11, fontFamily: 'var(--font-mono)' },
   removeBtn: { background: 'transparent', border: 'none', color: 'var(--text-secondary)', fontSize: 13, cursor: 'pointer', padding: '0 2px' },
-  typoRow: { display: 'flex', alignItems: 'center', gap: 6, padding: '5px 0', borderBottom: '1px solid var(--row-hover)' },
+  typoRow: { display: 'flex', alignItems: 'center', gap: 8, padding: '4px 0', borderBottom: '1px solid var(--row-hover)' },
   typoName: { flex: 1, color: 'var(--text)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
   typoMeta: { color: 'var(--text-secondary)', fontSize: 10, flexShrink: 0 },
 };

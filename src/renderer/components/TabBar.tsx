@@ -132,10 +132,10 @@ const styles: Record<string, React.CSSProperties> = {
     scrollbarWidth: 'none',
   },
   tab: {
-    display: 'flex', alignItems: 'center', gap: 6, flex: '0 0 auto',
-    maxWidth: 160, minWidth: 84, height: 30, padding: '0 6px 0 12px',
+    display: 'flex', alignItems: 'center', gap: 8, flex: '0 0 auto',
+    maxWidth: 160, minWidth: 84, height: 28, padding: '0 6px 0 12px',
     borderRadius: 8, cursor: 'pointer', userSelect: 'none',
-    fontFamily: 'system-ui', fontSize: 12,
+    fontFamily: 'var(--font-ui)', fontSize: 12,
   },
   label: {
     flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
@@ -145,14 +145,14 @@ const styles: Record<string, React.CSSProperties> = {
     background: 'var(--bg-inset)', border: '1px solid var(--accent)', borderRadius: 4,
     color: 'var(--text)', font: 'inherit', fontSize: 12, padding: '1px 4px', outline: 'none',
   },
-  dot: { width: 7, height: 7, borderRadius: '50%', background: 'var(--text-secondary)', flexShrink: 0, marginRight: 3 },
+  dot: { width: 7, height: 7, borderRadius: '50%', background: 'var(--text-secondary)', flexShrink: 0, marginRight: 4 },
   close: {
-    width: 18, height: 18, borderRadius: 5, flexShrink: 0,
+    width: 16, height: 16, borderRadius: 4, flexShrink: 0,
     display: 'flex', alignItems: 'center', justifyContent: 'center',
     background: 'transparent', border: 'none', cursor: 'pointer', color: 'inherit', padding: 0,
   },
   addBtn: {
-    width: 28, height: 28, borderRadius: 7, flexShrink: 0,
+    width: 28, height: 28, borderRadius: 6, flexShrink: 0,
     display: 'flex', alignItems: 'center', justifyContent: 'center',
     background: 'transparent', border: 'none', cursor: 'pointer', color: 'var(--text-secondary)',
   },

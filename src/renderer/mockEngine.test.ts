@@ -317,3 +317,194 @@ describe('DocumentEngine — undo replays side effects', () => {
     expect(objs(eng.getState()!).B.opacity).toBe(0.7);
   });
 });
+
+describe('undo restores geometry the auto-layout reflow wrote', () => {
+  it('turning the frame into an auto-layout container is undoable, positions included', () => {
+    const eng = new DocumentEngine();
+    eng.load(fileWithTwoRects());
+    const before = objs(eng.getState()!);
+    expect([before.A.x, before.B.x]).toEqual([10, 100]);
+
+    // Reflow packs B against A with a 20px gap, overwriting B.x.
+    eng.applyChanges({ pageId: 'page-1', ops: [{ op: 'set', id: 'frame-1', attr: 'autoLayout', val: {
+      direction: 'horizontal', spacing: 20,
+      padding: { top: 0, right: 0, bottom: 0, left: 0 },
+      justifyContent: 'start', alignItems: 'start',
+    } }] });
+    expect(objs(eng.getState()!).B.x).toBe(objs(eng.getState()!).A.x + 40 + 20);
+
+    // Undo hands the shapes back to the user — so their pre-layout positions have to
+    // come back with them. Re-deriving the reflow cannot do this: with no container
+    // left, there is nothing to re-derive from.
+    eng.undo();
+    const undone = eng.getState()!;
+    expect([objs(undone).A.x, objs(undone).B.x]).toEqual([10, 100]);
+    expect(objs(undone)['frame-1'].autoLayout).toBeFalsy();
+
+    eng.redo();
+    const redone = eng.getState()!;
+    expect(objs(redone).B.x).toBe(objs(redone).A.x + 40 + 20);
+  });
+
+  it('undo of a child moving into an auto-layout container restores where it was', () => {
+    const eng = new DocumentEngine();
+    const f = fileWithTwoRects();
+    f.pages[0].objects['frame-1'].autoLayout = {
+      direction: 'vertical', spacing: 8,
+      padding: { top: 0, right: 0, bottom: 0, left: 0 },
+      justifyContent: 'start', alignItems: 'start',
+    };
+    // C starts outside the container, at a position of its own.
+    f.pages[0].objects['C'] = makeDefaultShape({ id: 'C', type: 'rect', name: 'C',
+      frameId: 'page-1', parentId: null, x: 600, y: 400, width: 30, height: 30,
+      selrect: { x: 600, y: 400, width: 30, height: 30 } });
+    f.pages[0].childIds = [...f.pages[0].childIds, 'C'];
+    eng.load(f);
+
+    eng.applyChanges({ pageId: 'page-1', ops: [{ op: 'move', id: 'C', parentId: 'frame-1', index: 2 }] });
+    expect(objs(eng.getState()!).C.x).not.toBe(600);
+
+    eng.undo();
+    const undone = eng.getState()!;
+    expect([objs(undone).C.x, objs(undone).C.y]).toEqual([600, 400]);
+  });
+});
+
+describe('tokens and components keep their promises', () => {
+  const tokenFile = () => {
+    const f = fileWithTwoRects();
+    f.tokens = [{ id: 'tk', name: 'color.brand', $type: 'color', $value: '#FF3366' }];
+    return f;
+  };
+
+  it('deleting a token drops the bindings that pointed at it', () => {
+    const eng = new DocumentEngine();
+    eng.load(tokenFile());
+    eng.bindToken('A', 'page-1', 'fills.0.color', 'color.brand');
+    expect(objs(eng.getState()!).A.fills[0]).toMatchObject({ color: '#FF3366' });
+    expect(objs(eng.getState()!).A.tokenBindings).toBeTruthy();
+
+    eng.deleteToken('tk');
+    // A dangling binding is a landmine: re-creating the name would silently reclaim the
+    // layer. The binding has to go with the token.
+    expect(objs(eng.getState()!).A.tokenBindings).toBeUndefined();
+
+    eng.addToken('color.brand', 'color', '#00FF00');
+    expect(objs(eng.getState()!).A.fills[0]).toMatchObject({ color: '#FF3366' }); // not reclaimed
+  });
+
+  it('editing a token repaints every layer bound to it', () => {
+    const eng = new DocumentEngine();
+    eng.load(tokenFile());
+    eng.bindToken('A', 'page-1', 'fills.0.color', 'color.brand');
+    eng.bindToken('B', 'page-1', 'fills.0.color', 'color.brand');
+    eng.updateToken('tk', { $value: '#0000FF' });
+    const o = objs(eng.getState()!);
+    expect(o.A.fills[0]).toMatchObject({ color: '#0000FF' });
+    expect(o.B.fills[0]).toMatchObject({ color: '#0000FF' });
+  });
+
+  it('a master’s corner radius reaches its instances', () => {
+    const eng = new DocumentEngine();
+    eng.load(fileWithTwoRects());
+    const withComp = eng.createComponent('A', 'page-1')!;
+    const componentId = Object.keys(withComp.components)[0];
+    const withInst = eng.createInstance(componentId, 'page-1', 500, 500)!;
+    const instId = Object.keys(objs(withInst)).find(id => objs(withInst)[id].masterId === componentId)!;
+    expect(instId).toBeTruthy();
+
+    eng.applyChanges({ pageId: 'page-1', ops: [
+      { op: 'set', id: 'A', attr: 'cornerRadii', val: { tl: 24, tr: 24, br: 24, bl: 24 } },
+    ] });
+    // Radius sits in the same Appearance row as fills and strokes, which already
+    // propagated — it has to travel with them.
+    expect(objs(eng.getState()!)[instId].cornerRadii).toEqual({ tl: 24, tr: 24, br: 24, bl: 24 });
+  });
+});
+
+describe('the token map cache cannot go stale', () => {
+  // resolveToken caches name→token per tokens-ARRAY identity, so any mutator that edits
+  // the array in place serves a stale map. Both of these failed that way.
+  it('a token added after an earlier resolve is immediately usable', () => {
+    const eng = new DocumentEngine();
+    const f = fileWithTwoRects();
+    f.tokens = [{ id: 'first', name: 'color.a', $type: 'color', $value: '#111111' }];
+    eng.load(f);
+    eng.bindToken('A', 'page-1', 'fills.0.color', 'color.a');   // primes the cache
+    eng.addToken('color.b', 'color', '#222222');
+    eng.bindToken('B', 'page-1', 'fills.0.color', 'color.b');
+    expect(objs(eng.getState()!).B.fills[0]).toMatchObject({ color: '#222222' });
+  });
+
+  it('an edited token resolves to its new value, not the cached one', () => {
+    const eng = new DocumentEngine();
+    const f = fileWithTwoRects();
+    f.tokens = [{ id: 'tk', name: 'color.a', $type: 'color', $value: '#111111' }];
+    eng.load(f);
+    eng.bindToken('A', 'page-1', 'fills.0.color', 'color.a');   // primes the cache
+    eng.updateToken('tk', { $value: '#333333' });
+    expect(objs(eng.getState()!).A.fills[0]).toMatchObject({ color: '#333333' });
+  });
+});
+
+describe('variant properties are editable, so a Type × State matrix is buildable', () => {
+  const twoMasters = () => {
+    const eng = new DocumentEngine();
+    eng.load(fileWithTwoRects());
+    // Combine names its property, instead of always producing "Variant".
+    eng.combineAsVariants(['A', 'B'], 'page-1', 'Type');
+    const f = eng.getState()!;
+    const setId = Object.keys(f.componentSets!)[0];
+    return { eng, setId };
+  };
+
+  it('combine uses the property name it is given', () => {
+    const { eng, setId } = twoMasters();
+    const set = eng.getState()!.componentSets![setId];
+    expect(Object.keys(set.properties)).toEqual(['Type']);
+    expect(Object.values(set.variants).map(v => v.Type).sort()).toEqual(['A', 'B']);
+  });
+
+  it('a second property can be added, giving every variant a default coordinate', () => {
+    const { eng, setId } = twoMasters();
+    eng.addVariantProperty(setId, 'State', 'Default');
+    const set = eng.getState()!.componentSets![setId];
+    expect(Object.keys(set.properties).sort()).toEqual(['State', 'Type']);
+    // Every variant now sits at a full coordinate — a set with a half-filled matrix
+    // would leave an instance's dropdown with nothing to select.
+    for (const coords of Object.values(set.variants)) {
+      expect(coords.State).toBe('Default');
+      expect(coords.Type).toBeTruthy();
+    }
+  });
+
+  it('renaming a property renames it everywhere, not just in the table', () => {
+    const { eng, setId } = twoMasters();
+    eng.renameVariantProperty(setId, 'Type', 'Tone');
+    const set = eng.getState()!.componentSets![setId];
+    expect(Object.keys(set.properties)).toEqual(['Tone']);
+    for (const coords of Object.values(set.variants)) {
+      expect(coords.Tone).toBeTruthy();
+      expect('Type' in coords).toBe(false);
+    }
+  });
+
+  it('renaming one variant’s value drops the dead option from the set', () => {
+    const { eng, setId } = twoMasters();
+    const componentId = Object.keys(eng.getState()!.componentSets![setId].variants)[0];
+    eng.setVariantValue(componentId, 'Type', 'Primary');
+    const set = eng.getState()!.componentSets![setId];
+    // 'A' is no longer used by any variant, so it must not linger in the dropdown.
+    expect(set.properties.Type).not.toContain('A');
+    expect(set.properties.Type).toContain('Primary');
+    expect(set.variants[componentId].Type).toBe('Primary');
+  });
+
+  it('refuses to remove the last property — a set with none switches nothing', () => {
+    const { eng, setId } = twoMasters();
+    expect(eng.removeVariantProperty(setId, 'Type')).toBeNull();
+    eng.addVariantProperty(setId, 'State', 'Default');
+    expect(eng.removeVariantProperty(setId, 'State')).not.toBeNull();
+    expect(Object.keys(eng.getState()!.componentSets![setId].properties)).toEqual(['Type']);
+  });
+});

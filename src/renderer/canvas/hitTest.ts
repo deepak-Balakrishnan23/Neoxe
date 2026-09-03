@@ -1,4 +1,4 @@
-import { Shape, Page, Rect } from '../../shared/types';
+import { Shape, Page, Rect, isTextOnPath } from '../../shared/types';
 import { Viewport } from './renderer';
 import { getHandlePositions } from './renderer';
 import { ROTATE_HANDLE, ROTATE_OFFSET } from './transform';
@@ -63,6 +63,17 @@ function hitTestShape(
   // Then test self in local space
   if (shape.type === 'circle') {
     return pointInEllipseLocal(lp.x, lp.y, shape) ? shape.id : null;
+  }
+  // Text on a path sits ON its baseline, so glyphs running along the TOP of an ellipse are
+  // drawn above the shape's own box. Testing the bare box means clicking the text you can
+  // actually see misses the shape entirely - it reads as "the text can't be selected or
+  // edited". Grow the target by a line so the glyphs are inside it.
+  if (isTextOnPath(shape)) {
+    const pad = (shape.textStyle?.fontSize ?? 16) * 1.5;
+    return pointInRect(lp.x, lp.y, {
+      x: shape.x - pad, y: shape.y - pad,
+      width: shape.width + pad * 2, height: shape.height + pad * 2,
+    }) ? shape.id : null;
   }
   return pointInRect(lp.x, lp.y, { x: shape.x, y: shape.y, width: shape.width, height: shape.height })
     ? shape.id : null;

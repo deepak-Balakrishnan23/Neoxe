@@ -195,7 +195,7 @@ function LandingPage({ recoverySessions, onRecover, onDiscardRecovery }: {
         <div style={styles.recovery}>
           <span style={styles.recoveryText}>
             {recoverySessions.length === 1
-              ? `⚠ Unsaved changes from your last session — "${recoverySessions[0].name}"`
+              ? `⚠ Unsaved changes from your last session: "${recoverySessions[0].name}"`
               : `⚠ ${recoverySessions.length} unsaved sessions from your last session`}
           </span>
           <button style={styles.recoveryBtn} onClick={onRecover}>
@@ -235,31 +235,31 @@ const styles: Record<string, React.CSSProperties> = {
   recovery: {
     position: 'fixed', top: 0, left: 0, right: 0, zIndex: 300,
     background: 'var(--bg-elevated)', borderBottom: '1px solid var(--comment)',
-    display: 'flex', alignItems: 'center', gap: 10, padding: '8px 16px',
-    fontFamily: 'system-ui', fontSize: 13,
+    display: 'flex', alignItems: 'center', gap: 12, padding: '8px 16px',
+    fontFamily: 'var(--font-ui)', fontSize: 13,
   },
   recoveryText: { color: 'var(--comment)', flex: 1 },
-  recoveryBtn: { background: 'var(--accent)', color: '#fff', border: 'none', borderRadius: 6, padding: '5px 14px', fontSize: 12, cursor: 'pointer' },
-  recoveryDismiss: { background: 'transparent', color: 'var(--text-secondary)', border: 'none', padding: '5px 10px', fontSize: 12, cursor: 'pointer' },
+  recoveryBtn: { background: 'var(--accent)', color: '#fff', border: 'none', borderRadius: 6, padding: '4px 16px', fontSize: 12, cursor: 'pointer' },
+  recoveryDismiss: { background: 'transparent', color: 'var(--text-secondary)', border: 'none', padding: '4px 10px', fontSize: 12, cursor: 'pointer' },
 
   // ── Landing page ────────────────────────────────────────────────────────────
   landing: {
     position: 'fixed', inset: 0, background: 'var(--bg-canvas)',
     display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
-    fontFamily: 'system-ui', overflow: 'auto',
+    fontFamily: 'var(--font-ui)', overflow: 'auto',
   },
   landingInner: { width: '100%', maxWidth: 720, padding: '32px 24px', display: 'flex', flexDirection: 'column', gap: 32 },
   landingHeader: { textAlign: 'center' },
   landingLogo: { fontSize: 44, fontWeight: 800, color: 'var(--accent-hover)', letterSpacing: '-1.5px' },
-  landingSub: { fontSize: 15, color: 'var(--text-secondary)', marginTop: 6 },
+  landingSub: { fontSize: 16, color: 'var(--text-secondary)', marginTop: 8 },
   landingActions: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 },
   actionCard: {
-    display: 'flex', flexDirection: 'column', alignItems: 'flex-start', gap: 6, textAlign: 'left',
-    background: 'var(--accent)', color: '#fff', border: '1px solid transparent', borderRadius: 14,
-    padding: '22px 24px', cursor: 'pointer', fontFamily: 'system-ui',
+    display: 'flex', flexDirection: 'column', alignItems: 'flex-start', gap: 8, textAlign: 'left',
+    background: 'var(--accent)', color: '#fff', border: '1px solid transparent', borderRadius: 12,
+    padding: '22px 24px', cursor: 'pointer', fontFamily: 'var(--font-ui)',
   },
   actionCardGhost: { background: 'var(--bg-elevated)', color: 'var(--text)', border: '1px solid var(--border-strong)' },
   actionPlus: { fontSize: 26, fontWeight: 700, lineHeight: 1, marginBottom: 4 },
   actionTitle: { fontSize: 16, fontWeight: 600 },
-  actionDesc: { fontSize: 12.5, opacity: 0.8 },
+  actionDesc: { fontSize: 12, opacity: 0.8 },
 };

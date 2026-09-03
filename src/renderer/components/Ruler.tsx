@@ -150,7 +150,7 @@ export default function Ruler({ viewport }: RulerProps) {
       if (sx < RULER_SIZE) continue;
       elements.push(
         <line key={`hM${d}`} x1={sx} y1={RULER_SIZE - 8} x2={sx} y2={RULER_SIZE} stroke={RULER_TICK} strokeWidth={1} />,
-        <text key={`hL${d}`} x={sx + 2} y={RULER_SIZE - 4} fill={RULER_TEXT} fontSize={9} fontFamily="system-ui,sans-serif">
+        <text key={`hL${d}`} x={sx + 2} y={RULER_SIZE - 4} fill={RULER_TEXT} fontSize={10} fontFamily="var(--font-ui)">
           {d}
         </text>
       );
@@ -189,8 +189,8 @@ export default function Ruler({ viewport }: RulerProps) {
           transform={`translate(${RULER_SIZE / 2 - 1}, ${sy - 2}) rotate(-90)`}
           textAnchor="middle"
           fill={RULER_TEXT}
-          fontSize={9}
-          fontFamily="system-ui,sans-serif"
+          fontSize={10}
+          fontFamily="var(--font-ui)"
         >
           {d}
         </text>
@@ -314,7 +314,7 @@ export default function Ruler({ viewport }: RulerProps) {
             <rect x={bx} y={by} width={44} height={16} rx={3} ry={3} fill="#1B6FC8" />
             <text
               x={bx + 22} y={by + 11}
-              fill="#fff" fontSize={10} fontFamily="system-ui,sans-serif" textAnchor="middle"
+              fill="#fff" fontSize={10} fontFamily="var(--font-ui)" textAnchor="middle"
             >
               {dragDocPos}
             </text>

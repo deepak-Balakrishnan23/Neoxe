@@ -57,6 +57,22 @@ const compMock = {
     const f = engine.combineAsVariants(shapeIds, pageId, propName);
     return f ? { ok: true, data: f } : { ok: false, error: 'failed' };
   },
+  renameVariantProperty: async (setId: string, from: string, to: string): Promise<IPCResponse<DesignFile>> => {
+    const f = engine.renameVariantProperty(setId, from, to);
+    return f ? { ok: true, data: f } : { ok: false, error: 'failed' };
+  },
+  addVariantProperty: async (setId: string, name: string, defaultValue?: string): Promise<IPCResponse<DesignFile>> => {
+    const f = engine.addVariantProperty(setId, name, defaultValue);
+    return f ? { ok: true, data: f } : { ok: false, error: 'failed' };
+  },
+  removeVariantProperty: async (setId: string, name: string): Promise<IPCResponse<DesignFile>> => {
+    const f = engine.removeVariantProperty(setId, name);
+    return f ? { ok: true, data: f } : { ok: false, error: 'failed' };
+  },
+  setVariantValue: async (componentId: string, propName: string, value: string): Promise<IPCResponse<DesignFile>> => {
+    const f = engine.setVariantValue(componentId, propName, value);
+    return f ? { ok: true, data: f } : { ok: false, error: 'failed' };
+  },
   setInstanceVariant: async (shapeId: string, pageId: string, props: Record<string, string>): Promise<IPCResponse<DesignFile>> => {
     const f = engine.setInstanceVariant(shapeId, pageId, props);
     return f ? { ok: true, data: f } : { ok: false, error: 'failed' };
@@ -166,6 +182,10 @@ export const api = {
   setComponentProps: (componentId: string, props: ComponentPropDef[]) => compMock.setComponentProps(componentId, props),
   combineAsVariants: (shapeIds: string[], pageId: string, propName?: string) => compMock.combineAsVariants(shapeIds, pageId, propName),
   setInstanceVariant: (shapeId: string, pageId: string, props: Record<string, string>) => compMock.setInstanceVariant(shapeId, pageId, props),
+  renameVariantProperty: (setId: string, from: string, to: string) => compMock.renameVariantProperty(setId, from, to),
+  addVariantProperty: (setId: string, name: string, defaultValue?: string) => compMock.addVariantProperty(setId, name, defaultValue),
+  removeVariantProperty: (setId: string, name: string) => compMock.removeVariantProperty(setId, name),
+  setVariantValue: (componentId: string, propName: string, value: string) => compMock.setVariantValue(componentId, propName, value),
   addColor: (name: string, color: string, opacity: number) => compMock.addColor(name, color, opacity),
   updateColor: (id: string, patch: { name?: string; color?: string; opacity?: number }) => compMock.updateColor(id, patch),
   deleteColor: (id: string) => compMock.deleteColor(id),

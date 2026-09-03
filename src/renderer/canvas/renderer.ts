@@ -1,4 +1,6 @@
-import { Shape, Page, Fill, GradientStop, TextStyle, TextParagraph, DesignFile, ImageFill } from '../../shared/types';
+import { Shape, Page, Fill, GradientStop, TextStyle, TextParagraph, DesignFile, ImageFill, hasCustomBackground, PathSegment, isTextOnPath } from '../../shared/types';
+import { flattenPath, arrowHead, pointAtDistance, textBaseline, Polyline } from '../../shared/pathMetrics';
+import { textPathGlyphs, textPathString } from './textPath';
 import { gridTracks } from '../../shared/layoutGrid';
 import { canvasColors as CC } from '../theme';
 import { wrapLines } from './textLayout';
@@ -7,6 +9,23 @@ import { ensureFontLoaded } from './fontLoader';
 // Module-level editing id — set per render frame so drawText can see it without
 // threading the value through every function signature.
 let _editingTextId: string | null = null;
+// Selection is needed for one affordance only: a text-on-path keeps its dashed baseline
+// visible while selected, the way Figma shows the curve you are typing along.
+let _selectedIds: Set<string> = new Set();
+
+/** Fired when the in-progress text of a text-on-path changes, so the canvas can repaint
+ *  the glyphs along the curve on every keystroke. */
+export const LIVE_TEXT_EVENT = 'neouxe:live-text';
+let _liveText: { id: string; text: string; selStart: number; selEnd: number } | null = null;
+
+/** While a text-on-path is being edited its glyphs are drawn from here rather than from
+ *  the committed paragraphs, so typing updates the curve immediately. The selection range
+ *  comes along so the caret and highlight can be drawn ON the curve - without them the
+ *  editor is invisible and typing feels like nothing is happening. */
+export function setLiveText(id: string | null, text = '', selStart = 0, selEnd = 0) {
+  _liveText = id ? { id, text, selStart, selEnd } : null;
+  if (typeof window !== 'undefined') window.dispatchEvent(new CustomEvent(LIVE_TEXT_EVENT));
+}
 // Shapes currently owned by a DOM edit overlay (vector/svg/path edit) — the canvas skips
 // drawing these so the crisp editable overlay shows instead. Everything else (including
 // non-edited vectors) draws on the canvas so the drag preview moves it live.
@@ -109,6 +128,7 @@ export function renderPage(
   hideLayoutGrids?: boolean,
 ) {
   _editingTextId = editingTextId ?? null;
+  _selectedIds = selectedIds;
   _overlayHiddenIds = hiddenOverlayIds ?? new Set();
   _hideLayoutGrids = hideLayoutGrids ?? false;
   _fillImages = images;
@@ -119,7 +139,7 @@ export function renderPage(
   if (skipBackground) {
     ctx.clearRect(0, 0, width, height);
   } else {
-    ctx.fillStyle = page.background || CC.backdrop;
+    ctx.fillStyle = hasCustomBackground(page) ? page.background : CC.backdrop;
     ctx.fillRect(0, 0, width, height);
   }
 
@@ -355,8 +375,10 @@ function drawCircle(ctx: CanvasRenderingContext2D, shape: Shape) {
 }
 
 function drawText(ctx: CanvasRenderingContext2D, shape: Shape) {
-  // The textarea overlay handles rendering while in edit mode
-  if (shape.id === _editingTextId) return;
+  // The textarea overlay handles rendering while in edit mode - but NOT for text on a
+  // path, which keeps drawing its glyphs along the curve as you type (the overlay goes
+  // transparent instead). A box-shaped textarea can't represent a curved baseline.
+  if (shape.id === _editingTextId && !isTextOnPath(shape)) return;
 
   const style: TextStyle = shape.textStyle ?? {
     fontFamily: 'system-ui, sans-serif',
@@ -373,6 +395,14 @@ function drawText(ctx: CanvasRenderingContext2D, shape: Shape) {
   const paragraphs: TextParagraph[] = shape.paragraphs ?? [
     { align: 'left', spans: [{ text: shape.name }] },
   ];
+
+  // Text on a path is a different layout problem entirely - no boxes, no wrapping,
+  // one transform per glyph - so it takes its own path out of here.
+  const baseline = textBaseline(shape);
+  if (baseline) {
+    drawTextOnPath(ctx, shape, style, paragraphs, baseline);
+    return;
+  }
 
   const autoWidth = shape.textAutoWidth === true;
 
@@ -564,6 +594,173 @@ function drawPath(ctx: CanvasRenderingContext2D, shape: Shape) {
     ctx.stroke();
     ctx.restore();
   }
+
+  drawEndCaps(ctx, shape);
+}
+
+/**
+ * Lay glyphs along `shape.textPath`, one transform each.
+ *
+ * Each glyph is placed at its own mid-advance point so it sits centred on the baseline
+ * and rotated to the local tangent; advancing by the measured width (plus tracking)
+ * keeps spacing even around curves, where a naive fixed step would bunch on the inside.
+ */
+function drawTextOnPath(
+  ctx: CanvasRenderingContext2D,
+  shape: Shape,
+  style: TextStyle,
+  paragraphs: TextParagraph[],
+  baseline: PathSegment[],
+) {
+  const live = _liveText && _liveText.id === shape.id ? _liveText.text : null;
+  const text = textPathString(shape, live ?? undefined);
+
+  // Layout comes from the SHARED helper so the editor's hit-testing lands on exactly the
+  // glyph the user sees. Computing it separately here is what made clicking into curved
+  // text impossible.
+  const g = textPathGlyphs(shape, text, ctx);
+  if (!g) return;
+  const { pl, chars, widths, starts, at } = g;
+  const s = g.style;
+
+  const showGuide = !text || _selectedIds.has(shape.id) || shape.id === _editingTextId;
+  if (showGuide) strokeBaselineGuide(ctx, baseline, pl);
+  if (!text) return;
+
+  ctx.save();
+  ctx.globalAlpha = style.opacity;
+  ctx.font = `${s.fontWeight} ${s.fontSize}px ${s.fontFamily}`;
+  ctx.fillStyle = s.color;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'alphabetic';
+  try { ctx.letterSpacing = '0px'; } catch { /* older canvas */ }
+
+  for (let i = 0; i < chars.length; i++) {
+    const p = pointAtDistance(pl, at(starts[i] + widths[i] / 2));
+    if (!p) continue;
+    ctx.save();
+    ctx.translate(p.x, p.y);
+    ctx.rotate(p.angle);
+    ctx.fillText(chars[i], 0, 0);
+    for (const stroke of shape.strokes) {
+      ctx.save();
+      ctx.globalAlpha = style.opacity * (stroke.opacity ?? 1);
+      ctx.strokeStyle = stroke.color;
+      ctx.lineWidth = stroke.width;
+      ctx.strokeText(chars[i], 0, 0);
+      ctx.restore();
+    }
+    ctx.restore();
+  }
+
+  // Caret + selection, drawn along the curve while this shape is being edited.
+  if (shape.id === _editingTextId && _liveText && _liveText.id === shape.id) {
+    const { selStart, selEnd } = _liveText;
+    const lo = Math.max(0, Math.min(selStart, selEnd, chars.length));
+    const hi = Math.max(0, Math.min(Math.max(selStart, selEnd), chars.length));
+    const asc = s.fontSize * 0.8, desc = s.fontSize * 0.2;
+
+    if (hi > lo) {
+      ctx.save();
+      ctx.fillStyle = 'rgba(110,114,245,0.35)';
+      for (let i = lo; i < hi; i++) {
+        const p = pointAtDistance(pl, at(starts[i] + widths[i] / 2));
+        if (!p) continue;
+        ctx.save();
+        ctx.translate(p.x, p.y);
+        ctx.rotate(p.angle);
+        ctx.fillRect(-widths[i] / 2, -asc, widths[i], asc + desc);
+        ctx.restore();
+      }
+      ctx.restore();
+    }
+
+    const c = pointAtDistance(pl, at(starts[lo]));
+    if (c) {
+      ctx.save();
+      ctx.translate(c.x, c.y);
+      ctx.rotate(c.angle);
+      ctx.strokeStyle = s.color;
+      ctx.lineWidth = Math.max(1, s.fontSize / 14);
+      ctx.beginPath();
+      ctx.moveTo(0, -asc);
+      ctx.lineTo(0, desc);
+      ctx.stroke();
+      ctx.restore();
+    }
+  }
+  ctx.restore();
+}
+
+/** A dashed hint of an empty text-on-path baseline, so the curve you just dragged out
+ *  is visible before you have typed anything into it. */
+function strokeBaselineGuide(ctx: CanvasRenderingContext2D, baseline: PathSegment[], pl?: Polyline) {
+  ctx.save();
+  ctx.strokeStyle = 'rgba(110,114,245,0.9)';
+  ctx.lineWidth = 1;
+  ctx.setLineDash([4, 4]);
+  ctx.beginPath();
+  for (const seg of baseline) {
+    const k = seg.coords;
+    switch (seg.verb) {
+      case 'M': ctx.moveTo(k[0], k[1]); break;
+      case 'L': ctx.lineTo(k[0], k[1]); break;
+      case 'C': ctx.bezierCurveTo(k[0], k[1], k[2], k[3], k[4], k[5]); break;
+      case 'Q': ctx.quadraticCurveTo(k[0], k[1], k[2], k[3]); break;
+      case 'Z': ctx.closePath(); break;
+    }
+  }
+  ctx.stroke();
+
+  // The dot Figma puts where the text begins.
+  if (pl) {
+    const origin = pointAtDistance(pl, 0);
+    if (origin) {
+      ctx.setLineDash([]);
+      ctx.beginPath();
+      ctx.arc(origin.x, origin.y, 3, 0, Math.PI * 2);
+      ctx.fillStyle = '#FFFFFF';
+      ctx.fill();
+      ctx.strokeStyle = 'rgba(110,114,245,1)';
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+    }
+  }
+  ctx.restore();
+}
+
+/**
+ * Filled arrowheads on an open path's endpoints.
+ *
+ * The head is sized from the stroke width so it stays in proportion when the stroke is
+ * thickened, and it is drawn in the stroke's own colour so the two read as one object.
+ */
+function drawEndCaps(ctx: CanvasRenderingContext2D, shape: Shape) {
+  if (shape.strokeCapStart !== 'arrow' && shape.strokeCapEnd !== 'arrow') return;
+  if (!shape.content || shape.content.length === 0) return;
+  const stroke = shape.strokes[0];
+  if (!stroke) return;
+
+  const pl = flattenPath(shape.content);
+  const size = Math.max(6, stroke.width * 4);
+
+  const fill = (atEnd: boolean) => {
+    const tri = arrowHead(pl, atEnd, size);
+    if (!tri) return;
+    ctx.save();
+    ctx.globalAlpha = stroke.opacity;
+    ctx.fillStyle = stroke.color;
+    ctx.beginPath();
+    ctx.moveTo(tri[0].x, tri[0].y);
+    ctx.lineTo(tri[1].x, tri[1].y);
+    ctx.lineTo(tri[2].x, tri[2].y);
+    ctx.closePath();
+    ctx.fill();
+    ctx.restore();
+  };
+
+  if (shape.strokeCapEnd === 'arrow') fill(true);
+  if (shape.strokeCapStart === 'arrow') fill(false);
 }
 
 // Canvas composite op implementing each boolean, applied to every operand after the first.

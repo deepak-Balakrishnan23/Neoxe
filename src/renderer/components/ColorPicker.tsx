@@ -359,7 +359,7 @@ export default function ColorPicker({ color, opacity, onChange, onClose, anchorR
             <option value="stretch">Stretch</option>
             <option value="tile">Tile</option>
           </select>
-          <button style={{ ...styles.gradTypeSelect, marginTop: 6, cursor: 'pointer' }}
+          <button style={{ ...styles.gradTypeSelect, marginTop: 8, cursor: 'pointer' }}
             onClick={() => imageInputRef.current?.click()}>Replace image…</button>
         </div>
       )}
@@ -470,41 +470,41 @@ const styles: Record<string, React.CSSProperties> = {
   popover: {
     position: 'fixed', width: 236,
     background: 'var(--bg-panel)', border: '1px solid var(--border-strong)',
-    borderRadius: 10, padding: 10, boxShadow: 'var(--shadow-popover)',
+    borderRadius: 8, padding: 12, boxShadow: 'var(--shadow-popover)',
     zIndex: 1000, display: 'flex', flexDirection: 'column', gap: 8,
   },
   modeRow: { display: 'flex', gap: 4 },
   modeSwatch: { width: 16, height: 16, borderRadius: 4, border: '1px solid var(--border-strong)' },
   gradTypeSelect: {
     background: 'var(--bg-elevated)', border: '1px solid var(--border)',
-    borderRadius: 6, color: 'var(--text)', fontSize: 12, padding: '5px 7px', outline: 'none', cursor: 'pointer',
+    borderRadius: 6, color: 'var(--text)', fontSize: 12, padding: '0 8px', height: 28, outline: 'none', cursor: 'pointer',
   },
-  gradBar: { position: 'relative', height: 18, borderRadius: 6, cursor: 'copy', border: '1px solid var(--border-strong)' },
+  gradBar: { position: 'relative', height: 16, borderRadius: 6, cursor: 'copy', border: '1px solid var(--border-strong)' },
   stopHandle: {
     position: 'absolute', top: '50%', width: 12, height: 12, borderRadius: '50%',
     transform: 'translate(-50%, -50%)', cursor: 'grab',
   },
   stopList: { display: 'flex', flexDirection: 'column', gap: 2, maxHeight: 96, overflowY: 'auto' },
-  stopRow: { display: 'flex', alignItems: 'center', gap: 6, padding: '3px 4px', borderRadius: 5, cursor: 'pointer' },
+  stopRow: { display: 'flex', alignItems: 'center', gap: 8, padding: '4px 4px', borderRadius: 4, cursor: 'pointer' },
   stopRowActive: { background: 'var(--accent-soft)' },
   stopOffset: {
     width: 42, background: 'var(--bg-elevated)', border: '1px solid var(--border)',
-    borderRadius: 4, color: 'var(--text)', fontSize: 11, padding: '3px 5px', outline: 'none',
+    borderRadius: 4, color: 'var(--text)', fontSize: 11, padding: '0 4px', height: 24, outline: 'none',
   },
   stopSwatch: { width: 16, height: 16, borderRadius: 4, border: '1px solid var(--border-strong)', flexShrink: 0 },
-  stopHex: { flex: 1, color: 'var(--text)', fontSize: 11, fontFamily: 'monospace' },
+  stopHex: { flex: 1, color: 'var(--text)', fontSize: 11, fontFamily: 'var(--font-mono)' },
   stopPct: { color: 'var(--text-secondary)', fontSize: 11 },
   stopRemove: {
-    width: 18, height: 18, borderRadius: 4, border: 'none', background: 'transparent',
-    color: 'var(--text-secondary)', cursor: 'pointer', fontSize: 14, lineHeight: 1,
+    width: 16, height: 16, borderRadius: 4, border: 'none', background: 'transparent',
+    color: 'var(--text-secondary)', cursor: 'pointer', fontSize: 13, lineHeight: 1,
   },
   svCanvas: { borderRadius: 4, cursor: 'default', display: 'block' },
-  slider: { borderRadius: 7, cursor: 'ew-resize', display: 'block' },
-  row: { display: 'flex', alignItems: 'center', gap: 6 },
+  slider: { borderRadius: 6, cursor: 'ew-resize', display: 'block' },
+  row: { display: 'flex', alignItems: 'center', gap: 8 },
   swatch: { width: 20, height: 20, borderRadius: 4, border: '1px solid var(--border-strong)', flexShrink: 0 },
   hexInput: {
     flex: 1, background: 'var(--bg-elevated)', border: '1px solid var(--border)',
-    borderRadius: 4, color: 'var(--text)', fontSize: 12, padding: '3px 6px',
-    outline: 'none', fontFamily: 'monospace',
+    borderRadius: 4, color: 'var(--text)', fontSize: 12, padding: '0 6px', height: 24,
+    outline: 'none', fontFamily: 'var(--font-mono)',
   },
 };

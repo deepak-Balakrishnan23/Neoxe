@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { makeDefaultShape, Page } from './types';
-import { pageToSvg, frameToSvg, exportShapeSvg, shapeToCssProps, frameToHtml } from './codegen';
+import { makeDefaultShape, Page, Shape } from './types';
+import { pageToSvg, frameToSvg, exportShapeSvg, shapeToCssProps, frameToHtml, frameToResponsiveHtml } from './codegen';
 
 const PNG = 'data:image/png;base64,iVBORw0KGgoAAAANS';
 
@@ -232,5 +232,186 @@ describe('codegen — image paints', () => {
     const page = imagePaintPage('fill');
     page.objects['r'].cornerRadii = { tl: 12, tr: 12, br: 12, bl: 12 };
     expect(pageToSvg(page, { i1: PNG })).toContain('rx="12"');
+  });
+});
+
+describe('auto-layout children emit responsive CSS, not fixed boxes', () => {
+  const parentAndChild = (dir: 'horizontal' | 'vertical' | 'wrap', child: Partial<Shape>) => {
+    const parent = makeDefaultShape({
+      id: 'p', type: 'frame', name: 'Row', frameId: 'p', x: 0, y: 0, width: 800, height: 200,
+      selrect: { x: 0, y: 0, width: 800, height: 200 },
+      autoLayout: {
+        direction: dir, spacing: 16, padding: { top: 0, right: 0, bottom: 0, left: 0 },
+        justifyContent: 'start', alignItems: 'start',
+      },
+    });
+    const c = makeDefaultShape({
+      id: 'c', type: 'rect', name: 'Child', frameId: 'p', parentId: 'p',
+      x: 0, y: 0, width: 300, height: 100, selrect: { x: 0, y: 0, width: 300, height: 100 },
+      ...child,
+    });
+    const page: Page = {
+      id: 'pg', name: 'Page 1', background: '#FFFFFF',
+      objects: { p: parent, c }, childIds: ['p'],
+    };
+    return shapeToCssProps(c, page);
+  };
+
+  it('a flow child is not absolutely positioned', () => {
+    const css = parentAndChild('horizontal', {});
+    expect(css['position']).toBeUndefined();
+    expect(css['left']).toBeUndefined();
+    expect(css['top']).toBeUndefined();
+  });
+
+  it('Fill on the main axis becomes flex: 1 1 0 with the auto minimum defeated', () => {
+    const css = parentAndChild('horizontal', { widthMode: 'fill' });
+    expect(css['flex']).toBe('1 1 0');
+    expect(css['min-width']).toBe('0');
+    expect(css['width']).toBeUndefined();
+  });
+
+  it('Fill on the cross axis becomes align-self: stretch', () => {
+    const css = parentAndChild('horizontal', { heightMode: 'fill' });
+    expect(css['align-self']).toBe('stretch');
+    expect(css['height']).toBeUndefined();
+  });
+
+  it('a vertical parent flips which axis is main', () => {
+    const css = parentAndChild('vertical', { heightMode: 'fill', widthMode: 'fill' });
+    expect(css['flex']).toBe('1 1 0');
+    expect(css['min-height']).toBe('0');
+    expect(css['align-self']).toBe('stretch');
+  });
+
+  it('Hug becomes fit-content', () => {
+    const css = parentAndChild('horizontal', { widthMode: 'hug', heightMode: 'hug' });
+    expect(css['width']).toBe('fit-content');
+    expect(css['height']).toBe('fit-content');
+  });
+
+  it('a Fixed child gets flex-shrink: 0, matching the editor letting it overflow', () => {
+    expect(parentAndChild('horizontal', {})['flex-shrink']).toBe('0');
+    expect(parentAndChild('horizontal', { widthMode: 'fill' })['flex-shrink']).toBeUndefined();
+  });
+
+  it('a real min-width wins over the zero Fill needs', () => {
+    const css = parentAndChild('horizontal', { widthMode: 'fill', minWidth: 240, maxWidth: 480 });
+    expect(css['min-width']).toBe('240px');
+    expect(css['max-width']).toBe('480px');
+  });
+
+  it('an absolutely-positioned child keeps its coordinates', () => {
+    const css = parentAndChild('horizontal', { layoutPositioning: 'absolute' });
+    expect(css['position']).toBe('absolute');
+    expect(css['width']).toBe('300px');
+  });
+});
+
+describe('frameToResponsiveHtml — nested flow model', () => {
+  function build(): Page {
+    const screen = makeDefaultShape({ id: 'scr', type: 'frame', name: 'Screen', frameId: 'scr', parentId: null,
+      x: 0, y: 0, width: 1440, height: 900, selrect: { x: 0, y: 0, width: 1440, height: 900 },
+      fills: [{ type: 'solid', color: '#ffffff', opacity: 1 }], clipContent: true, childIds: ['row'],
+      widthMode: 'fixed', heightMode: 'fixed',
+      autoLayout: { direction: 'vertical', spacing: 0, padding: { top: 0, right: 0, bottom: 0, left: 0 }, justifyContent: 'start', alignItems: 'start' } });
+    const row = makeDefaultShape({ id: 'row', type: 'frame', name: 'Row', frameId: 'scr', parentId: 'scr',
+      x: 0, y: 0, width: 1440, height: 80, selrect: { x: 0, y: 0, width: 1440, height: 80 },
+      childIds: ['link', 'grow'], widthMode: 'fill', heightMode: 'hug',
+      autoLayout: { direction: 'wrap', spacing: 16, padding: { top: 8, right: 8, bottom: 8, left: 8 }, justifyContent: 'space-between', alignItems: 'center' } });
+    const link = makeDefaultShape({ id: 'link', type: 'text', name: 'Pricing', frameId: 'scr', parentId: 'row',
+      x: 8, y: 8, width: 60, height: 20, selrect: { x: 8, y: 8, width: 60, height: 20 },
+      textStyle: { fontFamily: 'Inter', fontWeight: 500, fontSize: 15, lineHeight: 1.3, letterSpacing: 0, textDecoration: 'none', textTransform: 'none', color: '#111', opacity: 1 },
+      paragraphs: [{ align: 'left', spans: [{ text: 'Pricing' }] }],
+      interactions: [{ id: 'i1', trigger: 'click', action: 'navigate', targetFrameId: 'scr', transition: 'dissolve' }] });
+    const grow = makeDefaultShape({ id: 'grow', type: 'rect', name: 'Grow', frameId: 'scr', parentId: 'row',
+      x: 100, y: 8, width: 200, height: 40, selrect: { x: 100, y: 8, width: 200, height: 40 },
+      widthMode: 'fill', heightMode: 'fixed' });
+    return { id: 'p', name: 'Page 1', background: '#fff', childIds: ['scr'],
+      objects: { scr: screen, row, link, grow } };
+  }
+
+  it('nests children instead of flattening them into siblings', () => {
+    const html = frameToResponsiveHtml(build().objects.scr, build(), {});
+    // The row is emitted INSIDE the screen, and the link inside the row.
+    const scrAt = html.indexOf('data-id="scr"');
+    const rowAt = html.indexOf('data-id="row"');
+    const linkAt = html.indexOf('data-id="link"');
+    expect(scrAt).toBeLessThan(rowAt);
+    expect(rowAt).toBeLessThan(linkAt);
+    // One root element, not a flat list of four.
+    expect(html.trimStart().startsWith('<div data-id="scr"')).toBe(true);
+  });
+
+  it('emits real flexbox for the auto-layout containers', () => {
+    const page = build();
+    const html = frameToResponsiveHtml(page.objects.scr, page, {});
+    expect(html).toContain('display:flex');
+    expect(html).toContain('flex-wrap:wrap');
+    expect(html).toContain('justify-content:space-between');
+    expect(html).toContain('padding:8px 8px 8px 8px');
+  });
+
+  it('the screen fills the window rather than pinning to the artboard box', () => {
+    const page = build();
+    const html = frameToResponsiveHtml(page.objects.scr, page, {});
+    // Root: full width, content-driven height, and no artboard-fold clipping.
+    expect(html).toMatch(/^<div data-id="scr"[^>]*width:100%/);
+    expect(html).not.toMatch(/^<div data-id="scr"[^>]*height:900px/);
+    expect(html).not.toMatch(/^<div data-id="scr"[^>]*overflow:hidden/);
+  });
+
+  it('a Fill child grows with the window instead of carrying a pixel width', () => {
+    const page = build();
+    const html = frameToResponsiveHtml(page.objects.scr, page, {});
+    const grow = html.slice(html.indexOf('data-id="grow"'));
+    // The row wraps, so the basis is the declared width (that is what breaks rows) — the
+    // point is that the element grows rather than being pinned at `width:200px`.
+    expect(grow).toContain('flex:1 1 200px');
+    expect(grow).not.toContain('width:200px');
+  });
+
+  it('carries injected hotspots INSIDE the layer — text layers included', () => {
+    const page = build();
+    const html = frameToResponsiveHtml(page.objects.scr, page, {},
+      s => (s.interactions ?? []).length ? '<div class="hotspot"></div>' : '');
+    // The link is a text layer; its hotspot has to survive, or the nav is dead.
+    const link = html.slice(html.indexOf('data-id="link"'));
+    expect(link).toContain('class="hotspot"');
+    // …and it needs a positioned host to be inset against.
+    expect(link.slice(0, link.indexOf('>'))).toContain('position:relative');
+  });
+});
+
+describe('Fill inside a wrap container keeps the engine’s row-breaking basis', () => {
+  const child = (mods: Partial<Shape>) => {
+    const parent = makeDefaultShape({ id: 'p', type: 'frame', name: 'Row', frameId: 'p',
+      x: 0, y: 0, width: 1440, height: 400, selrect: { x: 0, y: 0, width: 1440, height: 400 },
+      autoLayout: { direction: 'wrap', spacing: 40, padding: { top: 0, right: 0, bottom: 0, left: 0 },
+        justifyContent: 'start', alignItems: 'start' } });
+    const c = makeDefaultShape({ id: 'c', type: 'frame', name: 'Col', frameId: 'p', parentId: 'p',
+      x: 0, y: 0, width: 620, height: 380, selrect: { x: 0, y: 0, width: 620, height: 380 }, ...mods });
+    const page: Page = { id: 'pg', name: 'Page 1', background: '#fff', objects: { p: parent, c }, childIds: ['p'] };
+    return shapeToCssProps(c, page);
+  };
+
+  it('grows from the declared width so the row can break, unlike flex-basis 0', () => {
+    const css = child({ widthMode: 'fill' });
+    expect(css['flex']).toBe('1 1 620px');
+    // A zero basis always fits its row, so the column would never stack on a phone.
+    expect(css['flex']).not.toBe('1 1 0');
+    // …and shrink stays on so a lone item on a 375px row doesn't overflow it.
+    expect(css['min-width']).toBe('0');
+  });
+
+  it('a non-wrapping row still fills from a zero basis', () => {
+    const parent = makeDefaultShape({ id: 'p', type: 'frame', name: 'Row', frameId: 'p',
+      x: 0, y: 0, width: 800, height: 100, selrect: { x: 0, y: 0, width: 800, height: 100 },
+      autoLayout: { direction: 'horizontal', spacing: 0, padding: { top: 0, right: 0, bottom: 0, left: 0 },
+        justifyContent: 'start', alignItems: 'start' } });
+    const c = makeDefaultShape({ id: 'c', type: 'rect', name: 'Grow', frameId: 'p', parentId: 'p',
+      x: 0, y: 0, width: 300, height: 40, selrect: { x: 0, y: 0, width: 300, height: 40 }, widthMode: 'fill' });
+    const page: Page = { id: 'pg', name: 'Page 1', background: '#fff', objects: { p: parent, c }, childIds: ['p'] };
+    expect(shapeToCssProps(c, page)['flex']).toBe('1 1 0');
   });
 });

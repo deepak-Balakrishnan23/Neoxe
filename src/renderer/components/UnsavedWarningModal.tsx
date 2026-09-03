@@ -78,23 +78,23 @@ const s: Record<string, React.CSSProperties> = {
   overlay: {
     position: 'fixed', inset: 0, background: 'rgba(17,17,27,0.6)',
     display: 'flex', alignItems: 'center', justifyContent: 'center',
-    zIndex: 600, backdropFilter: 'blur(4px)', fontFamily: 'system-ui',
+    zIndex: 600, backdropFilter: 'blur(4px)', fontFamily: 'var(--font-ui)',
   },
   dialog: {
     background: 'var(--bg-panel)', border: '1px solid var(--border-strong)',
     borderRadius: 12, padding: 20, width: 360, display: 'flex', flexDirection: 'column', gap: 12,
     boxShadow: '0 16px 48px rgba(0,0,0,0.5)',
   },
-  title: { fontSize: 15, fontWeight: 700, color: 'var(--text)' },
+  title: { fontSize: 16, fontWeight: 700, color: 'var(--text)' },
   body: { fontSize: 13, color: 'var(--text-secondary)', lineHeight: 1.5 },
-  actions: { display: 'flex', alignItems: 'center', gap: 8, marginTop: 6 },
+  actions: { display: 'flex', alignItems: 'center', gap: 8, marginTop: 8 },
   dontSave: {
     background: 'transparent', border: '1px solid var(--border-strong)',
     color: 'var(--text-secondary)', fontSize: 13, padding: '8px 12px', borderRadius: 6, cursor: 'pointer',
   },
   cancel: {
     background: 'var(--border)', border: 'none',
-    color: 'var(--text)', fontSize: 13, padding: '8px 14px', borderRadius: 6, cursor: 'pointer',
+    color: 'var(--text)', fontSize: 13, padding: '8px 16px', borderRadius: 6, cursor: 'pointer',
   },
   primary: {
     background: 'var(--accent)', border: 'none',

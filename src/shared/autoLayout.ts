@@ -104,7 +104,10 @@ export function calculateLayout(node: AutoLayoutNode, parentBounds: Bounds): Lay
   }
 
   const width = resolveAxisSize('width', node, parentBounds);
-  const height = resolveAxisSize('height', node, parentBounds);
+  // The height is resolved AFTER the width so a hug can be measured against it.
+  const height = (node.heightMode ?? 'fixed') === 'hug'
+    ? clampAxis(hugHeightAtWidth(node, width), node.minHeight, node.maxHeight)
+    : resolveAxisSize('height', node, parentBounds);
   const bounds: Bounds = { x: parentBounds.x, y: parentBounds.y, width, height };
 
   if (!node.autoLayout || !node.children || node.children.length === 0) {
@@ -176,9 +179,26 @@ function naturalSize(node: AutoLayoutNode): { width: number; height: number } {
     };
   }
 
+  // A wrap container's height follows from its width — the browser rule that block size
+  // follows inline size. So resolve the width first (hug = one row's worth, i.e.
+  // max-content; otherwise the declared box), clamp it, and count the rows THAT width
+  // produces. A max-width that cuts a hug container short therefore adds rows, exactly
+  // as narrowing a wrapping flex container does in a browser.
+  if (dir === 'wrap') {
+    const intrinsicW = padding.left + padding.right + sum(childSizes.map(s => s.width)) + between;
+    const wRaw = (node.widthMode ?? 'fixed') === 'hug' ? intrinsicW : node.width;
+    const width = clampAxis(wRaw, node.minWidth, node.maxWidth);
+    return {
+      width,
+      height: clampAxis(
+        wrapContentHeight(node, Math.max(0, width - padding.left - padding.right)),
+        node.minHeight, node.maxHeight,
+      ),
+    };
+  }
+
   let w: number, h: number;
-  // Intrinsic (hug both axes) of a wrap container = a single row, like horizontal.
-  if (dir === 'horizontal' || dir === 'wrap') {
+  if (dir === 'horizontal') {
     w = padding.left + padding.right + sum(childSizes.map(s => s.width)) + between;
     h = padding.top + padding.bottom + max(childSizes.map(s => s.height));
   } else {
@@ -197,9 +217,124 @@ function naturalSize(node: AutoLayoutNode): { width: number; height: number } {
  */
 function naturalContribution(child: AutoLayoutNode): { width: number; height: number } {
   const ns = naturalSize(child);
+  // Clamp on every axis, not just the hugging ones: a fixed 100px child with
+  // min-width 200 occupies 200 when placed, so a hugging parent must measure 200 —
+  // same as a browser sizing a fit-content box around a min-width'd child.
   const w = (child.widthMode ?? 'fixed') === 'hug' ? ns.width : child.width;
   const h = (child.heightMode ?? 'fixed') === 'hug' ? ns.height : child.height;
-  return { width: w, height: h };
+  return {
+    width: clampAxis(w, child.minWidth, child.maxWidth),
+    height: clampAxis(h, child.minHeight, child.maxHeight),
+  };
+}
+
+/**
+ * The height a hugging node settles at once its width is known — the browser rule that a
+ * box's block size follows from its inline size.
+ *
+ * `naturalSize` answers a different question: the max-content size, where BOTH axes hug.
+ * That is the wrong measurement for a hug height whose width has already been decided,
+ * and the difference is not academic: a column hugging its content around a full-width
+ * wrapping row must measure that row at the width it will actually get, not at the width
+ * it would have if nothing constrained it. Measure it at max-content and the row reports
+ * one row's height, the column hugs to that, and the layer below it gets overlapped by
+ * the rows that actually appear.
+ *
+ * A `fill` child still contributes its DECLARED height here, matching
+ * `naturalContribution` — a hug parent has no leftover height to fill into.
+ */
+function hugHeightAtWidth(node: AutoLayoutNode, width: number): number {
+  if (!node.autoLayout || !node.children || node.children.length === 0) {
+    return clampAxis(node.height, node.minHeight, node.maxHeight);
+  }
+  const pad = node.padding ?? ZERO_PAD;
+  const spacing = node.spacing ?? 0;
+  const dir = node.direction ?? 'horizontal';
+  const innerW = Math.max(0, width - pad.left - pad.right);
+  const padV = pad.top + pad.bottom;
+  const clampH = (v: number) => clampAxis(v, node.minHeight, node.maxHeight);
+
+  if (dir === 'wrap') return clampH(wrapContentHeight(node, innerW));
+  if (dir === 'grid') {
+    const cols = Math.max(1, Math.floor(node.columns ?? 2));
+    const colW = Math.max(0, (innerW - spacing * (cols - 1)) / cols);
+    const rh = gridRowHeights(node, colW);
+    return clampH(padV + sum(rh) + spacing * Math.max(0, rh.length - 1));
+  }
+
+  const inclStroke = !!node.strokeInLayout;
+  // Each child's width, as this container will actually resolve it.
+  const widths = childWidthsAt(node, innerW, dir);
+  const heights = node.children.map((c, i) => {
+    const hMode = c.heightMode ?? 'fixed';
+    const own = hMode === 'hug'
+      ? hugHeightAtWidth(c, widths[i])
+      : clampAxis(c.height, c.minHeight, c.maxHeight);
+    return own + (inclStroke ? (c.strokeExtent ?? 0) : 0);
+  });
+
+  return dir === 'vertical'
+    ? clampH(padV + sum(heights) + spacing * Math.max(0, node.children.length - 1))
+    : clampH(padV + max(heights));
+}
+
+/**
+ * The width this container gives each child, given its own inner width. On the cross axis
+ * (a vertical container) that is simply fill → the full inner width; on the main axis (a
+ * horizontal container) the fill children split what the fixed and hugging ones leave,
+ * through the same flexbox resolution `placeChildren` uses.
+ */
+function childWidthsAt(node: AutoLayoutNode, innerW: number, dir: AutoLayoutDirection): number[] {
+  const children = node.children!;
+  const declared = (c: AutoLayoutNode) => {
+    const mode = c.widthMode ?? 'fixed';
+    return mode === 'hug' ? naturalSize(c).width : c.width;
+  };
+  if (dir === 'vertical') {
+    return children.map(c => clampAxis(
+      (c.widthMode ?? 'fixed') === 'fill' ? innerW : declared(c),
+      c.minWidth, c.maxWidth,
+    ));
+  }
+  const spacing = node.spacing ?? 0;
+  const inclStroke = !!node.strokeInLayout;
+  const slots = children.map(c => ({
+    primary: clampAxis(declared(c), c.minWidth, c.maxWidth),
+    ext: inclStroke ? (c.strokeExtent ?? 0) : 0,
+    minMain: c.minWidth, maxMain: c.maxWidth,
+    fill: (c.widthMode ?? 'fixed') === 'fill',
+  }));
+  const taken = slots.reduce((a, s) => a + (s.fill ? 0 : s.primary + s.ext), 0);
+  const gaps = spacing * Math.max(0, children.length - 1);
+  const fills = slots.filter(s => s.fill);
+  if (fills.length > 0) resolveFlexible(fills, Math.max(0, innerW - taken - gaps));
+  return slots.map(s => s.primary);
+}
+
+/**
+ * Flexbox's "resolve the flexible lengths" loop. Hands `free` out in equal shares to
+ * every unfrozen slot; a slot that hits a min/max clamp freezes at its clamped size and
+ * whatever it did not take is re-divided among the rest. Terminates because each pass
+ * either freezes at least one slot or assigns the remainder and stops.
+ */
+type FlexSlot = { primary: number; ext: number; minMain?: number; maxMain?: number };
+function resolveFlexible(slots: FlexSlot[], free: number): void {
+  const unfrozen = new Set(slots);
+  while (unfrozen.size > 0) {
+    const share = free / unfrozen.size;
+    let froze = false;
+    for (const s of unfrozen) {
+      const want = Math.max(0, share - s.ext);
+      const got = clampAxis(want, s.minMain, s.maxMain);
+      if (got !== want) {
+        s.primary = got;
+        free -= got + s.ext;
+        unfrozen.delete(s);
+        froze = true;
+      }
+    }
+    if (!froze) { for (const s of unfrozen) s.primary = Math.max(0, share - s.ext); break; }
+  }
 }
 
 // ── Child placement ───────────────────────────────────────────────────────────
@@ -227,7 +362,11 @@ function placeChildren(node: AutoLayoutNode, bounds: Bounds): LayoutResult[] {
 
   // First pass — compute each child's primary-axis geometric size + stroke ext. Fill children
   // share whatever is left after fixed+hug occupancy and the spacing between them.
-  type Slot = { primary: number; cross: number; fill: boolean; ext: number; minMain?: number; maxMain?: number };
+  type Slot = {
+    primary: number; cross: number; fill: boolean; ext: number;
+    minMain?: number; maxMain?: number;
+    crossHug: boolean; minCross?: number; maxCross?: number;
+  };
   const slots: Slot[] = [];
   let fixedPrimary = 0;   // occupancy (geometric + stroke ext)
   let fillCount = 0;
@@ -240,17 +379,10 @@ function placeChildren(node: AutoLayoutNode, bounds: Bounds): LayoutResult[] {
     const maxCross = dir === 'horizontal' ? c.maxHeight : c.maxWidth;
     const ext = inclStroke ? (c.strokeExtent ?? 0) : 0;
 
-    let primary = 0;
-    if (primaryMode === 'fill') { fillCount++; }
-    else if (primaryMode === 'hug') {
-      const ns = naturalSize(c);
-      primary = clampAxis(dir === 'horizontal' ? ns.width : ns.height, minMain, maxMain);
-      fixedPrimary += primary + ext;
-    } else {
-      primary = clampAxis(dir === 'horizontal' ? c.width : c.height, minMain, maxMain);
-      fixedPrimary += primary + ext;
-    }
-
+    // Cross axis first. A hug on the PRIMARY axis can depend on the resolved cross size
+    // (a wrap container's height follows from its width, as in a browser), while the cross
+    // size never depends on the primary one — except for a primary-fill child, whose cross
+    // hug is re-measured after the fill distribution below.
     let cross = 0;
     if (crossMode === 'fill') cross = crossSize - ext;   // fill leaves room for its own stroke
     else if (crossMode === 'hug') {
@@ -260,26 +392,51 @@ function placeChildren(node: AutoLayoutNode, bounds: Bounds): LayoutResult[] {
       cross = dir === 'horizontal' ? c.height : c.width;
     }
     cross = clampAxis(cross, minCross, maxCross);
-    slots.push({ primary, cross, fill: primaryMode === 'fill', ext, minMain, maxMain });
+
+    let primary = 0;
+    if (primaryMode === 'fill') { fillCount++; }
+    else if (primaryMode === 'hug') {
+      const raw = dir === 'horizontal' ? naturalSize(c).width : hugHeightAtWidth(c, cross);
+      primary = clampAxis(raw, minMain, maxMain);
+      fixedPrimary += primary + ext;
+    } else {
+      primary = clampAxis(dir === 'horizontal' ? c.width : c.height, minMain, maxMain);
+      fixedPrimary += primary + ext;
+    }
+
+    slots.push({
+      primary, cross, fill: primaryMode === 'fill', ext, minMain, maxMain,
+      crossHug: crossMode === 'hug', minCross, maxCross,
+    });
   }
 
   const totalSpacing = spacing * Math.max(0, children.length - 1);
   const remaining = Math.max(0, mainSize - fixedPrimary - totalSpacing);
-  const fillEach = fillCount > 0 ? remaining / fillCount : 0;
-  // Single-pass fill: equal share minus this child's stroke ext, then clamp to min/max.
-  // (Clamping can leave minor slack when multiple fill children hit bounds — acceptable v1.)
-  for (const s of slots) if (s.fill) s.primary = clampAxis(Math.max(0, fillEach - s.ext), s.minMain, s.maxMain);
+  // Fill children share what's left the way flexbox does: a child that clamps at its
+  // min/max freezes there and hands the difference back to the other fill children,
+  // instead of that space silently disappearing.
+  if (fillCount > 0) resolveFlexible(slots.filter(s => s.fill), remaining);
+
+  // A cross-axis hug on a fill child could only be measured once its primary size was
+  // known — do it now (a card that filled the row is only now tall enough for its rows).
+  for (let i = 0; i < children.length; i++) {
+    const s = slots[i];
+    if (!s.fill || !s.crossHug) continue;
+    const raw = dir === 'horizontal'
+      ? hugHeightAtWidth(children[i], s.primary)
+      : naturalSize(children[i]).width;
+    s.cross = clampAxis(raw, s.minCross, s.maxCross);
+  }
 
   // Occupancy of a slot on the main axis = geometric primary + stroke ext.
   const occ = (s: Slot) => s.primary + s.ext;
 
-  // Primary-axis distribution. When any fill children are present, they consume all
-  // leftover space so a `justifyContent` other than start has no slack — start-like.
+  // Primary-axis distribution. Fill children normally eat every bit of slack, leaving
+  // justifyContent nothing to do — but when they all clamp below their share, the
+  // leftover is real free space and must be distributed like a browser would.
   const totalPrimary = slots.reduce((a, s) => a + occ(s), 0);
   const slack = Math.max(0, mainSize - totalPrimary - totalSpacing);
-  const offsets = fillCount > 0
-    ? { leading: 0, between: spacing }
-    : computeJustifyOffsets(justify, children.length, slack, spacing);
+  const offsets = computeJustifyOffsets(justify, children.length, slack, spacing);
 
   // Second pass — place each child and recurse. The geometric box is centred inside its
   // occupancy (stroke extends half-ext beyond each edge).
@@ -372,7 +529,11 @@ function placeWrap(node: AutoLayoutNode, bounds: Bounds): LayoutResult[] {
 
   // alignContent — distribute the rows on the cross axis when the container is taller than
   // its content (only meaningful for a fixed/fill height; a hug container has no slack).
-  const rowHeights = rows.map(r => r.reduce((m, it) => Math.max(m, it.h), 0));
+  const crossContribution = (it: Item) =>
+    (it.c.heightMode ?? 'fixed') === 'fill'
+      ? clampAxis(naturalSize(it.c).height, it.c.minHeight, it.c.maxHeight)
+      : it.h;
+  const rowHeights = rows.map(r => r.reduce((m, it) => Math.max(m, crossContribution(it)), 0));
   const innerH = Math.max(0, bounds.height - padding.top - padding.bottom);
   const rowsTotal = sum(rowHeights) + spacing * Math.max(0, rows.length - 1);
   const crossSlack = Math.max(0, innerH - rowsTotal);
@@ -385,11 +546,35 @@ function placeWrap(node: AutoLayoutNode, bounds: Bounds): LayoutResult[] {
   const out: LayoutResult[] = [];
   for (let ri = 0; ri < rows.length; ri++) {
     const r = rows[ri];
-    const rowH = rowHeights[ri];
-    const contentW = r.reduce((a, it) => a + it.w, 0);
+    let rowH = rowHeights[ri];
     const rowSpacing = spacing * Math.max(0, r.length - 1);
+    // Fill children grow into the leftover of the row they landed on — the browser rule
+    // for `flex:1` under `flex-wrap`. Row BREAKING still uses each item's declared box
+    // (above), so adding fill to an item never re-flows the rows out from under the user.
+    const fills = r.filter(it => (it.c.widthMode ?? 'fixed') === 'fill');
+    if (fills.length > 0) {
+      const fixedW = r.reduce((a, it) => a + (fills.includes(it) ? 0 : it.w), 0);
+      const free = Math.max(0, innerW - fixedW - rowSpacing);
+      const fslots: FlexSlot[] = fills.map(it => ({
+        primary: it.w, ext: 0, minMain: it.c.minWidth, maxMain: it.c.maxWidth,
+      }));
+      resolveFlexible(fslots, free);
+      fills.forEach((it, i) => {
+        it.w = fslots[i].primary;
+        // A hug height follows from the width it just got, as in a browser.
+        if ((it.c.heightMode ?? 'fixed') === 'hug') it.h = hugHeightAtWidth(it.c, it.w);
+      });
+    }
+    const contentW = r.reduce((a, it) => a + it.w, 0);
     const slack = Math.max(0, innerW - contentW - rowSpacing);
     const offs = computeJustifyOffsets(justify, r.length, slack, spacing);
+    rowH = r.reduce((m, it) => Math.max(m, crossContribution(it)), rowH);
+    // Cross-axis fill inside a wrap row stretches to the row's height, the way
+    // `align-self: stretch` does in a wrapped flex line. The row's height itself comes
+    // from the items' own boxes, so a fill child never inflates the row it stretches to.
+    for (const it of r) {
+      if ((it.c.heightMode ?? 'fixed') === 'fill') it.h = clampAxis(rowH, it.c.minHeight, it.c.maxHeight);
+    }
     let x = offs.leading;
     for (const it of r) {
       const crossOffset = align === 'center' ? (rowH - it.h) / 2 : align === 'end' ? rowH - it.h : 0;
@@ -408,14 +593,23 @@ function placeWrap(node: AutoLayoutNode, bounds: Bounds): LayoutResult[] {
 // tallest child; `spacing` is used for both column and row gaps. Deferred: per-track
 // sizing, cell spans, separate row/column gaps, per-cell alignment.
 
-function gridRowHeights(node: AutoLayoutNode): number[] {
+// `colW` is the resolved column width when known (placement). A hug-height child in a
+// fill-width cell is as tall as that width makes it — the browser rule again.
+function gridRowHeights(node: AutoLayoutNode, colW?: number): number[] {
   const cols = Math.max(1, Math.floor(node.columns ?? 2));
   const children = node.children ?? [];
   const rows = Math.max(1, Math.ceil(children.length / cols));
+  const cellH = (c: AutoLayoutNode): number => {
+    if (colW != null && (c.heightMode ?? 'fixed') === 'hug') {
+      const w = (c.widthMode ?? 'fixed') === 'fill' ? colW : wrapBox(c).w;
+      return clampAxis(hugHeightAtWidth(c, w), c.minHeight, c.maxHeight);
+    }
+    return wrapBox(c).h;
+  };
   const heights: number[] = [];
   for (let r = 0; r < rows; r++) {
     let h = 0;
-    for (let c = 0; c < cols; c++) { const idx = r * cols + c; if (idx < children.length) h = Math.max(h, wrapBox(children[idx]).h); }
+    for (let c = 0; c < cols; c++) { const idx = r * cols + c; if (idx < children.length) h = Math.max(h, cellH(children[idx])); }
     heights.push(h);
   }
   return heights;
@@ -438,7 +632,7 @@ function placeGrid(node: AutoLayoutNode, bounds: Bounds): LayoutResult[] {
   const innerW = Math.max(0, bounds.width - padding.left - padding.right);
   const colW = Math.max(0, (innerW - gap * (cols - 1)) / cols);
 
-  const rowH = gridRowHeights(node);
+  const rowH = gridRowHeights(node, colW);
   const rowY: number[] = [];
   let acc = 0;
   for (let r = 0; r < rowH.length; r++) { rowY.push(acc); acc += rowH[r] + gap; }
@@ -451,7 +645,9 @@ function placeGrid(node: AutoLayoutNode, bounds: Bounds): LayoutResult[] {
     const box = wrapBox(c);
     // Fill stretches to the cell; otherwise the child keeps its own box, pinned top-left.
     const w = (c.widthMode ?? 'fixed') === 'fill' ? colW : box.w;
-    const h = (c.heightMode ?? 'fixed') === 'fill' ? rowH[row] : box.h;
+    const h = (c.heightMode ?? 'fixed') === 'fill' ? rowH[row]
+      : (c.heightMode ?? 'fixed') === 'hug' ? clampAxis(hugHeightAtWidth(c, w), c.minHeight, c.maxHeight)
+      : box.h;
     const placed: Bounds = { x: innerX + col * (colW + gap), y: innerY + rowY[row], width: w, height: h };
     const childInput: AutoLayoutNode = { ...c, width: w, height: h, widthMode: 'fixed', heightMode: 'fixed' };
     out.push(calculateLayout(childInput, placed));

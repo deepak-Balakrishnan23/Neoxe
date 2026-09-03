@@ -137,21 +137,21 @@ const s: Record<string, React.CSSProperties> = {
   overlay: {
     position: 'fixed', inset: 0, background: 'rgba(17,17,27,0.6)',
     display: 'flex', alignItems: 'center', justifyContent: 'center',
-    zIndex: 500, backdropFilter: 'blur(4px)', fontFamily: 'system-ui',
+    zIndex: 500, backdropFilter: 'blur(4px)', fontFamily: 'var(--font-ui)',
   },
   dialog: {
     background: 'var(--bg-panel)', border: '1px solid var(--border-strong)',
-    borderRadius: 12, padding: 20, width: 320, display: 'flex', flexDirection: 'column', gap: 14,
+    borderRadius: 12, padding: 20, width: 320, display: 'flex', flexDirection: 'column', gap: 16,
     boxShadow: '0 16px 48px rgba(0,0,0,0.5)',
   },
   title: { fontSize: 16, fontWeight: 700, color: 'var(--text)' },
-  field: { display: 'flex', flexDirection: 'column', gap: 6 },
+  field: { display: 'flex', flexDirection: 'column', gap: 8 },
   label: { fontSize: 11, color: 'var(--text-secondary)', textTransform: 'uppercase', letterSpacing: '0.06em' },
   hint: { fontSize: 12, color: 'var(--text-secondary)', lineHeight: 1.45, background: 'var(--border)', borderRadius: 6, padding: '8px 10px' },
   segGroup: { display: 'flex', gap: 4 },
   seg: {
     flex: 1, background: 'var(--border)', border: '1px solid var(--border-strong)',
-    color: 'var(--text)', fontSize: 12, padding: '6px 8px', borderRadius: 6, cursor: 'pointer',
+    color: 'var(--text)', fontSize: 12, padding: '0 8px', height: 28, borderRadius: 6, cursor: 'pointer',
   },
   // Solid accent fill + white text reads in both light and dark themes (a pale tint with
   // white text was invisible in light mode).

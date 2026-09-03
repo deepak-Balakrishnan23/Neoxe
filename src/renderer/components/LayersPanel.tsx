@@ -16,6 +16,26 @@ const TYPE_ICONS: Record<string, IconName> = {
   image: 'image', svg: 'code', vector: 'code', path: 'pen', bool: 'group', group: 'group',
 };
 
+// A plain frame and an auto-layout frame are different objects — one holds its children at
+// fixed coordinates, the other lays them out — so they must not share the generic frame
+// glyph. Figma identifies an auto-layout frame by its FLOW, which makes the direction part
+// of the icon rather than a decoration next to it.
+const AUTO_LAYOUT_ICONS: Record<NonNullable<Shape['autoLayout']>['direction'], IconName> = {
+  horizontal: 'flex-row',   // bars side by side
+  vertical: 'flex-col',     // bars stacked
+  wrap: 'flex-wrap',        // bars wrapping to a second row
+  grid: 'grid',             // 2×2 cells
+};
+
+function layerIcon(shape: Shape): IconName {
+  // Component masters/instances keep their own identity — that outranks the container kind.
+  if (shape.componentId || shape.masterId) return 'group';
+  if (shape.type === 'frame' && shape.autoLayout) {
+    return AUTO_LAYOUT_ICONS[shape.autoLayout.direction] ?? 'flex-row';
+  }
+  return TYPE_ICONS[shape.type] ?? 'rect';
+}
+
 export default function LayersPanel() {
   const [panelTab, setPanelTab] = useState<'layers' | 'assets' | 'tokens'>('layers');
   const { file, activePage, toggleSelected, setFile, clearSelection, vectorEditChildId, setVectorEditShapeId, setVectorEditChildId, groupEditId, setGroupEditId, setSvgEditShapeId, setLivePreviewSvg } = useDesignStore();
@@ -264,8 +284,9 @@ const tabStyles: Record<string, React.CSSProperties> = {
   btn: {
     flex: 1, background: 'transparent', borderWidth: 0, borderStyle: 'solid',
     borderBottomWidth: 2, borderBottomColor: 'transparent',
-    color: 'var(--text-secondary)', fontSize: 12, padding: '8px 4px', cursor: 'pointer',
-    fontFamily: 'system-ui',
+    color: 'var(--text-secondary)', fontSize: 12, padding: '0 4px', cursor: 'pointer',
+    fontFamily: 'var(--font-ui)',
+    height: 32, display: 'flex', alignItems: 'center', justifyContent: 'center',
   },
   active: { color: 'var(--text)', borderBottomColor: 'var(--accent)' },
 };
@@ -348,7 +369,7 @@ const LayerRow = React.memo(function LayerRow(props: RowProps) {
           color: shape.componentId || shape.masterId ? 'var(--accent-hover)' : undefined,
           opacity: shape.componentId || shape.masterId ? 1 : 0.75,
         }}>
-          <Icon name={shape.componentId || shape.masterId ? 'group' : (TYPE_ICONS[shape.type] ?? 'rect')} size={13} />
+          <Icon name={layerIcon(shape)} size={13} />
         </span>
 
         {/* Name */}
@@ -367,28 +388,13 @@ const LayerRow = React.memo(function LayerRow(props: RowProps) {
             }}
           />
         ) : (
-          <span style={{ display: 'flex', alignItems: 'center', gap: 3, overflow: 'hidden', flex: 1 }}>
+          <span style={{ display: 'flex', alignItems: 'center', gap: 4, overflow: 'hidden', flex: 1 }}>
             <span
               style={styles.name}
               onDoubleClick={(e) => { e.stopPropagation(); props.onStartRename(id); }}
             >
               {shape.name}
             </span>
-            {shape.autoLayout && (
-              <svg
-                width="10" height="10" viewBox="0 0 10 10"
-                style={{ flexShrink: 0, opacity: 0.5 }}
-                aria-hidden="true"
-              >
-                {shape.autoLayout.direction === 'horizontal' ? (
-                  // → right arrow
-                  <path d="M1 5h8M6 2l3 3-3 3" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" fill="none" />
-                ) : (
-                  // ↓ down arrow
-                  <path d="M5 1v8M2 6l3 3 3-3" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" fill="none" />
-                )}
-              </svg>
-            )}
           </span>
         )}
 
@@ -488,7 +494,7 @@ const styles: Record<string, React.CSSProperties> = {
     flexDirection: 'column',
     flexShrink: 0,
     overflow: 'hidden',
-    fontFamily: 'system-ui',
+    fontFamily: 'var(--font-ui)',
     userSelect: 'none',
   },
   list: {
@@ -500,7 +506,7 @@ const styles: Record<string, React.CSSProperties> = {
   row: {
     display: 'flex',
     alignItems: 'center',
-    gap: 6,
+    gap: 8,
     paddingTop: 0,
     paddingBottom: 0,
     paddingRight: 10,
@@ -536,12 +542,12 @@ const styles: Record<string, React.CSSProperties> = {
     flex: 1,
     background: 'var(--border)',
     border: '1px solid var(--accent)',
-    borderRadius: 3,
+    borderRadius: 4,
     color: 'var(--text)',
     fontSize: 12,
     padding: '1px 4px',
     outline: 'none',
-    fontFamily: 'system-ui',
+    fontFamily: 'var(--font-ui)',
   },
   icon: {
     fontSize: 11,
@@ -554,7 +560,7 @@ const styles: Record<string, React.CSSProperties> = {
     height: 2,
     background: 'var(--accent)',
     margin: '0 8px',
-    borderRadius: 1,
+    borderRadius: 2,
     pointerEvents: 'none',
   },
   empty: {
@@ -587,12 +593,14 @@ const styles: Record<string, React.CSSProperties> = {
     fontSize: 16,
     cursor: 'pointer',
     lineHeight: 1,
+    width: 24, height: 24, borderRadius: 4, flexShrink: 0,
+    display: 'flex', alignItems: 'center', justifyContent: 'center',
     padding: '0 4px',
   },
   pageRow: {
     display: 'flex',
     alignItems: 'center',
-    padding: '5px 12px',
+    padding: '4px 12px',
     fontSize: 12,
     cursor: 'pointer',
     borderRadius: 4,
@@ -609,7 +617,7 @@ const styles: Record<string, React.CSSProperties> = {
     background: 'transparent',
     border: 'none',
     color: 'var(--text-secondary)',
-    fontSize: 14,
+    fontSize: 13,
     cursor: 'pointer',
     opacity: 0,
     padding: '0 2px',

@@ -72,18 +72,43 @@
         --row-hover: rgba(0,0,0,0.04);
       }
 
+      /* ── Typography + control baseline ──────────────────────────────
+         The UI font lives in a variable so components can reference it as a
+         plain string (var(--font-ui)) with no import. Form controls get an
+         explicit font-size because the UA default is 13.333px, which is what
+         made every un-styled input render larger than the labels beside it.
+         Inline styles still win, so components that set their own size keep it. */
+      :root {
+        --font-ui: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", system-ui, sans-serif;
+        --font-mono: ui-monospace, "SF Mono", Menlo, monospace;
+      }
+
       *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
       html, body, #root { width: 100%; height: 100%; overflow: hidden; }
       body {
         background: var(--bg-canvas);
         color: var(--text);
-        font-family: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", system-ui, sans-serif;
+        font-family: var(--font-ui);
         -webkit-font-smoothing: antialiased;
         text-rendering: optimizeLegibility;
       }
-      button { font-family: inherit; }
+      button, input, select, textarea {
+        font-family: inherit;
+        font-size: 12px;
+        line-height: 16px;
+      }
       button:hover { filter: brightness(1.08); }
-      input, select, textarea { font-family: inherit; }
+      /* A text-on-path editor is an invisible input: its glyphs, caret and selection are
+         all painted on the canvas along the curve. The textarea's own selection band is
+         box-shaped, so without this it shows through as a stray blue rectangle. */
+      .textpath-editor::selection { background: transparent; color: transparent; }
+      .textpath-editor::-moz-selection { background: transparent; color: transparent; }
+
+      input[type="checkbox"], input[type="radio"] {
+        width: 16px; height: 16px; margin: 0; flex-shrink: 0; accent-color: var(--accent);
+      }
+      /* Keyboard focus is visible on every control, at one consistent inset. */
+      :focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 
       .layer-action { transition: opacity .12s; }
       .layer-row:hover .layer-action { opacity: 0.55 !important; }

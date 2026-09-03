@@ -65,7 +65,7 @@ describe('generatePrototypeHtml', () => {
   it('embeds the player runtime with back/forward + fit-to-viewport', () => {
     expect(html).toContain('function fit()');
     expect(html).toContain('function navigate(');
-    expect(html).toContain('function goBack()');
+    expect(html).toContain('function goBack(');
     expect(html).toContain('function goForward()');
     expect(html).toContain('START = "home"');
   });

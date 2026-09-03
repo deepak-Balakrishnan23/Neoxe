@@ -1,6 +1,7 @@
-import { DesignFile, ChangeSet, ChangeOp, Shape, Page, makeDefaultPage, ColorEntry, TextStyle, DesignToken, TokenType, VectorChildNode, ComponentPropDef, Shadow, BlurEffect, LayoutGrid } from '../shared/types';
+import { DesignFile, ChangeSet, ChangeOp, Shape, Page, makeDefaultPage, ColorEntry, TextStyle, DesignToken, TokenType, VectorChildNode, ComponentPropDef, Shadow, BlurEffect, LayoutGrid, isTextOnPath } from '../shared/types';
 import { applyTokensToFile } from '../shared/tokens';
 import { applyAutoLayoutToPage } from '../shared/autoLayout';
+import { fitTextSize } from './canvas/textLayout';
 import { constraintOps } from '../shared/constraints';
 import { resolvePropDefs } from '../shared/components';
 import { booleanSegments, BoolOp } from '../shared/boolean';
@@ -22,6 +23,10 @@ function pendingNumber(ops: ChangeOp[], id: string, attr: string, current: numbe
 const PROPAGATED_ATTRS = new Set([
   'fills', 'strokes', 'shadows', 'blur', 'opacity', 'blendMode',
   'textStyle', 'paragraphs', 'content', 'type',
+  // Corner radius and smoothing sit in the same Appearance row as the fills and strokes
+  // above and are just as much a paint property — leaving them out meant rounding a
+  // master's corners changed nothing in any of its instances.
+  'cornerRadii', 'cornerSmoothing',
 ]);
 
 type InverseOp =
@@ -94,6 +99,11 @@ export class DocumentEngine {
     this.undoStack = [];
     this.redoStack = [];
     this.lastSnapshot = null;
+    // Lay the document out on open. A file saved by this app is already reflow-stable, so
+    // this is a no-op for it — but a file that has never been laid out (imported, or
+    // authored elsewhere) would otherwise render with every auto-layout child still at
+    // its stored position. Not part of any undo entry: opening a file is not an edit.
+    for (const page of this.file.pages) this.reflow(page);
   }
 
   // Snapshot the active session (document + history) so it can be parked while another
@@ -324,7 +334,27 @@ export class DocumentEngine {
     const booleansChanged = this.recomputeBooleans(page);
 
     // Re-run Figma-style Auto Layout so containers reflow their children.
+    // The reflow writes geometry straight onto the shapes rather than through ops, so its
+    // writes have to be inverse-recorded: re-deriving them on undo only works while the
+    // engine still OWNS those shapes. Undo something that hands a shape back — removing a
+    // container, clearing its autoLayout, making a child absolute — and the pre-layout
+    // x/y is gone for good, leaving the children parked where the layout had put them.
+    // Recorded last in the entry so they are restored after the structural inverses.
+    const beforeReflow = new Map<string, { x: number; y: number; width: number; height: number }>();
+    for (const id in page.objects) {
+      const s = page.objects[id];
+      beforeReflow.set(id, { x: s.x, y: s.y, width: s.width, height: s.height });
+    }
     const autoLayoutChanged = this.reflow(page);
+    if (autoLayoutChanged) {
+      for (const [id, was] of beforeReflow) {
+        const s = page.objects[id];
+        if (!s) continue;
+        for (const attr of ['x', 'y', 'width', 'height'] as const) {
+          if (s[attr] !== was[attr]) inverseOps.push({ op: 'set', id, attr, val: was[attr] });
+        }
+      }
+    }
 
     // Don't record a no-op changeset (every op missed its target) — it would make undo
     // silently do nothing and cost the user extra ⌘Z presses to reach a real edit.
@@ -568,6 +598,76 @@ export class DocumentEngine {
    * from that master. The root keeps its id and position so the selection survives the
    * swap; descendant overrides don't (their layers are replaced).
    */
+  // ── Variant property editing ───────────────────────────────────────────────
+  // `combineAsVariants` can only ever produce ONE property, named "Variant", with values
+  // taken from layer names. A design system needs matrices (Type x State), and the model
+  // already stores `properties` as a map — these three methods are what let the UI build
+  // one instead of only the engine being able to.
+
+  /** Rename a variant property across the set's table and every variant's coordinates. */
+  renameVariantProperty(setId: string, from: string, to: string): DesignFile | null {
+    if (!this.file) return null;
+    const set = this.file.componentSets?.[setId];
+    const name = to.trim();
+    if (!set || !name || from === name || !(from in set.properties) || name in set.properties) return null;
+    const props: Record<string, string[]> = {};
+    for (const [k, v] of Object.entries(set.properties)) props[k === from ? name : k] = v;
+    set.properties = props;
+    for (const id of Object.keys(set.variants)) {
+      const coords = set.variants[id];
+      if (!(from in coords)) continue;
+      const next: Record<string, string> = {};
+      for (const [k, v] of Object.entries(coords)) next[k === from ? name : k] = v;
+      set.variants[id] = next;
+    }
+    return this.snapshot();
+  }
+
+  /** Add a property to the set. Every existing variant takes `defaultValue`. */
+  addVariantProperty(setId: string, name: string, defaultValue = 'Default'): DesignFile | null {
+    if (!this.file) return null;
+    const set = this.file.componentSets?.[setId];
+    const key = name.trim(), val = defaultValue.trim() || 'Default';
+    if (!set || !key || key in set.properties) return null;
+    set.properties[key] = [val];
+    for (const id of Object.keys(set.variants)) set.variants[id] = { ...set.variants[id], [key]: val };
+    return this.snapshot();
+  }
+
+  /** Remove a property from the set and from every variant's coordinates. */
+  removeVariantProperty(setId: string, name: string): DesignFile | null {
+    if (!this.file) return null;
+    const set = this.file.componentSets?.[setId];
+    // A set with no properties has nothing to switch between — keep at least one.
+    if (!set || !(name in set.properties) || Object.keys(set.properties).length < 2) return null;
+    delete set.properties[name];
+    for (const id of Object.keys(set.variants)) {
+      const next = { ...set.variants[id] };
+      delete next[name];
+      set.variants[id] = next;
+    }
+    return this.snapshot();
+  }
+
+  /** Set THIS variant's value for a property, registering the value on the set. */
+  setVariantValue(componentId: string, propName: string, value: string): DesignFile | null {
+    if (!this.file) return null;
+    const comp = this.file.components[componentId];
+    const set = comp?.setId ? this.file.componentSets?.[comp.setId] : null;
+    const v = value.trim();
+    if (!set || !v || !(propName in set.properties)) return null;
+    set.variants[componentId] = { ...(set.variants[componentId] ?? {}), [propName]: v };
+    // Rebuild the value list from what the variants actually use, so renaming the last
+    // variant off a value doesn't leave a dead option in every instance's dropdown.
+    const used: string[] = [];
+    for (const id of Object.keys(set.variants)) {
+      const val = set.variants[id][propName];
+      if (val && used.indexOf(val) === -1) used.push(val);
+    }
+    set.properties[propName] = used;
+    return this.snapshot();
+  }
+
   setInstanceVariant(shapeId: string, pageId: string, props: Record<string, string>): DesignFile | null {
     if (!this.file) return null;
     const page = this.file.pages.find(p => p.id === pageId);
@@ -726,25 +826,48 @@ export class DocumentEngine {
 
   // ── Design tokens ───────────────────────────────────────────────────────────
 
+  // NOTE for all three token mutators: replace the array, never mutate it in place.
+  // `resolveToken` caches its name→token map in a WeakMap keyed on the ARRAY IDENTITY, so
+  // a `push` or an index assignment leaves the stale map in place — a new token resolves
+  // to null and an edited one keeps resolving to its old value, which made both operations
+  // look like they did nothing at all.
   addToken(name: string, type: TokenType, value: string | number): DesignFile | null {
     if (!this.file) return null;
-    this.file.tokens.push({ id: uid(), name, $type: type, $value: value });
+    this.file.tokens = [...this.file.tokens, { id: uid(), name, $type: type, $value: value }];
     applyTokensToFile(this.file);
     return this.snapshot();
   }
 
   updateToken(id: string, patch: Partial<DesignToken>): DesignFile | null {
     if (!this.file) return null;
-    const idx = this.file.tokens.findIndex(t => t.id === id);
-    if (idx === -1) return null;
-    this.file.tokens[idx] = { ...this.file.tokens[idx], ...patch };
+    if (!this.file.tokens.some(t => t.id === id)) return null;
+    this.file.tokens = this.file.tokens.map(t => (t.id === id ? { ...t, ...patch } : t));
     applyTokensToFile(this.file);
     return this.snapshot();
   }
 
   deleteToken(id: string): DesignFile | null {
     if (!this.file) return null;
+    const gone = this.file.tokens.find(t => t.id === id);
     this.file.tokens = this.file.tokens.filter(t => t.id !== id);
+    // Drop every binding that pointed at the deleted token. Left in place they are
+    // invisible landmines: the layer keeps whatever value it last resolved to, and the
+    // moment a new token is created with the same name the stale binding springs back to
+    // life and silently overwrites the layer.
+    if (gone) {
+      for (const page of this.file.pages) {
+        for (const shape of Object.values(page.objects)) {
+          if (!shape.tokenBindings) continue;
+          const next = Object.fromEntries(
+            Object.entries(shape.tokenBindings).filter(([, name]) => name !== gone.name),
+          );
+          if (Object.keys(next).length !== Object.keys(shape.tokenBindings).length) {
+            shape.tokenBindings = Object.keys(next).length ? next : undefined;
+          }
+        }
+      }
+    }
+    applyTokensToFile(this.file);
     return this.snapshot();
   }
 
@@ -1030,7 +1153,38 @@ export class DocumentEngine {
   private reflow(page: Page): boolean {
     if (!Object.values(page.objects).some(s => s.autoLayout)) return false;
     let changed = false;
-    for (let i = 0; i < 6; i++) { if (!applyAutoLayoutToPage(page)) break; changed = true; }
+    for (let i = 0; i < 6; i++) {
+      const moved = applyAutoLayoutToPage(page);
+      // Auto-height text is width-dependent: narrow the box and the same words need more
+      // lines. The layout engine sets the width but can't measure glyphs, so refit here
+      // and let the loop settle — a re-fitted paragraph makes its hugging ancestors taller,
+      // which is what stops a heading from clipping (or overlapping the block beneath it)
+      // as soon as the artboard gets narrower.
+      const refit = this.refitAutoHeightText(page);
+      if (!moved && !refit) break;
+      changed = true;
+    }
+    return changed;
+  }
+
+  /** Re-fit every auto-height text box to its current width. True if any height changed. */
+  private refitAutoHeightText(page: Page): boolean {
+    let changed = false;
+    for (const id in page.objects) {
+      const s = page.objects[id];
+      if (!s || s.type !== 'text' || !s.textStyle) continue;
+      // Auto-WIDTH text hugs its longest line, so the layout never constrains it; only
+      // fixed-width / auto-height boxes have a height to recompute. `textAutoHeight`
+      // undefined means auto (Figma's default for a text box).
+      if (s.textAutoWidth === true || s.textAutoHeight === false) continue;
+      // Text on a path sizes its own baseline; refitting would collapse the curve.
+      if (isTextOnPath(s)) continue;
+      const h = Math.max(0, Math.round(fitTextSize(s).height));
+      if (h === s.height) continue;
+      s.height = h;
+      s.selrect = { ...s.selrect, height: h };
+      changed = true;
+    }
     return changed;
   }
 

@@ -1,0 +1,292 @@
+<meta charset="utf-8">
+<title>proto harness</title>
+<style>
+  :root{
+    --font-ui: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", system-ui, sans-serif;
+    --bg-panel:#1b1b1f; --bg-inset:#141417; --bg-elevated:#26262b;
+    --border:#2e2e34; --border-strong:#43434b; --text:#eee; --text-secondary:#aaa;
+    --text-muted:#888; --accent:#6E72F5; --row-hover:rgba(255,255,255,0.05);
+  }
+  *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+  body{background:#0f0f12;color:var(--text);font-family:var(--font-ui);-webkit-font-smoothing:antialiased}
+  button,input,select,textarea{font-family:inherit;font-size:12px;line-height:16px}
+  .panel{background:var(--bg-panel);border-left:1px solid var(--border);display:flex;flex-direction:column;flex-shrink:0;overflow:hidden;font-family:var(--font-ui)}
+</style>
+
+<div id="host"></div>
+
+<script>
+// ---- exact style objects lifted from the source files ----
+const S = {
+  // PrototypePanel s.*
+  ppPanel:{display:'flex',flexDirection:'column',gap:'16px',padding:'16px',overflowY:'auto'},
+  ppSection:{display:'flex',flexDirection:'column',gap:'8px'},
+  ppLabel:{fontSize:'11px',fontWeight:600,color:'var(--text-secondary)',letterSpacing:'0.06em',textTransform:'uppercase'},
+  ppSelect:{background:'var(--bg-inset)',border:'1px solid var(--border)',borderRadius:'6px',color:'var(--text)',fontSize:'12px',padding:'0 8px',height:'28px',outline:'none',cursor:'pointer'},
+  ppCheckRow:{display:'flex',alignItems:'center',gap:'8px',cursor:'pointer',color:'var(--text-secondary)',fontSize:'12px'},
+  ppActions:{display:'flex',gap:'8px',marginTop:'4px'},
+  ppPresent:{flex:'1',display:'flex',alignItems:'center',justifyContent:'center',gap:'8px',background:'var(--bg-elevated)',border:'1px solid var(--border)',borderRadius:'6px',color:'var(--text)',fontSize:'12px',padding:'0 12px',height:'32px',cursor:'pointer',fontWeight:500},
+  ppExport:{flex:'1',display:'flex',alignItems:'center',justifyContent:'center',gap:'8px',background:'var(--accent)',border:'none',borderRadius:'6px',color:'#fff',fontSize:'12px',padding:'0 12px',height:'32px',cursor:'pointer',fontWeight:600},
+  ppRowMain:{display:'flex',alignItems:'center',gap:'8px',color:'var(--text)',fontSize:'12px'},
+  ppRow:{display:'flex',flexDirection:'column',gap:'4px',background:'var(--row-hover)',borderRadius:'6px',padding:'8px',cursor:'pointer'},
+  ppSrc:{fontWeight:500,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap',maxWidth:'110px'},
+  ppDst:{color:'var(--text-secondary)',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap',maxWidth:'110px'},
+  ppRowMeta:{display:'flex',alignItems:'center',gap:'8px'},
+  ppBadge:{fontSize:'10px',color:'var(--text-secondary)',background:'var(--bg-inset)',borderRadius:'4px',padding:'2px 6px',textTransform:'capitalize'},
+  ppDel:{marginLeft:'auto',background:'transparent',border:'none',color:'var(--text-secondary)',fontSize:'16px',cursor:'pointer',lineHeight:1},
+  ppEmpty:{fontSize:'12px',color:'var(--text-secondary)',lineHeight:1.5,background:'var(--border)',borderRadius:'6px',padding:'10px'},
+
+  // InteractionsSection s.*
+  isSection:{padding:'8px 10px 6px',borderTop:'1px solid var(--border)'},
+  isHeader:{display:'flex',justifyContent:'space-between',alignItems:'center',fontSize:'11px',fontWeight:600,color:'var(--text-secondary)',letterSpacing:'0.06em',textTransform:'uppercase',marginBottom:'8px'},
+  isAdd:{background:'transparent',border:'none',color:'var(--text-secondary)',fontSize:'16px',cursor:'pointer',lineHeight:1,width:'24px',height:'24px',borderRadius:'4px',flexShrink:0,display:'flex',alignItems:'center',justifyContent:'center'},
+  isStartBtn:{width:'100%',background:'var(--border)',border:'1px solid var(--border-strong)',borderRadius:'6px',color:'var(--text)',fontSize:'12px',padding:'0 8px',height:'28px',cursor:'pointer',marginBottom:'8px'},
+  isInteraction:{background:'var(--row-hover)',borderRadius:'6px',padding:'8px',marginBottom:'8px',display:'flex',flexDirection:'column',gap:'4px'},
+  isRow:{display:'flex',alignItems:'center',gap:'8px'},
+  isTag:{fontSize:'11px',color:'var(--text-secondary)',width:'38px',flexShrink:0},
+  isSelect:{flex:'1',background:'var(--border)',border:'1px solid var(--border-strong)',borderRadius:'4px',color:'var(--text)',fontSize:'11px',padding:'0 4px',height:'24px',outline:'none',cursor:'pointer'},
+  isDel:{background:'transparent',border:'none',color:'var(--text-secondary)',fontSize:'13px',cursor:'pointer',flexShrink:0},
+  isUnit:{fontSize:'10px',color:'var(--text-secondary)',flexShrink:0},
+  isHint:{color:'var(--text-muted)',fontSize:'11px',lineHeight:1.35,flex:'1',minWidth:0},
+  isCheck:{display:'flex',alignItems:'center',gap:'8px',fontSize:'11px',color:'var(--text-secondary)',cursor:'pointer'},
+};
+function el(tag, style, ...kids){
+  const n=document.createElement(tag);
+  if(style) Object.assign(n.style, style);
+  for(const k of kids){ if(k==null) continue; n.append(typeof k==='string'?document.createTextNode(k):k); }
+  return n;
+}
+function svg(size){
+  const n=document.createElementNS('http://www.w3.org/2000/svg','svg');
+  n.setAttribute('width',size);n.setAttribute('height',size);n.setAttribute('viewBox','0 0 16 16');
+  n.style.display='block';n.style.flexShrink='0';n.style.fill='currentColor';
+  return n;
+}
+function sel(style, opts, val){
+  const s=el('select',style);
+  for(const o of opts){ const op=document.createElement('option'); op.textContent=o; s.append(op); }
+  if(val!=null) s.selectedIndex=val;
+  return s;
+}
+const TRIGGERS=['Click','Drag','While hovering','While pressing','Key pressed','Mouse enter','Mouse leave','Mouse down','Mouse up','After delay'];
+const ACTIONS=['Navigate to','Go back','Open overlay','Swap overlay','Close overlay','Scroll to','Open URL','Change to','Set variable mode','None'];
+const TRANSITIONS=['Instant','Dissolve','Smart animate','Slide left','Slide right','Slide up','Slide down','Push left','Push right','Push up','Push down','Move in left','Move in right','Move in up','Move in down','Move out left','Move out right','Move out up','Move out down'];
+const EASINGS=['Ease out','Ease in','Ease in and out','Linear','Gentle overshoot'];
+const OVERLAY_POS=['Center','Top left','Top center','Top right','Bottom left','Bottom center','Bottom right','Manual'];
+const SCROLLB=['No scrolling','Vertical','Horizontal','Both'];
+const SCROLLPOS=['Scrolls with content','Fixed (stays in place)'];
+
+function build(panelWidth){
+  const panel=el('div',{width:panelWidth+'px'});
+  panel.className='panel';
+
+  // ---- top block: PrototypePanel ----
+  const pp=el('div',S.ppPanel);
+  pp.id='pp';
+  const sec1=el('div',S.ppSection);
+  sec1.append(el('div',S.ppLabel,'Presentation'));
+  const lab=el('label',S.ppCheckRow);
+  const cb=el('input');cb.type='checkbox';cb.style.margin='0';cb.style.width='16px';cb.style.height='16px';cb.style.flexShrink='0';
+  lab.append(cb, el('span',null,'Responsive (reflow to window)'));
+  lab.id='checkRow';
+  sec1.append(lab);
+  pp.append(sec1);
+
+  const sec2=el('div',S.ppSection);
+  sec2.append(el('div',S.ppLabel,'Start screen'));
+  const ss=sel(S.ppSelect,['Home / Dashboard — Desktop 1440','Login','Settings'],0); ss.id='startSel';
+  sec2.append(ss);
+  pp.append(sec2);
+
+  const sec3=el('div',S.ppSection);
+  sec3.append(el('div',S.ppLabel,'Connections (2)'));
+  const list=el('div',{display:'flex',flexDirection:'column',gap:'8px'});
+  const row=el('div',S.ppRow); row.id='connRow';
+  const rowMain=el('div',S.ppRowMain); rowMain.id='rowMain';
+  const src=el('span',S.ppSrc,'Primary CTA Button Long Name'); src.id='src';
+  const dst=el('span',S.ppDst,'Checkout Confirmation Screen'); dst.id='dst';
+  rowMain.append(src, svg(12), dst);
+  const rowMeta=el('div',S.ppRowMeta); rowMeta.id='rowMeta';
+  rowMeta.append(el('span',S.ppBadge,'mouse-enter'), el('span',S.ppBadge,'move-out-right'), el('button',S.ppDel,'×'));
+  row.append(rowMain,rowMeta);
+  list.append(row);
+  sec3.append(list);
+  pp.append(sec3);
+
+  const actions=el('div',S.ppActions); actions.id='actions';
+  const bPresent=el('button',S.ppPresent); bPresent.id='bPresent';
+  bPresent.append(svg(13),' Present');
+  const bExport=el('button',S.ppExport); bExport.id='bExport';
+  bExport.append(svg(13),' Export HTML');
+  actions.append(bPresent,bExport);
+  pp.append(actions);
+  panel.append(pp);
+
+  // ---- bottom block: InteractionsSection ----
+  const is=el('div',S.isSection); is.id='is';
+  const hd=el('div',S.isHeader); hd.id='isHeader';
+  hd.append(el('span',null,'Prototype'), el('button',S.isAdd,'＋'));
+  is.append(hd);
+  const sb=el('button',S.isStartBtn,'☆ Set as start screen'); sb.id='startBtn';
+  is.append(sb);
+
+  const scrollRow=el('div',S.isRow); scrollRow.id='scrollRow';
+  scrollRow.append(el('span',S.isTag,'Scroll'), sel(S.isSelect,SCROLLB,1));
+  is.append(scrollRow);
+
+  const posRow=el('div',S.isRow); posRow.id='posRow';
+  posRow.append(el('span',S.isTag,'Position'), sel(S.isSelect,SCROLLPOS,0));
+  is.append(posRow);
+
+  const card=el('div',S.isInteraction); card.id='card';
+  const onRow=el('div',S.isRow); onRow.id='onRow';
+  onRow.append(el('span',S.isTag,'On'), sel(S.isSelect,TRIGGERS,2), el('button',S.isDel,'×'));
+  card.append(onRow);
+
+  const delayRow=el('div',S.isRow); delayRow.id='delayRow';
+  const dIn=el('input',S.isSelect); dIn.type='number'; dIn.value='1000';
+  delayRow.append(el('span',S.isTag,'Delay'), dIn, el('span',S.isUnit,'ms'));
+  card.append(delayRow);
+
+  const doRow=el('div',S.isRow); doRow.id='doRow';
+  doRow.append(el('span',S.isTag,'Do'), sel(S.isSelect,ACTIONS,8));
+  card.append(doRow);
+
+  const goRow=el('div',S.isRow); goRow.id='goRow';
+  goRow.append(el('span',S.isTag,'Go to'), sel(S.isSelect,['Home / Dashboard — Desktop 1440','Login'],0));
+  card.append(goRow);
+
+  const whereRow=el('div',S.isRow); whereRow.id='whereRow';
+  whereRow.append(el('span',S.isTag,'Where'), sel(S.isSelect,OVERLAY_POS,5));
+  card.append(whereRow);
+
+  const xyRow=el('div',S.isRow); xyRow.id='xyRow';
+  const x=el('input',S.isSelect);x.type='number';x.value='0';
+  const y=el('input',S.isSelect);y.type='number';y.value='0';
+  xyRow.append(el('span',S.isTag,'X / Y'), x, y);
+  card.append(xyRow);
+
+  const urlRow=el('div',S.isRow); urlRow.id='urlRow';
+  const u=el('input',S.isSelect);u.type='url';u.value='https://example.com/very/long/path';
+  urlRow.append(el('span',S.isTag,'URL'), u);
+  card.append(urlRow);
+
+  const variantRow=el('div',S.isRow); variantRow.id='variantRow';
+  variantRow.append(el('span',S.isTag,'Variant'), el('span',S.isHint,'This layer isn’t an instance of a component with variants.'));
+  card.append(variantRow);
+
+  const animRow=el('div',S.isRow); animRow.id='animRow';
+  animRow.append(el('span',S.isTag,'Anim'), sel(S.isSelect,TRANSITIONS,16));
+  card.append(animRow);
+
+  const curveRow=el('div',S.isRow); curveRow.id='curveRow';
+  const dur=el('input',Object.assign({},S.isSelect,{maxWidth:'62px'}));dur.type='number';dur.value='300';dur.id='dur';
+  const easeSel=sel(S.isSelect,EASINGS,2); easeSel.id='easeSel';
+  const msSpan=el('span',S.isUnit,'ms'); msSpan.id='ms';
+  curveRow.append(el('span',S.isTag,'Curve'), easeSel, dur, msSpan);
+  card.append(curveRow);
+
+  const chk=el('label',S.isCheck); chk.id='chkRow';
+  const c2=el('input');c2.type='checkbox';c2.style.width='16px';c2.style.height='16px';c2.style.flexShrink='0';
+  chk.append(c2,'Close when clicking outside');
+  card.append(chk);
+
+  is.append(card);
+  panel.append(is);
+  return panel;
+}
+
+window.measure = function(width){
+  const host=document.getElementById('host');
+  host.textContent='';
+  const p=build(width);
+  host.append(p);
+  const out={panelWidth:width, rows:{}};
+  const ids=['actions','bPresent','bExport','checkRow','startSel','connRow','rowMain','rowMeta','is','isHeader','startBtn','scrollRow','posRow','card','onRow','delayRow','doRow','goRow','whereRow','xyRow','urlRow','variantRow','animRow','curveRow','chkRow','easeSel','dur','ms'];
+  for(const id of ids){
+    const n=document.getElementById(id);
+    if(!n) continue;
+    const r=n.getBoundingClientRect();
+    out.rows[id]={w:+r.width.toFixed(2), h:+r.height.toFixed(2), left:+r.left.toFixed(2), right:+r.right.toFixed(2), scrollW:n.scrollWidth, clientW:n.clientWidth};
+  }
+  // does the label inside Export wrap? compare button content height to line-height
+  const bx=document.getElementById('bExport');
+  const rng=document.createRange();
+  // last child is the text node ' Export HTML'
+  rng.selectNodeContents(bx);
+  out.exportTextRects = [...rng.getClientRects()].map(r=>({w:+r.width.toFixed(2),h:+r.height.toFixed(2),top:+r.top.toFixed(2)}));
+  const bp=document.getElementById('bPresent');
+  const rng2=document.createRange(); rng2.selectNodeContents(bp);
+  out.presentTextRects=[...rng2.getClientRects()].map(r=>({w:+r.width.toFixed(2),h:+r.height.toFixed(2),top:+r.top.toFixed(2)}));
+  // overflow: right edge of ms vs right content edge of card
+  const card=document.getElementById('card');
+  const cr=card.getBoundingClientRect();
+  const ms=document.getElementById('ms').getBoundingClientRect();
+  out.msRight=+ms.right.toFixed(2);
+  out.cardContentRight=+(cr.right-8).toFixed(2);
+  out.msOverflowPx=+(ms.right-(cr.right-8)).toFixed(2);
+  out.curveScroll = {scrollW: document.getElementById('curveRow').scrollWidth, clientW: document.getElementById('curveRow').clientWidth};
+  // panel-level overflow
+  out.panelScrollW = p.scrollWidth; out.panelClientW = p.clientWidth;
+  // measure natural (max-content) width of each select
+  const natural={};
+  for(const [k,id] of [['ease','easeSel']]){ }
+  return out;
+};
+
+window.natural = function(){
+  // max-content width of each select's option set at fontSize 11 + padding 0 4 + border 1
+  const probe=el('div',{position:'absolute',visibility:'hidden',width:'max-content'});
+  document.body.append(probe);
+  const res={};
+  const sets={TRIGGERS,ACTIONS,TRANSITIONS,EASINGS,OVERLAY_POS,SCROLLB,SCROLLPOS};
+  for(const [name,arr] of Object.entries(sets)){
+    const s=sel(Object.assign({},S.isSelect,{flex:'0 0 auto',width:'max-content'}),arr,0);
+    probe.append(s);
+    let maxw=0, widest='';
+    for(let i=0;i<arr.length;i++){ s.selectedIndex=i; }
+    // Chrome sizes select to widest option regardless of selection
+    maxw=s.getBoundingClientRect().width;
+    // min-content
+    const s2=sel(Object.assign({},S.isSelect,{flex:'0 0 auto',width:'min-content'}),arr,0);
+    probe.append(s2);
+    res[name]={maxContent:+maxw.toFixed(2), minContent:+s2.getBoundingClientRect().width.toFixed(2)};
+  }
+  // text widths
+  const t=el('span',{fontFamily:'var(--font-ui)',whiteSpace:'nowrap',position:'absolute',visibility:'hidden'});
+  document.body.append(t);
+  function tw(text,size,weight){ t.style.fontSize=size+'px'; t.style.fontWeight=weight; t.textContent=text; return +t.getBoundingClientRect().width.toFixed(2); }
+  res.text={
+    'Export HTML @12/600': tw('Export HTML',12,600),
+    'Export @12/600': tw('Export',12,600),
+    'HTML @12/600': tw('HTML',12,600),
+    'Present @12/500': tw('Present',12,500),
+    'ms @10/400': tw('ms',10,400),
+    'Position @11/400': tw('Position',11,400),
+    'Go to @11/400': tw('Go to',11,400),
+    'Curve @11/400': tw('Curve',11,400),
+    'Variant @11/400': tw('Variant',11,400),
+    'Responsive (reflow to window) @12/400': tw('Responsive (reflow to window)',12,400),
+    'Set as start screen @12/400': tw('☆ Set as start screen',12,400),
+  };
+  probe.remove(); t.remove();
+  return res;
+};
+
+window.sweep = function(lo,hi){
+  const rows=[];
+  for(let w=lo;w<=hi;w++){
+    const m=window.measure(w);
+    rows.push({
+      w,
+      exportLines:m.exportTextRects.length,
+      exportH:m.exportTextRects.length?m.exportTextRects[0].h:0,
+      msOverflow:m.msOverflowPx,
+      curveOverflow:+(m.curveScroll.scrollW-m.curveScroll.clientW).toFixed(2),
+      panelOverflow:m.panelScrollW-m.panelClientW,
+    });
+  }
+  return rows;
+};
+document.getElementById('host').append(build(286));
+</script>

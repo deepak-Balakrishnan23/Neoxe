@@ -115,7 +115,7 @@ export default function FontPicker({ value, onChange }: Props) {
       <button type="button" style={s.trigger} onClick={() => setOpen(o => !o)} title="Font family">
         <span style={{ ...s.triggerLabel, fontFamily: value }}>{currentLabel}</span>
         {!available && (
-          <span style={s.missing} title={`"${currentLabel}" isn't available on this device — a fallback font is being shown`}>!</span>
+          <span style={s.missing} title={`"${currentLabel}" isn't available on this device. Showing a fallback font.`}>!</span>
         )}
         <Icon name="chevron-down" size={12} />
       </button>
@@ -138,7 +138,7 @@ export default function FontPicker({ value, onChange }: Props) {
           {status === 'loading' && <div style={s.note}>Requesting font access…</div>}
           {status === 'denied' && (
             <div style={s.note}>
-              Font access denied — showing web-safe fonts. Allow it from your browser's site settings to see installed fonts.
+              Font access denied. Showing web-safe fonts. Allow it from your browser's site settings to see installed fonts.
             </div>
           )}
           {status === 'unsupported' && (
@@ -177,9 +177,9 @@ function FontOption({ name, stack, active, onClick }: {
 
 const s: Record<string, React.CSSProperties> = {
   trigger: {
-    width: '100%', height: 30, display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-    background: 'var(--bg-inset)', border: '1px solid var(--border)', borderRadius: 7,
-    color: 'var(--text)', fontSize: 12, padding: '0 8px', cursor: 'pointer', gap: 6,
+    width: '100%', height: 28, display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+    background: 'var(--bg-inset)', border: '1px solid var(--border)', borderRadius: 6,
+    color: 'var(--text)', fontSize: 12, padding: '0 8px', cursor: 'pointer', gap: 8,
   },
   triggerLabel: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', textAlign: 'left', flex: 1 },
   missing: {
@@ -191,22 +191,22 @@ const s: Record<string, React.CSSProperties> = {
     position: 'absolute', top: '100%', left: 0, marginTop: 4, width: 240, maxWidth: '80vw',
     background: 'var(--bg-elevated)', border: '1px solid var(--border-strong)', borderRadius: 8,
     boxShadow: '0 8px 24px rgba(0,0,0,0.35)', zIndex: 1000,
-    display: 'flex', flexDirection: 'column', padding: 6, gap: 6,
+    display: 'flex', flexDirection: 'column', padding: 8, gap: 8,
   },
   search: {
     height: 28, background: 'var(--bg-inset)', border: '1px solid var(--border)', borderRadius: 6,
     color: 'var(--text)', fontSize: 12, padding: '0 8px', outline: 'none',
   },
   cta: {
-    display: 'flex', alignItems: 'center', gap: 6, justifyContent: 'center',
+    display: 'flex', alignItems: 'center', gap: 8, justifyContent: 'center',
     background: 'var(--accent-soft)', border: 'none', borderRadius: 6,
-    color: 'var(--accent-hover)', fontSize: 11, fontWeight: 600, padding: '7px 8px', cursor: 'pointer',
+    color: 'var(--accent-hover)', fontSize: 11, fontWeight: 600, padding: '8px 8px', cursor: 'pointer',
   },
-  note: { fontSize: 10.5, lineHeight: 1.4, color: 'var(--text-muted)', padding: '2px 4px' },
+  note: { fontSize: 11, lineHeight: 1.4, color: 'var(--text-muted)', padding: '2px 4px' },
   list: { display: 'flex', flexDirection: 'column', maxHeight: 240, overflowY: 'auto' },
   option: {
-    display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 6,
-    padding: '6px 8px', borderRadius: 5, cursor: 'pointer', color: 'var(--text)',
+    display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8,
+    padding: '6px 8px', borderRadius: 4, cursor: 'pointer', color: 'var(--text)',
   },
   optionLabel: { fontSize: 12, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
 };

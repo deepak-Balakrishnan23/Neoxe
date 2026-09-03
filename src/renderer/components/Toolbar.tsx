@@ -25,7 +25,7 @@ export default function Toolbar() {
     // the most prominent Present entry point (visible on every tab), so it needs the
     // same guard as the Prototype panel's own Present/Export HTML buttons.
     const hasFrame = page.childIds.some(id => page.objects[id]?.type === 'frame');
-    if (!hasFrame) { showToast('Add a frame before presenting — content outside a frame can’t be shown'); return; }
+    if (!hasFrame) { showToast('Add a frame before presenting: content outside a frame can’t be shown'); return; }
     const html = generatePrototypeHtml(file, page);
     const url = URL.createObjectURL(new Blob([html], { type: 'text/html' }));
     window.open(url, '_blank');
@@ -105,27 +105,27 @@ const styles: Record<string, React.CSSProperties> = {
     height: 48, background: T.bgApp, borderBottom: `1px solid ${T.border}`,
     display: 'flex', alignItems: 'center', padding: '0 12px', gap: 8, flexShrink: 0,
   },
-  left: { display: 'flex', alignItems: 'center', gap: 3, flex: '0 0 auto' },
+  left: { display: 'flex', alignItems: 'center', gap: 4, flex: '0 0 auto' },
   center: { display: 'flex', alignItems: 'center', flex: '1 1 0', minWidth: 0, height: '100%' },
-  right: { display: 'flex', alignItems: 'center', gap: 3, flex: '0 0 auto', justifyContent: 'flex-end' },
+  right: { display: 'flex', alignItems: 'center', gap: 4, flex: '0 0 auto', justifyContent: 'flex-end' },
   logo: {
-    display: 'flex', alignItems: 'center', gap: 6, color: T.text, fontWeight: 700, fontSize: 15,
-    fontFamily: T.font, letterSpacing: '-0.3px', marginRight: 6,
+    display: 'flex', alignItems: 'center', gap: 8, color: T.text, fontWeight: 700, fontSize: 16,
+    fontFamily: T.font, letterSpacing: '-0.3px', marginRight: 8,
   },
   iconBtn: {
-    border: 'none', width: 34, height: 34, borderRadius: T.rMd, cursor: 'pointer',
+    border: 'none', width: 32, height: 32, borderRadius: T.rMd, cursor: 'pointer',
     display: 'flex', alignItems: 'center', justifyContent: 'center',
     transition: 'background .12s, color .12s',
   },
-  sep: { width: 1, height: 22, background: T.border, margin: '0 5px' },
+  sep: { width: 1, height: 20, background: T.border, margin: '0 5px' },
   exportBtn: {
-    display: 'flex', alignItems: 'center', gap: 6, background: T.accent, border: 'none', color: '#fff',
-    fontSize: 13, padding: '7px 14px', borderRadius: T.rMd, cursor: 'pointer',
+    display: 'flex', alignItems: 'center', gap: 8, background: T.accent, border: 'none', color: '#fff',
+    fontSize: 13, padding: '8px 16px', borderRadius: T.rMd, cursor: 'pointer',
     fontFamily: T.font, fontWeight: 600,
   },
   presentBtn: {
-    display: 'flex', alignItems: 'center', gap: 6, background: T.bgElevated, border: 'none', color: T.text,
-    fontSize: 13, padding: '7px 13px', borderRadius: T.rMd, cursor: 'pointer',
+    display: 'flex', alignItems: 'center', gap: 8, background: T.bgElevated, border: 'none', color: T.text,
+    fontSize: 13, padding: '8px 12px', borderRadius: T.rMd, cursor: 'pointer',
     fontFamily: T.font, fontWeight: 500,
   },
 };

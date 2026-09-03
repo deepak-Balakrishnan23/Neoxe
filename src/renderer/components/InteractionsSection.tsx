@@ -24,6 +24,8 @@ const ACTIONS: { v: Interaction['action']; label: string }[] = [
   { v: 'close-overlay', label: 'Close overlay' },
   { v: 'scroll-to', label: 'Scroll to' },
   { v: 'url', label: 'Open URL' },
+  { v: 'change-to', label: 'Change to' },
+  { v: 'set-variable-mode', label: 'Set variable mode' },
   { v: 'none', label: 'None' },
 ];
 
@@ -80,6 +82,20 @@ export default function InteractionsSection({ shape }: { shape: Shape }) {
   };
   if (page.objects[shape.frameId]) collect(shape.frameId);
 
+  // "Change to" targets: the OTHER variants in this instance's component set. Swapping to
+  // the variant already showing is a no-op, so the current one is excluded.
+  const currentComponentId = shape.masterId ?? shape.componentId;
+  const ownSetId = currentComponentId ? file.components[currentComponentId]?.setId : undefined;
+  const siblingVariants = ownSetId
+    ? Object.entries(file.components)
+      .filter(([id, c]) => c.setId === ownSetId && id !== currentComponentId)
+      .map(([id, c]) => ({ id, name: c.name }))
+    : [];
+
+  // "Set variable mode" targets: the file's theme sets. Neoxe's ThemeSet is Figma's
+  // variable mode — a named override map over the same tokens.
+  const themes = file.themes ?? [];
+
   const interactions = shape.interactions ?? [];
 
   const setInteractions = async (next: Interaction[]) => {
@@ -135,7 +151,7 @@ export default function InteractionsSection({ shape }: { shape: Shape }) {
 
       {/* Scroll behaviour: which axes a frame scrolls on, and whether a child rides along. */}
       {isFrame && (
-        <div style={s.iRow}>
+        <div style={s.looseRow}>
           <span style={s.tag}>Scroll</span>
           <select style={s.select} value={shape.scrollBehavior ?? 'none'}
             onChange={e => setAttr('scrollBehavior', e.target.value)}>
@@ -147,7 +163,7 @@ export default function InteractionsSection({ shape }: { shape: Shape }) {
         </div>
       )}
       {!isFrame && parentScrolls && (
-        <div style={s.iRow}>
+        <div style={s.looseRow}>
           <span style={s.tag}>Position</span>
           <select style={s.select} value={shape.scrollPosition ?? 'scrolls'}
             onChange={e => setAttr('scrollPosition', e.target.value)}>
@@ -197,9 +213,15 @@ export default function InteractionsSection({ shape }: { shape: Shape }) {
             <select style={s.select} value={it.action}
               onChange={e => {
                 const action = e.target.value as Interaction['action'];
-                update(it.id, (action === 'navigate' || action === 'overlay' || action === 'swap-overlay')
-                  ? { action, targetFrameId: it.targetFrameId ?? frames[0]?.id }
-                  : { action });
+                if (action === 'navigate' || action === 'overlay' || action === 'swap-overlay') {
+                  update(it.id, { action, targetFrameId: it.targetFrameId ?? frames[0]?.id });
+                } else if (action === 'change-to') {
+                  update(it.id, { action, targetComponentId: it.targetComponentId ?? siblingVariants[0]?.id });
+                } else if (action === 'set-variable-mode') {
+                  update(it.id, { action, targetThemeId: it.targetThemeId ?? (themes[0]?.id ?? 'default') });
+                } else {
+                  update(it.id, { action });
+                }
               }}>
               {ACTIONS.map(a => <option key={a.v} value={a.v}>{a.label}</option>)}
             </select>
@@ -257,6 +279,34 @@ export default function InteractionsSection({ shape }: { shape: Shape }) {
             </div>
           )}
 
+          {it.action === 'change-to' && (
+            <div style={s.iRow}>
+              <span style={s.tag}>Variant</span>
+              {siblingVariants.length === 0 ? (
+                // Without a component set there is nothing to swap between, and saying so
+                // beats an empty dropdown that looks broken.
+                <span style={s.hint}>This layer isn’t an instance of a component with variants.</span>
+              ) : (
+                <select style={s.select} value={it.targetComponentId ?? ''}
+                  onChange={e => update(it.id, { targetComponentId: e.target.value })}>
+                  <option value="">Choose a variant…</option>
+                  {siblingVariants.map(v => <option key={v.id} value={v.id}>{v.name}</option>)}
+                </select>
+              )}
+            </div>
+          )}
+
+          {it.action === 'set-variable-mode' && (
+            <div style={s.iRow}>
+              <span style={s.tag}>Mode</span>
+              <select style={s.select} value={it.targetThemeId ?? 'default'}
+                onChange={e => update(it.id, { targetThemeId: e.target.value })}>
+                <option value="default">Default</option>
+                {themes.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}
+              </select>
+            </div>
+          )}
+
           {it.action === 'url' && (
             <div style={s.iRow}>
               <span style={s.tag}>URL</span>
@@ -298,30 +348,55 @@ export default function InteractionsSection({ shape }: { shape: Shape }) {
 }
 
 const s: Record<string, React.CSSProperties> = {
-  section: { padding: '8px 10px 6px', borderTop: '1px solid var(--border)' },
+  hint: { color: 'var(--text-muted)', fontSize: 11, lineHeight: '16px', flex: 1, minWidth: 0 },
+  section: {
+    display: 'flex', flexDirection: 'column', gap: 8,
+    padding: '8px 16px', borderTop: '1px solid var(--border)',
+  },
   header: {
     display: 'flex', justifyContent: 'space-between', alignItems: 'center',
-    fontSize: 10, fontWeight: 600, color: 'var(--text-secondary)',
-    letterSpacing: '0.06em', textTransform: 'uppercase', marginBottom: 8,
+    fontSize: 11, fontWeight: 700, color: 'var(--text-secondary)',
+    letterSpacing: '0.06em', textTransform: 'uppercase',
+    lineHeight: '16px', minHeight: 24,
   },
-  add: { background: 'transparent', border: 'none', color: 'var(--text-secondary)', fontSize: 16, cursor: 'pointer', lineHeight: 1 },
+  add: {
+    background: 'transparent', border: 'none', color: 'var(--text-secondary)', fontSize: 16,
+    cursor: 'pointer', lineHeight: 1, width: 24, height: 24, borderRadius: 6, flexShrink: 0,
+    display: 'flex', alignItems: 'center', justifyContent: 'center',
+  },
   startBtn: {
-    width: '100%', background: 'var(--border)', border: '1px solid var(--border-strong)',
-    borderRadius: 6, color: 'var(--text)', fontSize: 12, padding: '6px', cursor: 'pointer', marginBottom: 8,
+    width: '100%', background: 'var(--bg-elevated)', border: '1px solid var(--border)',
+    borderRadius: 6, color: 'var(--text)', fontSize: 12, padding: '0 8px', height: 28, cursor: 'pointer',
   },
   startActive: { background: 'rgba(245,197,66,0.18)', border: '1px solid rgba(245,197,66,0.5)', color: 'var(--comment)' },
-  empty: { fontSize: 11, color: 'var(--text-secondary)', padding: '2px 0 4px' },
+  empty: {
+    fontSize: 12, color: 'var(--text-secondary)',
+    lineHeight: '16px', minHeight: 24, display: 'flex', alignItems: 'center',
+  },
   interaction: {
-    background: 'var(--row-hover)', borderRadius: 6, padding: 8, marginBottom: 6,
-    display: 'flex', flexDirection: 'column', gap: 5,
+    background: 'var(--row-hover)', borderRadius: 6, padding: 8,
+    display: 'flex', flexDirection: 'column', gap: 8,
   },
-  iRow: { display: 'flex', alignItems: 'center', gap: 6 },
-  tag: { fontSize: 11, color: 'var(--text-secondary)', width: 38, flexShrink: 0 },
+  iRow: { display: 'flex', alignItems: 'center', gap: 8, paddingRight: 32 },
+  /** A field row that is NOT inside an interaction card. The extra 8px inset puts its
+   *  label in the same column as the carded rows' labels, so they read as peers. */
+  looseRow: { display: 'flex', alignItems: 'center', gap: 8, padding: '0 8px', paddingRight: 40 },
+  tag: {
+    fontSize: 12, color: 'var(--text-secondary)', width: 44, flexShrink: 0,
+    overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+  },
   select: {
-    flex: 1, background: 'var(--border)', border: '1px solid var(--border-strong)',
-    borderRadius: 4, color: 'var(--text)', fontSize: 11, padding: '2px 4px', outline: 'none', cursor: 'pointer',
+    flex: 1, minWidth: 0,
+    background: 'var(--bg-inset)', border: '1px solid var(--border)',
+    borderRadius: 6, color: 'var(--text)', fontSize: 12, padding: '0 8px', height: 28,
+    outline: 'none', cursor: 'pointer',
   },
-  del: { background: 'transparent', border: 'none', color: 'var(--text-secondary)', fontSize: 13, cursor: 'pointer', flexShrink: 0 },
-  unit: { fontSize: 10, color: 'var(--text-secondary)', flexShrink: 0 },
-  check: { display: 'flex', alignItems: 'center', gap: 6, fontSize: 11, color: 'var(--text-secondary)', cursor: 'pointer' },
+  del: {
+    width: 24, height: 24, marginRight: -32, borderRadius: 6, flexShrink: 0,
+    display: 'flex', alignItems: 'center', justifyContent: 'center',
+    background: 'transparent', border: 'none', color: 'var(--text-muted)',
+    fontSize: 16, lineHeight: 1, cursor: 'pointer', padding: 0,
+  },
+  unit: { fontSize: 11, color: 'var(--text-secondary)', flexShrink: 0, width: 24, marginRight: -32 },
+  check: { display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, color: 'var(--text-secondary)', cursor: 'pointer', minHeight: 24 },
 };

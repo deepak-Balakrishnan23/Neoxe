@@ -1,5 +1,6 @@
+import { canvasColors } from '../theme';
 import React, { useState, useCallback, useRef, useEffect } from 'react';
-import { Shape, Fill, Stroke, Shadow, BlurEffect, TextStyle, BlendMode, makeDefaultShape, VectorChildNode, ConstraintMode, Constraints, LayoutGrid, LayoutGridType, LayoutGridAlign, makeDefaultLayoutGrid, ComponentPropDef, Page, DesignFile, ExportSetting } from '../../shared/types';
+import { Shape, Fill, Stroke, Shadow, BlurEffect, TextStyle, BlendMode, makeDefaultShape, VectorChildNode, ConstraintMode, Constraints, LayoutGrid, LayoutGridType, LayoutGridAlign, makeDefaultLayoutGrid, ComponentPropDef, Page, DesignFile, ExportSetting, hasCustomBackground, isTextOnPath } from '../../shared/types';
 import { DEFAULT_CONSTRAINTS } from '../../shared/constraints';
 import { resolvePropDefs } from '../../shared/components';
 import { useDesignStore } from '../store/useDesignStore';
@@ -93,7 +94,7 @@ function NumInput({ label, value, unit, min, max, step = 1, decimals = 0, icon, 
           style={{ ...numStyles.label, ...(icon ? { display: 'flex', alignItems: 'center', justifyContent: 'center' } : {}) }}
           onPointerDown={e => startScrub(e, { value, step, min, max, decimals, onChange })}
           onDoubleClick={() => { setDraft(String(value)); setEditing(true); }}
-          title={`${label} — drag to scrub (Shift = coarse, Alt = fine), double-click to type`}
+          title={`${label}: drag to scrub (Shift = coarse, Alt = fine), double-click to type`}
         >{icon ? <Icon name={icon} size={14} /> : label}</span>
       )}
       {editing ? (
@@ -153,8 +154,8 @@ function GapInput({ value, disabled, onChange }: {
   };
 
   const hint = disabled
-    ? 'Spacing between items — auto-distributed in this mode'
-    : 'Spacing between items — drag to scrub (Shift = coarse, Alt = fine), click to type, clear for Auto';
+    ? 'Spacing between items: auto-distributed in this mode'
+    : 'Spacing between items: drag to scrub (Shift = coarse, Alt = fine), click to type, clear for Auto';
 
   return (
     <div style={{ ...numStyles.wrap, opacity: disabled ? 0.45 : 1 }}>
@@ -192,19 +193,19 @@ function GapInput({ value, disabled, onChange }: {
 }
 
 const numStyles: Record<string, React.CSSProperties> = {
-  wrap: { display: 'grid', gridTemplateColumns: '22px minmax(0, 1fr)', alignItems: 'center', gap: 6, minWidth: 0, flex: 1 },
+  wrap: { display: 'grid', gridTemplateColumns: '22px minmax(0, 1fr)', alignItems: 'center', gap: 8, minWidth: 0, flex: 1 },
   wrapBare: { display: 'block', minWidth: 0, flex: 1 },
   label: { color: 'var(--text-muted)', fontSize: 11, cursor: 'ew-resize', userSelect: 'none', flexShrink: 0, width: 22 },
   value: {
     color: 'var(--text)', fontSize: 12, cursor: 'text', fontVariantNumeric: 'tabular-nums',
     overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
-    background: 'var(--bg-inset)', border: '1px solid transparent', borderRadius: 7,
-    padding: '0 9px', minHeight: 30, display: 'flex', alignItems: 'center',
+    background: 'var(--bg-inset)', border: '1px solid transparent', borderRadius: 6,
+    padding: '0 8px', minHeight: 28, display: 'flex', alignItems: 'center',
   },
   input: {
-    background: 'var(--bg-inset)', border: '1px solid var(--accent)', borderRadius: 7,
-    color: 'var(--text)', fontSize: 12, padding: '0 9px', outline: 'none', height: 30,
-    width: '100%', minWidth: 0, fontFamily: 'system-ui', fontVariantNumeric: 'tabular-nums',
+    background: 'var(--bg-inset)', border: '1px solid var(--accent)', borderRadius: 6,
+    color: 'var(--text)', fontSize: 12, padding: '0 8px', outline: 'none', height: 28,
+    width: '100%', minWidth: 0, fontFamily: 'var(--font-ui)', fontVariantNumeric: 'tabular-nums',
   },
 };
 
@@ -268,7 +269,7 @@ function ColorSwatch({ color, opacity = 1, onChange, fill, onFillChange }: Swatc
 
 const swatchStyles: Record<string, React.CSSProperties> = {
   swatch: {
-    width: 20, height: 20, borderRadius: 5, flexShrink: 0,
+    width: 20, height: 20, borderRadius: 4, flexShrink: 0,
     border: '1px solid var(--border-strong)', cursor: 'pointer',
     boxShadow: '0 1px 0 rgba(255,255,255,0.08) inset',
   },
@@ -283,7 +284,7 @@ function Section({ label, children, action }: { label: string; children: React.R
   const hasContent = React.Children.toArray(children).length > 0;
   return (
     <div style={pStyles.section}>
-      <div style={{ ...pStyles.sectionHeader, marginBottom: hasContent ? 10 : 0 }}>
+      <div style={{ ...pStyles.sectionHeader, marginBottom: hasContent ? 8 : 0 }}>
         <span>{label}</span>
         {action}
       </div>
@@ -349,13 +350,13 @@ function VectorChildPanel({ shapeId, childId, emit }: {
   const strokeHex = child.stroke ?? '#000000';
 
   return (
-    <div style={{ padding: '12px 14px' }}>
-      <div style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-secondary)', marginBottom: 8, textTransform: 'uppercase' as const, letterSpacing: '0.05em' }}>
+    <div style={{ padding: '12px 16px' }}>
+      <div style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-secondary)', marginBottom: 8, textTransform: 'uppercase' as const, letterSpacing: '0.06em' }}>
         Vector · {child.name}
       </div>
       <Row>
         <span style={pStyles.fieldLabel}>Fill</span>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
           <ColorSwatch
             color={fillHex}
             opacity={child.opacity}
@@ -368,7 +369,7 @@ function VectorChildPanel({ shapeId, childId, emit }: {
       </Row>
       <Row>
         <span style={pStyles.fieldLabel}>Stroke</span>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
           <ColorSwatch
             color={strokeHex}
             opacity={1}
@@ -411,10 +412,19 @@ export default function PropertiesPanel() {
 
   // Add Figma-style auto layout to an existing frame. The frame KEEPS its current size
   // (fixed/fixed) — unlike Shift+A wrapping, which hugs a brand-new wrapper. This avoids
-  // a sized screen collapsing to its content the moment a child is added. Children lock
-  // to fixed sizing (so they aren't squeezed) and any legacy flex/grid layout is cleared
-  // so the two models can't collide.
+  // a sized screen collapsing to its content the moment a child is added. Children are
+  // pinned to fixed sizing so they aren't squeezed, EXCEPT on an axis they already hug:
+  // hugging describes a child's relationship to its own content rather than to its
+  // parent, so it survives the parent gaining a layout. Pinning it instead freezes the
+  // child at whatever size it happened to be, and it then overflows its own children the
+  // next time they reflow.
   const addAutoLayout = useCallback((s: Shape) => {
+    const pinChild = (cid: string, axis: 'widthMode' | 'heightMode') => {
+      const child = page?.objects[cid];
+      return child?.[axis] === 'hug'
+        ? []
+        : [{ op: 'set' as const, id: cid, attr: axis, val: 'fixed' }];
+    };
     emit([
       { op: 'set', id: s.id, attr: 'autoLayout', val: {
         direction: 'horizontal', // spacing omitted — starts as Auto (Figma default)
@@ -423,12 +433,9 @@ export default function PropertiesPanel() {
       } },
       { op: 'set', id: s.id, attr: 'widthMode', val: 'fixed' },
       { op: 'set', id: s.id, attr: 'heightMode', val: 'fixed' },
-      ...s.childIds.flatMap(cid => ([
-        { op: 'set' as const, id: cid, attr: 'widthMode', val: 'fixed' },
-        { op: 'set' as const, id: cid, attr: 'heightMode', val: 'fixed' },
-      ])),
+      ...s.childIds.flatMap(cid => ([...pinChild(cid, 'widthMode'), ...pinChild(cid, 'heightMode')])),
     ]);
-  }, [emit]);
+  }, [emit, page]);
 
   const ModeToggle = (
     <div style={pStyles.modeToggle}>
@@ -457,8 +464,12 @@ export default function PropertiesPanel() {
     return (
       <div style={pStyles.panel}>
         {ModeToggle}
-        <PrototypePanel />
-        {protoShape && <InteractionsSection shape={protoShape} />}
+        {/* One scroller for the whole tab (as in the Design branch), so the two blocks
+            share a single scrollbar gutter and their right edges stay locked together. */}
+        <div style={pStyles.scroll}>
+          <PrototypePanel />
+          {protoShape && <InteractionsSection shape={protoShape} />}
+        </div>
       </div>
     );
   }
@@ -491,11 +502,11 @@ export default function PropertiesPanel() {
         const pt = svgEditingPaths[ref.pathIndex]?.points[ref.pointIndex];
         if (!pt || pt.command === 'Z') return null;
         return (
-          <div style={{ padding: '12px 14px', borderBottom: '1px solid var(--border)' }}>
-            <div style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-secondary)', marginBottom: 8, textTransform: 'uppercase' as const, letterSpacing: '0.05em' }}>
+          <div style={{ padding: '12px 16px', borderBottom: '1px solid var(--border)' }}>
+            <div style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-secondary)', marginBottom: 8, textTransform: 'uppercase' as const, letterSpacing: '0.06em' }}>
               Point {ref.pointIndex + 1}
             </div>
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6 }}>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
               <NumInput label="X" value={Math.round(pt.x)} onChange={v => {
                 const newPaths = svgEditingPaths.map((p, pi) => pi !== ref.pathIndex ? p : {
                   ...p,
@@ -521,11 +532,11 @@ export default function PropertiesPanel() {
         const pt = editingPoints[selectedPointIndices[0]];
         if (!pt || pt.command === 'Z') return null;
         return (
-          <div style={{ padding: '12px 14px', borderBottom: '1px solid var(--border)' }}>
-            <div style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-secondary)', marginBottom: 8, textTransform: 'uppercase' as const, letterSpacing: '0.05em' }}>
+          <div style={{ padding: '12px 16px', borderBottom: '1px solid var(--border)' }}>
+            <div style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-secondary)', marginBottom: 8, textTransform: 'uppercase' as const, letterSpacing: '0.06em' }}>
               Anchor Point {selectedPointIndices[0] + 1}
             </div>
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6 }}>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
               <NumInput label="X" value={Math.round(pt.x)} onChange={v => {
                 const next = editingPoints.map((p, i) => selectedPointIndices.includes(i) ? { ...p, x: v } : p);
                 setEditingPoints(next);
@@ -557,13 +568,33 @@ export default function PropertiesPanel() {
             {(() => {
               const locked = shape.aspectRatioLocked ?? (shape.type === 'image' || shape.type === 'svg');
               const ratio = shape.lockedAspectRatio ?? (shape.height > 0 ? shape.width / shape.height : 1);
+              // Typing a size on an axis the layout engine owns (Hug, or Fill inside an
+              // auto-layout parent) pins that axis to Fixed at the typed size — the same
+              // thing scrubbing the W/H letter in the Auto layout section does, and what
+              // Figma does. Without it the engine recomputes the axis on the next reflow
+              // and the number the user just typed silently reverts.
+              const pin = (axis: 'width' | 'height'): Parameters<typeof emit>[0] => {
+                const attr = axis === 'width' ? 'widthMode' : 'heightMode';
+                const mode = axis === 'width' ? shape.widthMode : shape.heightMode;
+                return mode === 'hug' || mode === 'fill'
+                  ? [{ op: 'set', id: shape.id, attr, val: 'fixed' }]
+                  : [];
+              };
               const onW = (v: number) => {
-                if (locked) emit([{ op: 'set', id: shape.id, attr: 'width', val: v }, { op: 'set', id: shape.id, attr: 'height', val: Math.max(1, Math.round(v / ratio)) }]);
-                else set(shape.id, 'width', v);
+                emit([
+                  ...pin('width'), { op: 'set', id: shape.id, attr: 'width', val: v },
+                  ...(locked
+                    ? [...pin('height'), { op: 'set' as const, id: shape.id, attr: 'height', val: Math.max(1, Math.round(v / ratio)) }]
+                    : []),
+                ]);
               };
               const onH = (v: number) => {
-                if (locked) emit([{ op: 'set', id: shape.id, attr: 'height', val: v }, { op: 'set', id: shape.id, attr: 'width', val: Math.max(1, Math.round(v * ratio)) }]);
-                else set(shape.id, 'height', v);
+                emit([
+                  ...pin('height'), { op: 'set', id: shape.id, attr: 'height', val: v },
+                  ...(locked
+                    ? [...pin('width'), { op: 'set' as const, id: shape.id, attr: 'width', val: Math.max(1, Math.round(v * ratio)) }]
+                    : []),
+                ]);
               };
               const toggleLock = () => {
                 const nowLocked = !locked;
@@ -575,7 +606,7 @@ export default function PropertiesPanel() {
                 <div style={{ display: 'flex', alignItems: 'center', gap: 4, marginBottom: 8 }}>
                   <div style={{ flex: 1 }}><NumInput label="W" value={shape.width} min={1} onChange={onW} /></div>
                   <button onClick={toggleLock} title={locked ? 'Unlock ratio' : 'Lock ratio'}
-                    style={{ background: 'none', border: 'none', cursor: 'pointer', padding: 2, color: locked ? 'var(--color-accent, #0d99ff)' : 'var(--color-text-tertiary, #888)', flexShrink: 0 }}>
+                    style={{ background: 'none', border: 'none', cursor: 'pointer', padding: 2, color: locked ? 'var(--accent)' : 'var(--text-muted)', flexShrink: 0 }}>
                     <Icon name={locked ? 'lock' : 'unlock'} size={12} />
                   </button>
                   <div style={{ flex: 1 }}><NumInput label="H" value={shape.height} min={1} onChange={onH} /></div>
@@ -612,13 +643,25 @@ export default function PropertiesPanel() {
           </Section>
         )}
         {/* Container with autoLayout set → full controls. */}
-        {!multi && shape.autoLayout && <AutoLayoutSection shape={shape} set={set} setAll={setAll} />}
+        {!multi && shape.autoLayout && (
+          <AutoLayoutSection
+            shape={shape} set={set} setAll={setAll}
+            inAutoLayoutParent={!!(shape.parentId && page?.objects[shape.parentId]?.autoLayout)}
+          />
+        )}
 
         {/* Sizing controls — visible whenever the SELECTED shape is itself inside an
-            auto-layout container (so the user can pick how it sizes within the parent). */}
+            auto-layout container (so the user can pick how it sizes within the parent).
+            A shape that is ALSO a container of its own already has W/H and min/max in its
+            Auto layout section above; showing them again here was the same two attributes
+            twice, in two identical widgets, with Transform making a third. The nested case
+            keeps the Auto layout section as the one place to size the shape, and that
+            section hosts the Absolute-position toggle instead. */}
         {!multi && (() => {
           const parent = shape.parentId ? page?.objects[shape.parentId] : null;
-          return parent?.autoLayout ? <ChildSizingSection shape={shape} set={set} /> : null;
+          return parent?.autoLayout && !shape.autoLayout
+            ? <ChildSizingSection shape={shape} set={set} />
+            : null;
         })()}
 
         {/* ── Boolean group — swap the operation without rebuilding the group. */}
@@ -1012,11 +1055,11 @@ const menuStyles: Record<string, React.CSSProperties> = {
     position: 'fixed', zIndex: 1000,
     background: 'var(--bg-elevated)', border: '1px solid var(--border-strong)',
     borderRadius: 8, padding: 4, boxShadow: '0 8px 28px rgba(0,0,0,0.45)',
-    display: 'flex', flexDirection: 'column', gap: 1,
+    display: 'flex', flexDirection: 'column', gap: 2,
   },
   item: {
     textAlign: 'left', background: 'transparent', border: 'none', cursor: 'pointer',
-    color: 'var(--text)', fontSize: 12, padding: '7px 9px', borderRadius: 5, fontFamily: 'inherit',
+    color: 'var(--text)', fontSize: 12, padding: '8px 8px', borderRadius: 4, fontFamily: 'inherit',
   },
 };
 
@@ -1024,18 +1067,18 @@ const popStyles: Record<string, React.CSSProperties> = {
   panel: {
     position: 'fixed', zIndex: 1000,
     background: 'var(--bg-elevated)', border: '1px solid var(--border-strong)',
-    borderRadius: 10, boxShadow: '0 12px 36px rgba(0,0,0,0.5)', overflow: 'hidden',
+    borderRadius: 8, boxShadow: '0 12px 36px rgba(0,0,0,0.5)', overflow: 'hidden',
   },
   head: {
-    display: 'flex', alignItems: 'center', gap: 6, padding: 8,
+    display: 'flex', alignItems: 'center', gap: 8, padding: 8,
     borderBottom: '1px solid var(--border)',
   },
   typeSelect: {
     flex: 1, minWidth: 0, background: 'var(--bg-inset)', border: '1px solid var(--border)',
-    borderRadius: 6, color: 'var(--text)', fontSize: 12, padding: '6px 8px', outline: 'none',
+    borderRadius: 6, color: 'var(--text)', fontSize: 12, padding: '0 8px', height: 28, outline: 'none',
     cursor: 'pointer', fontFamily: 'inherit',
   },
-  body: { padding: 10, display: 'flex', flexDirection: 'column', gap: 8 },
+  body: { padding: 12, display: 'flex', flexDirection: 'column', gap: 8 },
   fieldRow: { display: 'flex', alignItems: 'center', gap: 8 },
   fieldLabel: { color: 'var(--text-secondary)', fontSize: 11, width: 56, flexShrink: 0 },
 };
@@ -1064,7 +1107,14 @@ function ComponentSection({ shapes, page, set }: {
     return (
       <Section label="Component">
         <button style={pStyles.addRowBtn}
-          onClick={() => void run(api.combineAsVariants(shapes.map(s => s.id), page.id))}>
+          onClick={() => {
+            // The property name is the whole point of a set — "Variant" is almost never
+            // what a design system wants ("Type", "State", "Size"), and it used to be
+            // hardcoded with no way to change it afterwards.
+            const name = (window.prompt('Variant property name', 'Type') || '').trim();
+            if (!name) return;
+            void run(api.combineAsVariants(shapes.map(s => s.id), page.id, name));
+          }}>
           <Icon name="plus" size={13} /> Combine as variants
         </button>
       </Section>
@@ -1123,6 +1173,8 @@ function ComponentSection({ shapes, page, set }: {
   if (shape.componentId) {
     const comp = file.components[shape.componentId];
     const defs = comp?.props ?? [];
+    const mSet = comp?.setId ? file.componentSets?.[comp.setId] : null;
+    const myCoords = mSet?.variants[shape.componentId] ?? {};
     const write = (next: ComponentPropDef[]) => void run(api.setComponentProps(shape.componentId!, next));
     const add = (type: ComponentPropDef['type']) => write([...defs, {
       id: `cp-${Math.random().toString(36).slice(2, 9)}`,
@@ -1132,6 +1184,43 @@ function ComponentSection({ shapes, page, set }: {
     }]);
 
     return (
+      <>
+      {/* Variant properties live on the SET, so they're edited here on any of its masters.
+          Without this there was no way to name a property, add a second one, or rename a
+          value — a Type x State matrix could only be produced by editing the file. */}
+      {mSet && (
+        <Section label="Variant properties">
+          {Object.keys(mSet.properties).map(name => (
+            <Row key={name}>
+              <input
+                style={{ ...pStyles.textInput, flex: 1 }}
+                defaultValue={name} key={`n-${name}`}
+                title="Property name, shared by every variant in this set"
+                onBlur={e => { const v = e.target.value.trim(); if (v && v !== name) void run(api.renameVariantProperty(mSet.id, name, v)); }}
+                onKeyDown={e => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur(); e.stopPropagation(); }}
+              />
+              <input
+                style={{ ...pStyles.textInput, flex: 1 }}
+                defaultValue={myCoords[name] ?? ''} key={`v-${name}-${myCoords[name]}`}
+                title="This variant's value for that property"
+                onBlur={e => { const v = e.target.value.trim(); if (v && v !== myCoords[name]) void run(api.setVariantValue(shape.componentId!, name, v)); }}
+                onKeyDown={e => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur(); e.stopPropagation(); }}
+              />
+              {Object.keys(mSet.properties).length > 1 && (
+                <RemoveBtn onClick={() => void run(api.removeVariantProperty(mSet.id, name))} />
+              )}
+            </Row>
+          ))}
+          <button style={pStyles.addRowBtn} onClick={() => {
+            const name = (window.prompt('New variant property (e.g. State)', 'State') || '').trim();
+            if (!name) return;
+            const val = (window.prompt(`Value of "${name}" for every existing variant`, 'Default') || '').trim();
+            void run(api.addVariantProperty(mSet.id, name, val || 'Default'));
+          }}>
+            <Icon name="plus" size={13} /> Add variant property
+          </button>
+        </Section>
+      )}
       <Section label="Component properties">
         {defs.map((d, i) => (
           <Row key={d.id}>
@@ -1146,6 +1235,7 @@ function ComponentSection({ shapes, page, set }: {
           <button style={pStyles.addRowBtn} onClick={() => add('text')}><Icon name="plus" size={13} /> Text</button>
         </div>
       </Section>
+      </>
     );
   }
 
@@ -1197,8 +1287,8 @@ function masterAncestorComponentId(page: Page, id: string): string | null {
 
 const compStyles: Record<string, React.CSSProperties> = {
   masterName: { fontSize: 12, color: 'var(--text-muted)', marginBottom: 8 },
-  actions: { display: 'flex', gap: 6, marginTop: 6 },
-  propType: { fontSize: 10, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '.06em' },
+  actions: { display: 'flex', gap: 8, marginTop: 8 },
+  propType: { fontSize: 11, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.06em' },
 };
 
 // ── Layout grid section ───────────────────────────────────────────────────────
@@ -1275,7 +1365,7 @@ function LayoutGridSection({ shape, setAll }: { shape: Shape; setAll: (attr: str
 }
 
 const gridStyles: Record<string, React.CSSProperties> = {
-  item: { display: 'flex', flexDirection: 'column', gap: 6, paddingBottom: 8 },
+  item: { display: 'flex', flexDirection: 'column', gap: 8, paddingBottom: 8 },
 };
 
 // ── Export presets ────────────────────────────────────────────────────────────
@@ -1360,7 +1450,7 @@ function StylePicker({ kind, hasLocal, onApply, capture }: {
   };
 
   return (
-    <div style={{ ...pStyles.row, marginTop: 6 }}>
+    <div style={{ ...pStyles.row, marginTop: 8 }}>
       {entries.length > 0 && (
         <select style={{ ...pStyles.select, flex: 1 }} value=""
           onChange={e => {
@@ -1424,9 +1514,18 @@ function ConstraintsSection({ shape, set }: { shape: Shape; set: (id: string, at
     update({ vertical: next });
   };
 
-  const bar = (active: boolean, style: React.CSSProperties, onClick: () => void, title: string) => (
+  // The visible pin is a 2px line, but a 2px-tall button is unhittable. The button is
+  // a 20px transparent target centred on the same spot; the line is drawn inside it.
+  const bar = (active: boolean, style: React.CSSProperties, onClick: () => void, title: string,
+               vertical: boolean) => (
     <button title={title} onClick={onClick} aria-pressed={active}
-      style={{ ...conStyles.bar, ...style, background: active ? 'var(--color-accent, #0d99ff)' : 'var(--border-strong)' }} />
+      style={{ ...conStyles.hit, ...style }}>
+      <span style={{
+        display: 'block', borderRadius: 2,
+        width: vertical ? 2 : 12, height: vertical ? 12 : 2,
+        background: active ? 'var(--accent)' : 'var(--border-strong)',
+      }} />
+    </button>
   );
 
   return (
@@ -1434,10 +1533,10 @@ function ConstraintsSection({ shape, set }: { shape: Shape; set: (id: string, at
       <div style={conStyles.wrap}>
         <div style={conStyles.diagram}>
           <div style={conStyles.inner} />
-          {bar(pinT, { top: 4, left: '50%', width: 2, height: 12, transform: 'translateX(-50%)' }, () => toggleV('min'), V_LABELS.min)}
-          {bar(pinB, { bottom: 4, left: '50%', width: 2, height: 12, transform: 'translateX(-50%)' }, () => toggleV('max'), V_LABELS.max)}
-          {bar(pinL, { left: 4, top: '50%', height: 2, width: 12, transform: 'translateY(-50%)' }, () => toggleH('min'), H_LABELS.min)}
-          {bar(pinR, { right: 4, top: '50%', height: 2, width: 12, transform: 'translateY(-50%)' }, () => toggleH('max'), H_LABELS.max)}
+          {bar(pinT, { top: 0, left: '50%', transform: 'translateX(-50%)' }, () => toggleV('min'), V_LABELS.min, true)}
+          {bar(pinB, { bottom: 0, left: '50%', transform: 'translateX(-50%)' }, () => toggleV('max'), V_LABELS.max, true)}
+          {bar(pinL, { left: 0, top: '50%', transform: 'translateY(-50%)' }, () => toggleH('min'), H_LABELS.min, false)}
+          {bar(pinR, { right: 0, top: '50%', transform: 'translateY(-50%)' }, () => toggleH('max'), H_LABELS.max, false)}
         </div>
         <div style={conStyles.selects}>
           <select style={pStyles.select} value={con.horizontal}
@@ -1455,7 +1554,7 @@ function ConstraintsSection({ shape, set }: { shape: Shape; set: (id: string, at
 }
 
 const conStyles: Record<string, React.CSSProperties> = {
-  wrap: { display: 'flex', gap: 10, alignItems: 'center' },
+  wrap: { display: 'flex', gap: 12, alignItems: 'center' },
   diagram: {
     position: 'relative', width: 62, height: 62, flexShrink: 0,
     border: '1px solid var(--border)', borderRadius: 4, background: 'var(--bg-inset)',
@@ -1464,8 +1563,12 @@ const conStyles: Record<string, React.CSSProperties> = {
     position: 'absolute', left: 20, top: 20, right: 20, bottom: 20,
     border: '1px solid var(--border-strong)', borderRadius: 2,
   },
-  bar: { position: 'absolute', border: 'none', borderRadius: 1, padding: 0, cursor: 'pointer' },
-  selects: { display: 'flex', flexDirection: 'column', gap: 6, flex: 1, minWidth: 0 },
+  hit: {
+    position: 'absolute', width: 20, height: 20, border: 'none', padding: 0,
+    background: 'transparent', cursor: 'pointer', borderRadius: 4,
+    display: 'flex', alignItems: 'center', justifyContent: 'center',
+  },
+  selects: { display: 'flex', flexDirection: 'column', gap: 8, flex: 1, minWidth: 0 },
 };
 
 // ── Auto Layout section (Figma Shift+A panel) ─────────────────────────────────
@@ -1480,53 +1583,65 @@ type SizingMode = 'hug' | 'fill' | 'fixed';
 // Compact Figma-style dimension field: `W [ 486      Hug ⌄]` — the live number is always
 // visible (editable when Fixed, muted when derived), the mode word shows for Hug/Fill,
 // and a slim chevron opens the sizing menu.
-function SizingField({ axis, value, mode, onValue, onMode }: {
+function SizingField({ axis, value, mode, onValue, onMode, modeDisabled }: {
   axis: 'W' | 'H';
   value: number;
   mode: SizingMode;
   onValue: (v: number) => void;
   onMode: (m: SizingMode) => void;
+  /** Absolute-positioned children sit outside the flow — Hug/Fill can't apply, so the
+   *  mode menu is hidden and the size stays directly editable. */
+  modeDisabled?: boolean;
 }) {
   const title = axis === 'W' ? 'Width' : 'Height';
-  const modeWord = mode === 'hug' ? 'Hug' : mode === 'fill' ? 'Fill' : '';
+  const effectiveMode = modeDisabled ? 'fixed' : mode;
+  const modeWord = effectiveMode === 'hug' ? 'Hug' : effectiveMode === 'fill' ? 'Fill' : '';
   return (
     <div style={alStyles.dimField}>
       <span
         style={{ ...alStyles.dimLetter, cursor: 'ew-resize' }}
-        title={`${title} — drag to scrub (Shift = coarse, Alt = fine)`}
+        title={`${title}: drag to scrub (Shift = coarse, Alt = fine)`}
         // Scrubbing a Hug/Fill axis pins it to Fixed at the scrubbed size (onValue
         // sets the mode), matching Figma.
         onPointerDown={e => startScrub(e, { value, min: 1, onChange: onValue })}
       >{axis}</span>
-      {mode === 'fixed' ? (
+      {effectiveMode === 'fixed' ? (
         <div style={{ flex: 1, minWidth: 0 }}>
           <NumInput hideLabel label={title} value={value} min={1} onChange={onValue} />
         </div>
       ) : (
-        <span style={alStyles.dimDerived} title={`${title} ${value} — ${modeWord === 'Hug' ? 'hugging contents' : 'filling the container'}`}>
-          <span style={{ color: 'var(--text)' }}>{modeWord}</span>
+        <span style={alStyles.dimDerived} title={`${title} ${value}: ${modeWord === 'Hug' ? 'hugging contents' : 'filling the container'}`}>
+          {/* The engine owns this axis, so the number is read-only — but it still has to be
+              visible: "Hug" alone leaves you guessing how wide the frame actually ended up. */}
+          <span>{Math.round(value)}</span>
+          <span style={{ color: 'var(--text)', marginLeft: 'auto' }}>{modeWord}</span>
         </span>
       )}
-      <div style={alStyles.chevWrap}>
-        <span style={alStyles.chev}>▾</span>
-        <select
-          style={alStyles.chevSelect}
-          value={mode} title={`${title} sizing`}
-          onChange={e => onMode(e.target.value as SizingMode)}
-        >
-          <option value="fixed">Fixed</option>
-          <option value="hug">Hug contents</option>
-          <option value="fill">Fill container</option>
-        </select>
-      </div>
+      {!modeDisabled && (
+        <div style={alStyles.chevWrap}>
+          <span style={alStyles.chev}>▾</span>
+          <select
+            style={alStyles.chevSelect}
+            value={mode} title={`${title} sizing`}
+            onChange={e => onMode(e.target.value as SizingMode)}
+          >
+            <option value="fixed">Fixed</option>
+            <option value="hug">Hug contents</option>
+            <option value="fill">Fill container</option>
+          </select>
+        </div>
+      )}
     </div>
   );
 }
 
-function AutoLayoutSection({ shape, set, setAll }: {
+function AutoLayoutSection({ shape, set, setAll, inAutoLayoutParent }: {
   shape: Shape;
   set: (id: string, attr: string, val: unknown) => void;
   setAll: (attr: string, val: unknown) => void;
+  /** This container is itself a child of an auto-layout parent, so it also needs the
+   *  child-side Absolute-position escape hatch. */
+  inAutoLayoutParent?: boolean;
 }) {
   const al = shape.autoLayout!;
   const updateAL = (patch: Partial<typeof al>) => set(shape.id, 'autoLayout', { ...al, ...patch });
@@ -1573,7 +1688,7 @@ function AutoLayoutSection({ shape, set, setAll }: {
           ))}
         </div>
         <button title={al.reversed ? 'Reversed (click to unreverse)' : 'Reverse order'}
-          style={{ ...segBtnStyle(!!al.reversed), width: 30, height: 30, flex: 'none' }}
+          style={{ ...segBtnStyle(!!al.reversed), width: 28, height: 28, flex: 'none' }}
           onClick={() => updateAL({ reversed: !al.reversed })}>
           <Icon name="reverse" size={14} />
         </button>
@@ -1708,24 +1823,36 @@ function AutoLayoutSection({ shape, set, setAll }: {
         />
         <label htmlFor={`stroke-lay-${shape.id}`} style={alStyles.checkLabel}>Include stroke in layout</label>
       </div>
+      {inAutoLayoutParent && (
+        <div style={alStyles.checkRow}>
+          <input
+            type="checkbox"
+            id={`abs-${shape.id}`}
+            checked={shape.layoutPositioning === 'absolute'}
+            onChange={e => set(shape.id, 'layoutPositioning', e.target.checked ? 'absolute' : 'auto')}
+            style={{ margin: 0, cursor: 'pointer' }}
+          />
+          <label htmlFor={`abs-${shape.id}`} style={alStyles.checkLabel}>Absolute position (ignore auto layout)</label>
+        </div>
+      )}
     </Section>
   );
 }
 
 const alStyles: Record<string, React.CSSProperties> = {
   // One compact W/H field: letter + pill (number / mode word) + slim chevron menu.
-  dimField: { display: 'flex', alignItems: 'center', gap: 6, flex: 1, minWidth: 0 },
+  dimField: { display: 'flex', alignItems: 'center', gap: 8, flex: 1, minWidth: 0 },
   dimLetter: { color: 'var(--text-muted)', fontSize: 11, flexShrink: 0, width: 10, textAlign: 'center' },
   dimDerived: {
     flex: 1, minWidth: 0, display: 'flex', alignItems: 'center', gap: 4,
-    height: 30, background: 'var(--bg-inset)', border: '1px solid transparent', borderRadius: 7,
-    color: 'var(--text-secondary)', fontSize: 12, padding: '0 9px',
+    height: 28, background: 'var(--bg-inset)', border: '1px solid transparent', borderRadius: 6,
+    color: 'var(--text-secondary)', fontSize: 12, padding: '0 8px',
     overflow: 'hidden', whiteSpace: 'nowrap', fontVariantNumeric: 'tabular-nums',
   },
   chevWrap: { position: 'relative', width: 20, height: 28, flexShrink: 0 },
   chev: {
     position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center',
-    color: 'var(--text-secondary)', fontSize: 9, pointerEvents: 'none',
+    color: 'var(--text-secondary)', fontSize: 11, pointerEvents: 'none',
   },
   chevSelect: { position: 'absolute', inset: 0, opacity: 0, cursor: 'pointer', width: '100%', height: '100%' },
   // Bare inline toggle (min/max, padding expand) — glyph only, consistent with iconAction.
@@ -1783,23 +1910,19 @@ function ChildSizingSection({ shape, set }: { shape: Shape; set: (id: string, at
   const [mmOpen, setMmOpen] = useState(hasMM);
   return (
     <Section label="Sizing">
+      {/* Same control the container's own W/H uses — one concept, one widget, and the
+          resolved number stays visible on a Hug/Fill axis instead of only in Transform. */}
       <Row>
-        <span style={pStyles.fieldLabel}>W</span>
-        <select style={{ ...pStyles.select, flex: 1 }} disabled={abs}
-          value={shape.widthMode ?? 'fixed'}
-          onChange={e => set(shape.id, 'widthMode', e.target.value as SizingMode)}>
-          <option value="hug">Hug contents</option>
-          <option value="fill">Fill container</option>
-          <option value="fixed">Fixed width</option>
-        </select>
-        <span style={pStyles.fieldLabel}>H</span>
-        <select style={{ ...pStyles.select, flex: 1 }} disabled={abs}
-          value={shape.heightMode ?? 'fixed'}
-          onChange={e => set(shape.id, 'heightMode', e.target.value as SizingMode)}>
-          <option value="hug">Hug contents</option>
-          <option value="fill">Fill container</option>
-          <option value="fixed">Fixed height</option>
-        </select>
+        <SizingField
+          axis="W" value={shape.width} mode={shape.widthMode ?? 'fixed'} modeDisabled={abs}
+          onValue={v => { set(shape.id, 'width', v); set(shape.id, 'widthMode', 'fixed'); }}
+          onMode={m => set(shape.id, 'widthMode', m)}
+        />
+        <SizingField
+          axis="H" value={shape.height} mode={shape.heightMode ?? 'fixed'} modeDisabled={abs}
+          onValue={v => { set(shape.id, 'height', v); set(shape.id, 'heightMode', 'fixed'); }}
+          onMode={m => set(shape.id, 'heightMode', m)}
+        />
         {!abs && (
           <button style={alStyles.mmToggle} title="Min/max size" onClick={() => setMmOpen(o => !o)}>
             {mmOpen ? '−' : '+'}
@@ -1840,11 +1963,13 @@ function MinMaxRows({ shape, set }: { shape: Shape; set: (id: string, attr: stri
 }
 
 const mmStyles: Record<string, React.CSSProperties> = {
-  cell: { display: 'flex', alignItems: 'center', gap: 6, flex: 1, minWidth: 0 },
-  label: { color: 'var(--text-muted)', fontSize: 11, flexShrink: 0, width: 34 },
+  cell: { display: 'flex', alignItems: 'center', gap: 8, flex: 1, minWidth: 0 },
+  // 34px clipped "Max W" onto a second line, which knocked that row out of alignment
+  // with the Min H / Max H row below it.
+  label: { color: 'var(--text-muted)', fontSize: 11, flexShrink: 0, width: 42, whiteSpace: 'nowrap' },
   input: {
     flex: 1, minWidth: 0, background: 'var(--bg-inset)', border: '1px solid var(--border)',
-    borderRadius: 7, color: 'var(--text)', fontSize: 12, padding: '0 8px', outline: 'none', height: 30,
+    borderRadius: 6, color: 'var(--text)', fontSize: 12, padding: '0 8px', outline: 'none', height: 28,
   },
 };
 
@@ -1915,7 +2040,7 @@ function AppearanceSection({ shape, set, setAll }: {
           <NumInput icon="smooth" label="Smoothing" value={smooth} min={0} max={100}
             onChange={v => set(shape.id, 'cornerSmoothing', v || undefined)} />
           <button title="Unlink corners"
-            style={{ ...segBtnStyle(false), width: 30, height: 30, flex: 'none' }}
+            style={{ ...segBtnStyle(false), width: 28, height: 28, flex: 'none' }}
             onClick={() => setCornersLinked(false)}>
             <Icon name="unlink" size={13} />
           </button>
@@ -1930,7 +2055,7 @@ function AppearanceSection({ shape, set, setAll }: {
             <NumInput icon="corner-bl" label="Bottom left"  value={cr.bl} min={0} onChange={v => setCorner({ bl: v })} />
             <NumInput icon="corner-br" label="Bottom right" value={cr.br} min={0} onChange={v => setCorner({ br: v })} />
             <button title="Link corners"
-              style={{ ...segBtnStyle(false), width: 30, height: 30, flex: 'none' }}
+              style={{ ...segBtnStyle(false), width: 28, height: 28, flex: 'none' }}
               onClick={() => { setAllCorners(cr.tl); setCornersLinked(true); }}>
               <Icon name="link" size={13} />
             </button>
@@ -2002,19 +2127,22 @@ function AlignmentGrid({ direction, primary, cross, distributed, onChange }: {
 
 const alignGridStyles: Record<string, React.CSSProperties> = {
   grid: {
-    display: 'flex', flexDirection: 'column', gap: 3, padding: 6,
+    display: 'flex', flexDirection: 'column', gap: 4, padding: 8,
     background: 'var(--bg-inset)', borderRadius: 8,
-    width: 96, flexShrink: 0,
+    // A fixed square: 96 - 16 padding - 8 gaps = 72, so the 3x3 cells land on 24px
+    // exactly. Without an explicit height the rows' `flex: 1` collapsed them to 6px,
+    // leaving nine 6px-tall click targets.
+    width: 96, height: 96, flexShrink: 0,
   },
-  gridRow: { display: 'flex', gap: 3, flex: 1, height: 26 },
+  gridRow: { display: 'flex', gap: 4, flex: 1 },
   cell: {
     flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center',
-    background: 'transparent', border: 'none', borderRadius: 5, cursor: 'pointer',
+    background: 'transparent', border: 'none', borderRadius: 4, cursor: 'pointer',
     padding: 0,
   },
   dot: { display: 'block', width: 6, height: 6, borderRadius: '50%' },
   distributedBar: { background: 'transparent', flex: 1 },
-  bar: { display: 'block', height: 2, borderRadius: 1, width: '60%', background: 'inherit' },
+  bar: { display: 'block', height: 2, borderRadius: 2, width: '60%', background: 'inherit' },
 };
 
 // ── TypographySection ─────────────────────────────────────────────────────────
@@ -2038,7 +2166,8 @@ function TypographySection({ shape, set, emit }: {
     shape.textAutoWidth ? 'auto-width' : autoHeight ? 'auto-height' : 'fixed';
   const updateTs = (patch: Partial<TextStyle>) => {
     const nextStyle = { ...ts, ...patch };
-    const fitted = fitTextSize({ ...shape, textStyle: nextStyle });
+    // A text-on-path keeps its curve when type settings change; only box text refits.
+    const fitted = isTextOnPath(shape) ? { width: shape.width, height: shape.height } : fitTextSize({ ...shape, textStyle: nextStyle });
     const ops: Parameters<typeof api.applyChanges>[0]['ops'] = [
       { op: 'set', id: shape.id, attr: 'textStyle', val: nextStyle },
     ];
@@ -2215,7 +2344,8 @@ function PageSettingsPanel() {
   const page = activePage();
   if (!page) return <div style={pStyles.empty}>No file open</div>;
 
-  const bg = page.background || '#F0F0F4';
+  // Show what is actually painted: an unset background follows the theme.
+  const bg = hasCustomBackground(page) ? page.background : canvasColors.backdrop;
 
   const handleBgChange = async (color: string, opacity: number) => {
     const res = await api.setPageBackground(page.id, color);
@@ -2241,7 +2371,7 @@ function PageSettingsPanel() {
 }
 
 const psStyles: Record<string, React.CSSProperties> = {
-  root: { display: 'flex', flexDirection: 'column', padding: '12px 14px', gap: 10 },
+  root: { display: 'flex', flexDirection: 'column', padding: '12px 16px', gap: 12 },
   header: {
     fontSize: 11, fontWeight: 700, color: 'var(--text-secondary)',
     textTransform: 'uppercase', letterSpacing: '0.06em',
@@ -2250,9 +2380,9 @@ const psStyles: Record<string, React.CSSProperties> = {
   label: { color: 'var(--text-secondary)', fontSize: 12 },
   control: { display: 'flex', alignItems: 'center', gap: 8 },
   hexText: {
-    color: 'var(--text)', fontSize: 11, fontFamily: 'ui-monospace, "SF Mono", Menlo, monospace',
+    color: 'var(--text)', fontSize: 11, fontFamily: 'var(--font-mono)',
     background: 'var(--bg-inset)', border: '1px solid var(--border)', borderRadius: 6,
-    padding: '4px 7px',
+    padding: '4px 8px',
   },
 };
 
@@ -2338,18 +2468,18 @@ function PresetRow({ preset, onSelect }: {
 const fpStyles: Record<string, React.CSSProperties> = {
   root: { display: 'flex', flexDirection: 'column', flex: 1, overflow: 'hidden' },
   sectionTitle: {
-    padding: '11px 14px 9px',
+    padding: '12px 16px 8px',
     fontSize: 11, fontWeight: 700,
     color: 'var(--text-secondary)',
     borderBottom: '1px solid var(--border)',
     flexShrink: 0,
     textTransform: 'uppercase',
-    letterSpacing: '0.04em',
+    letterSpacing: '0.06em',
   },
   list: { flex: 1, overflowY: 'auto', paddingBottom: 12 },
   catHeader: {
-    display: 'flex', alignItems: 'center', gap: 6,
-    width: '100%', padding: '7px 14px',
+    display: 'flex', alignItems: 'center', gap: 8,
+    width: '100%', padding: '8px 16px',
     background: 'transparent', border: 'none',
     color: 'var(--text)', fontSize: 12, fontWeight: 600,
     cursor: 'pointer', fontFamily: 'inherit', textAlign: 'left',
@@ -2360,7 +2490,7 @@ const fpStyles: Record<string, React.CSSProperties> = {
   },
   presetRow: {
     display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-    width: '100%', padding: '0 14px 0 30px', height: 32,
+    width: '100%', padding: '0 16px 0 30px', height: 32,
     border: 'none', cursor: 'pointer', fontFamily: 'inherit',
     textAlign: 'left', transition: 'background .08s',
   },
@@ -2382,14 +2512,14 @@ const pStyles: Record<string, React.CSSProperties> = {
     flexDirection: 'column',
     flexShrink: 0,
     overflow: 'hidden',
-    fontFamily: 'system-ui',
+    fontFamily: 'var(--font-ui)',
   },
   header: {
-    padding: '12px 14px',
+    padding: '12px 16px',
     display: 'flex',
     alignItems: 'center',
     justifyContent: 'space-between',
-    gap: 10,
+    gap: 12,
     borderBottom: '1px solid var(--border)',
     flexShrink: 0,
   },
@@ -2400,7 +2530,7 @@ const pStyles: Record<string, React.CSSProperties> = {
   headerType: {
     color: 'var(--text-muted)', fontSize: 11, textTransform: 'capitalize',
     background: 'var(--bg-inset)', border: '1px solid var(--border)',
-    borderRadius: 999, padding: '3px 8px', flexShrink: 0,
+    borderRadius: 999, padding: '4px 8px', flexShrink: 0,
   },
   modeToggle: {
     display: 'flex',
@@ -2415,10 +2545,10 @@ const pStyles: Record<string, React.CSSProperties> = {
     border: '1px solid transparent',
     color: 'var(--text-secondary)',
     fontSize: 12,
-    padding: '6px 8px',
+    padding: '0 8px', height: 28,
     cursor: 'pointer',
-    fontFamily: 'system-ui',
-    borderRadius: 7,
+    fontFamily: 'var(--font-ui)',
+    borderRadius: 6,
     fontWeight: 600,
   },
   modeActive: {
@@ -2430,49 +2560,49 @@ const pStyles: Record<string, React.CSSProperties> = {
   },
   scroll: { flex: 1, overflowY: 'auto', paddingBottom: 18 },
   // Tight vertical rhythm (Figma density): slim padding; empty sections are one short row.
-  section: { padding: '9px 14px', borderTop: '1px solid var(--border)' },
+  section: { padding: '8px 16px', borderTop: '1px solid var(--border)' },
   sectionHeader: {
     fontSize: 11, fontWeight: 700, color: 'var(--text-secondary)',
-    letterSpacing: '0.02em', minHeight: 24,
+    letterSpacing: '0.06em', minHeight: 24,
     display: 'flex', justifyContent: 'space-between', alignItems: 'center',
   },
   fieldGrid: {
     display: 'grid',
     gridTemplateColumns: '1fr 1fr',
     gap: 8,
-    marginBottom: 10,
+    marginBottom: 8,
   },
-  row: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8, marginBottom: 10 },
+  row: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8, marginBottom: 8 },
   fillRow: {
     display: 'flex',
     alignItems: 'center',
     gap: 8,
     marginBottom: 8,
-    minHeight: 30,
+    minHeight: 28,
   },
   fieldLabel: { color: 'var(--text-secondary)', fontSize: 12, flexShrink: 0, width: 44 },
   fillType: {
     flex: 1, color: 'var(--text)', fontSize: 11, overflow: 'hidden',
-    textOverflow: 'ellipsis', fontFamily: 'ui-monospace, "SF Mono", Menlo, monospace',
+    textOverflow: 'ellipsis', fontFamily: 'var(--font-mono)',
     background: 'var(--bg-inset)', border: '1px solid var(--border)', borderRadius: 6,
-    padding: '5px 7px', minWidth: 0,
+    padding: '4px 8px', minWidth: 0,
   },
-  empty: { padding: 14, color: 'var(--text-secondary)', fontSize: 12 },
-  segGroup: { display: 'flex', gap: 3, flex: 1, background: 'var(--bg-inset)', borderRadius: 8, padding: 3 },
-  effectRow: { display: 'flex', alignItems: 'center', gap: 8, padding: '3px 0' },
+  empty: { padding: 16, color: 'var(--text-secondary)', fontSize: 12 },
+  segGroup: { display: 'flex', gap: 4, flex: 1, background: 'var(--bg-inset)', borderRadius: 8, padding: 4 },
+  effectRow: { display: 'flex', alignItems: 'center', gap: 8, padding: '4px 0' },
   effectGlyph: {
-    width: 20, height: 20, borderRadius: 5, flexShrink: 0,
+    width: 20, height: 20, borderRadius: 4, flexShrink: 0,
     display: 'flex', alignItems: 'center', justifyContent: 'center',
     background: 'var(--bg-inset)', border: '1px solid var(--border-strong)', color: 'var(--text-secondary)',
   },
   effectChip: {
     flex: 1, minWidth: 0, display: 'flex', alignItems: 'center', gap: 4,
     background: 'var(--bg-inset)', border: '1px solid var(--border)', borderRadius: 6,
-    color: 'var(--text)', fontSize: 12, padding: '6px 8px', cursor: 'pointer',
-    fontFamily: 'inherit', minHeight: 30,
+    color: 'var(--text)', fontSize: 12, padding: '0 8px', height: 28, cursor: 'pointer',
+    fontFamily: 'inherit',
   },
   iconGhost: {
-    width: 26, height: 26, borderRadius: 6, flexShrink: 0,
+    width: 24, height: 24, borderRadius: 6, flexShrink: 0,
     background: 'transparent', border: '1px solid transparent',
     color: 'var(--text-secondary)', cursor: 'pointer',
     display: 'flex', alignItems: 'center', justifyContent: 'center',
@@ -2486,12 +2616,12 @@ const pStyles: Record<string, React.CSSProperties> = {
     display: 'flex', alignItems: 'center', justifyContent: 'center',
   },
   addRowBtn: {
-    width: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6,
+    width: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8,
     background: 'var(--bg-elevated)', border: '1px solid var(--border)', borderRadius: 6,
-    color: 'var(--text-secondary)', cursor: 'pointer', fontSize: 12, padding: '7px 8px',
+    color: 'var(--text-secondary)', cursor: 'pointer', fontSize: 12, padding: '0 8px', height: 28,
   },
   iconActionMuted: {
-    width: 26, height: 26, borderRadius: 6,
+    width: 24, height: 24, borderRadius: 6,
     background: 'transparent', border: '1px solid transparent',
     color: 'var(--text-muted)', cursor: 'pointer',
     display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0,
@@ -2499,19 +2629,19 @@ const pStyles: Record<string, React.CSSProperties> = {
   select: {
     minWidth: 0,
     background: 'var(--bg-inset)', border: '1px solid var(--border)',
-    borderRadius: 7, color: 'var(--text)', fontSize: 12, padding: '0 8px',
-    outline: 'none', cursor: 'pointer', height: 30,
+    borderRadius: 6, color: 'var(--text)', fontSize: 12, padding: '0 8px',
+    outline: 'none', cursor: 'pointer', height: 28,
   },
   // Free-text field (component property names/values) — same chrome as `select`.
   textInput: {
     minWidth: 0, flex: 1,
     background: 'var(--bg-inset)', border: '1px solid var(--border)',
-    borderRadius: 7, color: 'var(--text)', fontSize: 12, padding: '0 8px',
-    outline: 'none', height: 30, fontFamily: 'inherit',
+    borderRadius: 6, color: 'var(--text)', fontSize: 12, padding: '0 8px',
+    outline: 'none', height: 28, fontFamily: 'inherit',
   },
   alignIconBtn: {
     background: 'var(--bg-inset)', border: '1px solid var(--border)', borderRadius: 6,
     color: 'var(--text-secondary)', cursor: 'pointer',
-    width: 30, height: 30, display: 'flex', alignItems: 'center', justifyContent: 'center',
+    width: 28, height: 28, display: 'flex', alignItems: 'center', justifyContent: 'center',
   },
 };

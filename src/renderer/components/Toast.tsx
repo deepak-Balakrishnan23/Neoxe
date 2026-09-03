@@ -29,13 +29,13 @@ const styles: Record<string, React.CSSProperties> = {
     position: 'fixed', bottom: 76, left: '50%', transform: 'translateX(-50%)',
     zIndex: 700, display: 'flex', alignItems: 'center', gap: 8,
     background: 'var(--bg-elevated-2)', color: 'var(--text)',
-    border: '1px solid var(--border-strong)', borderRadius: 10,
-    padding: '9px 14px', fontSize: 13, fontFamily: 'system-ui', fontWeight: 500,
+    border: '1px solid var(--border-strong)', borderRadius: 8,
+    padding: '8px 16px', fontSize: 13, fontFamily: 'var(--font-ui)', fontWeight: 500,
     boxShadow: '0 8px 28px rgba(0,0,0,0.45)',
     transition: 'opacity .18s ease, transform .18s ease', pointerEvents: 'none',
   },
   check: {
     display: 'flex', alignItems: 'center', justifyContent: 'center',
-    width: 18, height: 18, borderRadius: '50%', background: 'var(--accent)', color: '#fff', flexShrink: 0,
+    width: 16, height: 16, borderRadius: '50%', background: 'var(--accent)', color: '#fff', flexShrink: 0,
   },
 };

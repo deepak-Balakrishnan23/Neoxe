@@ -69,12 +69,20 @@ export function createAutoLayoutFromSelection(
   });
 
   const ops: ChangeOp[] = [{ op: 'add', shape: frameShape }];
-  // Move each shape into the new container, in z-order, then mark them fixed-sized so
-  // they don't get squeezed by the container on resize.
+  // Move each shape into the new container, in z-order, then pin its size so the new
+  // container doesn't squeeze it.
+  //
+  // 'hug' is the exception: it describes the child's relationship to its OWN content, not
+  // to whatever parent it happens to sit in, so it stays meaningful after the move and
+  // has to survive it. Overwriting it with 'fixed' freezes a container at the size it
+  // happened to be — and it then overflows its own children the moment they reflow (a
+  // hugging wrap row wrapped into a second line and spilled over the layer below it).
+  // 'fill' does depend on the old parent, so it collapses to 'fixed' like an unset axis.
   ordered.forEach((id, index) => {
+    const child = page.objects[id];
     ops.push({ op: 'move', id, parentId: containerId, index });
-    ops.push({ op: 'set', id, attr: 'widthMode', val: 'fixed' });
-    ops.push({ op: 'set', id, attr: 'heightMode', val: 'fixed' });
+    if (child?.widthMode !== 'hug') ops.push({ op: 'set', id, attr: 'widthMode', val: 'fixed' });
+    if (child?.heightMode !== 'hug') ops.push({ op: 'set', id, attr: 'heightMode', val: 'fixed' });
   });
 
   return { ops, containerId };
@@ -107,12 +115,33 @@ function analyzeSelection(shapes: Shape[]): {
   const maxY = Math.max(...shapes.map(s => s.y + s.height));
   const bounds = { x: minX, y: minY, width: maxX - minX, height: maxY - minY };
 
-  // Direction: horizontal if the spread of centers along X exceeds the spread along Y.
+  // Direction: a row is a set of shapes that DON'T overlap horizontally but do overlap
+  // vertically, and a column is the reverse — so the layout axis is whichever axis the
+  // shapes are separated along. Comparing the spread of centres instead gets this wrong
+  // as soon as the shapes differ in size: a 185-wide nav sitting above an 875-wide card
+  // row spreads further on X than on Y, and reads as a row despite the two never sharing
+  // a single scanline.
+  const overlapAlong = (axis: 'x' | 'y'): number => {
+    const size = axis === 'x' ? 'width' : 'height';
+    const sorted = [...shapes].sort((a, b) => a[axis] - b[axis]);
+    let total = 0;
+    for (let i = 1; i < sorted.length; i++) {
+      const prev = sorted[i - 1], cur = sorted[i];
+      total += Math.max(0, (prev[axis] + prev[size]) - cur[axis]);
+    }
+    return total;
+  };
+  const overlapX = overlapAlong('x');
+  const overlapY = overlapAlong('y');
+  // Tie (a single shape, or a diagonal spread where neither axis separates them) falls
+  // back to whichever axis the centres spread along more.
   const cx = shapes.map(s => s.x + s.width / 2);
   const cy = shapes.map(s => s.y + s.height / 2);
   const xSpread = (Math.max(...cx) - Math.min(...cx));
   const ySpread = (Math.max(...cy) - Math.min(...cy));
-  const direction: 'horizontal' | 'vertical' = xSpread >= ySpread ? 'horizontal' : 'vertical';
+  const direction: 'horizontal' | 'vertical' = overlapX === overlapY
+    ? (xSpread >= ySpread ? 'horizontal' : 'vertical')
+    : (overlapX < overlapY ? 'horizontal' : 'vertical');
 
   // Spacing: average of the GAPS between adjacent shapes along the primary axis.
   let spacing = 0;

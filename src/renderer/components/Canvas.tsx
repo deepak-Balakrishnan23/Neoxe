@@ -1,5 +1,5 @@
 import React, { useRef, useEffect, useCallback, useState } from 'react';
-import { renderPage, Viewport, ShapePreview, invalidateSvgCache, externalDragPreview, SVG_DECODED_EVENT } from '../canvas/renderer';
+import { renderPage, Viewport, ShapePreview, invalidateSvgCache, externalDragPreview, SVG_DECODED_EVENT, LIVE_TEXT_EVENT } from '../canvas/renderer';
 import { fitTextSize } from '../canvas/textLayout';
 import { FONT_LOADED_EVENT } from '../canvas/fontLoader';
 import { hitTestPoint, screenToDoc, getHandleAt, hitTestMarquee } from '../canvas/hitTest';
@@ -10,12 +10,16 @@ import Ruler from './Ruler';
 import PrototypeOverlay from './PrototypeOverlay';
 import FrameLabels from './FrameLabels';
 import { api } from '../ipc/api';
-import { makeDefaultShape, Shape, PathSegment, Page, AnchorPoint } from '../../shared/types';
+import { makeDefaultShape, Shape, PathSegment, Page, AnchorPoint, isTextOnPath } from '../../shared/types';
 import { createAutoLayoutFromSelection } from '../../shared/createAutoLayout';
 import { applyAutoLayoutToPage } from '../../shared/autoLayout';
 import { constraintOps } from '../../shared/constraints';
 import { gridSnapPositions } from '../../shared/layoutGrid';
 import { shapeToSegments, toLocal, segmentsBounds, regularPolygon } from '../../shared/flatten';
+import { simplifyPoints, pointsToSmoothPath } from '../../shared/pathMetrics';
+
+/** An arrow is a line with a head: every two-point rule applies to both. */
+const isLineTool = (t: string) => t === 'line' || t === 'arrow';
 
 // During a resize drag, run the previewed container's constraints so its children move and
 // stretch LIVE rather than snapping into place on mouse-up. Mirrors what the engine emits on
@@ -84,6 +88,7 @@ import { syncViewport } from '../canvas/viewportBridge';
 
 const MIN_ZOOM = 0.002; // 0.2% — lets you zoom out far enough to fit sprawling layouts
 const MAX_ZOOM = 256;   // 25600%
+const AL_REORDER_SLOP_PX = 4;       // screen pixels of travel before a press becomes a reorder drag
 const SNAP_ENGAGE_PX = 8;           // screen pixels — snap engage threshold
 const SNAP_RELEASE_PX = 12;         // screen pixels — snap release threshold
 const SNAP_COLOR = '#E040FB';       // magenta snap lines
@@ -147,7 +152,8 @@ type DragMode =
       // frame's direct children.
       frameId?: string | null;
     }
-  | { mode: 'create'; tool: 'rect' | 'ellipse' | 'frame' | 'line' | 'polygon' | 'star'; startDocX: number; startDocY: number; currentDocX: number; currentDocY: number }
+  | { mode: 'create'; tool: 'rect' | 'ellipse' | 'frame' | 'line' | 'arrow' | 'polygon' | 'star' | 'text-path'; startDocX: number; startDocY: number; currentDocX: number; currentDocY: number }
+  | { mode: 'pencil'; pts: { x: number; y: number }[] }
   | { mode: 'text-create'; startDocX: number; startDocY: number; currentDocX: number; currentDocY: number }
   | {
       // Reordering a single child within its auto-layout parent. The engine snaps
@@ -161,6 +167,11 @@ type DragMode =
       currentDocX: number; currentDocY: number;
       originalIndex: number;
       insertionIndex: number;
+      // A press is not a drag. Until the pointer travels past AL_REORDER_SLOP_PX the
+      // gesture is still a plain click-to-select, so no insertion line is drawn and no
+      // reorder is committed — otherwise selecting a card flashes a reorder line, and a
+      // click that jitters across a sibling's midpoint silently reshuffles the layer.
+      moved: boolean;
     };
 
 function genId() {
@@ -878,7 +889,7 @@ export default function Canvas() {
     showToast, rightMode,
   } = useDesignStore();
 
-  const { showRulers, showGuides, snapToGuides, set: setPrefs } = usePrefs();
+  const { showRulers, showGuides, snapToGuides, theme, set: setPrefs } = usePrefs();
 
   const [viewport, setViewport] = useState<Viewport>({ x: 40, y: 60, zoom: 1 });
   const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number } | null>(null);
@@ -1047,12 +1058,15 @@ export default function Canvas() {
     // selectedIds/penSegments/etc.) and repaint with outdated state.
     const handler = () => { redrawOnceRef.current = true; };
     window.addEventListener(FONT_LOADED_EVENT, handler);
+    // Typing into a text-on-path repaints the curve live (the overlay is invisible).
+    window.addEventListener(LIVE_TEXT_EVENT, handler);
     // Same idle-loop repaint request when a lazily-rasterized SVG/vector image decodes —
     // without it an imported SVG draws blank until an unrelated repaint (it "vanishes"
     // until the next click).
     window.addEventListener(SVG_DECODED_EVENT, handler);
     return () => {
       window.removeEventListener(FONT_LOADED_EVENT, handler);
+      window.removeEventListener(LIVE_TEXT_EVENT, handler);
       window.removeEventListener(SVG_DECODED_EVENT, handler);
     };
   }, []);
@@ -1271,13 +1285,28 @@ export default function Canvas() {
       }
     }
 
+    if (drag.mode === 'pencil' && drag.pts.length > 1) {
+      ctx.save();
+      ctx.translate(vp.x, vp.y);
+      ctx.scale(vp.zoom, vp.zoom);
+      ctx.strokeStyle = '#1A1A1A';
+      ctx.lineWidth = 2;
+      ctx.lineJoin = 'round';
+      ctx.lineCap = 'round';
+      ctx.beginPath();
+      ctx.moveTo(drag.pts[0].x, drag.pts[0].y);
+      for (let i = 1; i < drag.pts.length; i++) ctx.lineTo(drag.pts[i].x, drag.pts[i].y);
+      ctx.stroke();
+      ctx.restore();
+    }
+
     if (drag.mode === 'create') {
       const { startDocX, startDocY, currentDocX, currentDocY } = drag;
       const x = Math.min(startDocX, currentDocX);
       const y = Math.min(startDocY, currentDocY);
       const w = Math.abs(currentDocX - startDocX);
       const h = Math.abs(currentDocY - startDocY);
-      if (drag.tool === 'line' ? (w > 2 || h > 2) : (w > 2 && h > 2)) {
+      if (isLineTool(drag.tool) ? (w > 2 || h > 2) : (w > 2 && h > 2)) {
         ctx.save();
         ctx.translate(vp.x, vp.y);
         ctx.scale(vp.zoom, vp.zoom);
@@ -1285,15 +1314,28 @@ export default function Canvas() {
         ctx.lineWidth = 1.5 / vp.zoom;
         ctx.setLineDash([5 / vp.zoom, 3 / vp.zoom]);
         ctx.fillStyle = 'rgba(110,114,245,0.08)';
-        if (drag.tool === 'ellipse') {
+        if (drag.tool === 'ellipse' || drag.tool === 'text-path') {
           ctx.beginPath();
           ctx.ellipse(x + w / 2, y + h / 2, w / 2, h / 2, 0, 0, Math.PI * 2);
           ctx.fill(); ctx.stroke();
-        } else if (drag.tool === 'line') {
+        } else if (isLineTool(drag.tool)) {
           ctx.beginPath();
           ctx.moveTo(drag.startDocX, drag.startDocY);
           ctx.lineTo(drag.currentDocX, drag.currentDocY);
           ctx.stroke();
+          if (drag.tool === 'arrow') {
+            // Preview the head so the drag reads as an arrow, not a plain line.
+            const ang = Math.atan2(drag.currentDocY - drag.startDocY, drag.currentDocX - drag.startDocX);
+            const size = 10 / vp.zoom;
+            ctx.setLineDash([]);
+            ctx.beginPath();
+            ctx.moveTo(drag.currentDocX, drag.currentDocY);
+            ctx.lineTo(drag.currentDocX - size * Math.cos(ang - 0.4), drag.currentDocY - size * Math.sin(ang - 0.4));
+            ctx.lineTo(drag.currentDocX - size * Math.cos(ang + 0.4), drag.currentDocY - size * Math.sin(ang + 0.4));
+            ctx.closePath();
+            ctx.fillStyle = '#6E72F5';
+            ctx.fill();
+          }
         } else if (drag.tool === 'polygon' || drag.tool === 'star') {
           const pts = regularPolygon(w, h, drag.tool === 'star' ? 5 : 3, drag.tool === 'star' ? 0.382 : undefined);
           ctx.beginPath();
@@ -1312,7 +1354,7 @@ export default function Canvas() {
     }
 
     // ── Auto-layout reorder indicator ─────────────────────────────────────
-    if (drag.mode === 'al-reorder' && page) {
+    if (drag.mode === 'al-reorder' && drag.moved && page) {
       const container = page.objects[drag.containerId];
       if (container?.autoLayout) {
         const { indicator } = alReorderSlot(container, drag.childId, page, drag.currentDocX, drag.currentDocY);
@@ -1405,7 +1447,10 @@ export default function Canvas() {
 
   // State-driven repaint when IDLE. During any drag/pan the rAF loop below already repaints
   // every frame (busy), so skip here to avoid a redundant second draw per frame.
-  useEffect(() => { if (dragRef.current.mode === 'none') draw(); }, [draw, file, selectedIds, viewport, penSegments, penCurrentDoc]);
+  // `theme` is a dependency because the backdrop and handle colors the renderer reads
+  // (canvasColors) are mutated by setThemeMode, not by React. Without it the canvas keeps
+  // its last painted frame after a theme switch and the backdrop stays the old color.
+  useEffect(() => { if (dragRef.current.mode === 'none') draw(); }, [draw, file, selectedIds, viewport, penSegments, penCurrentDoc, theme]);
   useEffect(() => {
     // The continuous loop exists for LIVE interaction previews (drags, marquee, snap
     // lines, external label-drag). When idle, skip the redraw — state-driven renders
@@ -1528,7 +1573,7 @@ export default function Canvas() {
     const ids = topLevelSelection(page, [...selectedIds]);
     const shapes = ids.map(id => page.objects[id]).filter(Boolean) as Shape[];
     const segments = shapes.flatMap(s => shapeToSegments(s, page.objects));
-    if (segments.length === 0) { showToast('Nothing to flatten — text and images have no path form'); return; }
+    if (segments.length === 0) { showToast('Nothing to flatten: text and images have no path form'); return; }
     const bounds = segmentsBounds(segments);
     if (!bounds) return;
     const first = shapes[0];
@@ -1562,7 +1607,14 @@ export default function Canvas() {
 
       // Tool shortcuts
       const toolKeys: Record<string, ToolType> = { v: 'select', f: 'frame', r: 'rect', o: 'ellipse', t: 'text', p: 'pen', i: 'image', l: 'line' };
-      // Shift is excluded: ⇧V / ⇧H are Figma's flip commands, not the Move tool.
+      // Shifted tool shortcuts, matching Figma: ⇧L arrow, ⇧P pencil.
+      const shiftToolKeys: Record<string, ToolType> = { l: 'arrow', p: 'pencil' };
+      if (!e.metaKey && !e.ctrlKey && !e.altKey && e.shiftKey && shiftToolKeys[e.key.toLowerCase()]) {
+        setActiveTool(shiftToolKeys[e.key.toLowerCase()]);
+        if (penSegments) { setPenSegments(null); setPenContinueShapeId(null); }
+        return;
+      }
+      // Shift is excluded below: ⇧V / ⇧H are Figma's flip commands, not the Move tool.
       if (!e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey && toolKeys[e.key.toLowerCase()]) {
         setActiveTool(toolKeys[e.key.toLowerCase()]);
         if (penSegments) { setPenSegments(null); setPenContinueShapeId(null); }
@@ -2234,6 +2286,17 @@ export default function Canvas() {
     setActiveTool('select');
   }, [penSegments, penContinueShapeId, penContinueIsFirst, activePage, setFile, setSelectedIds, setPenSegments, setPenCurrentDoc, setPenContinueShapeId, setActiveTool]);
 
+  // Leaving the pen commits the path in progress (Figma does the same). Previously
+  // only the keyboard tool shortcuts cleared pen state - and they DISCARDED it - so
+  // switching tools from the toolbar left an uncommitted draft painted on the canvas
+  // that belonged to no layer and therefore never moved with its frame.
+  useEffect(() => {
+    if (activeTool === 'pen' || !penSegments) return;
+    if (penSegments.length >= 2) { void finishPenPath(false); }
+    else { setPenSegments(null); setPenCurrentDoc(null); setPenContinueShapeId(null); }
+  }, [activeTool, penSegments, finishPenPath, setPenSegments, setPenCurrentDoc, setPenContinueShapeId]);
+
+
   // ── Wheel ─────────────────────────────────────────────────────────────────
   const onWheel = useCallback((e: WheelEvent) => {
     e.preventDefault();
@@ -2461,9 +2524,18 @@ export default function Canvas() {
       return;
     }
 
+    // ── Pencil: freehand. Collects the raw pointer trail; it is simplified and
+    //    smoothed on mouseup so the document stores a handful of curves, not hundreds
+    //    of straight hops.
+    if (activeTool === 'pencil') {
+      dragRef.current = { mode: 'pencil', pts: [{ x: doc.x, y: doc.y }] };
+      return;
+    }
+
     // ── Shape creation tools ────────────────────────────────────────────────
     if (activeTool === 'rect' || activeTool === 'ellipse' || activeTool === 'frame'
-        || activeTool === 'line' || activeTool === 'polygon' || activeTool === 'star') {
+        || activeTool === 'line' || activeTool === 'arrow' || activeTool === 'polygon' || activeTool === 'star'
+        || activeTool === 'text-path') {
       let startDocX = doc.x, startDocY = doc.y;
       if (page) {
         const frame = frameAtPoint(page, doc.x, doc.y);
@@ -2548,7 +2620,8 @@ export default function Canvas() {
       if (sel.size === 1 && parent?.autoLayout && parent.childIds.length > 1) {
         const originalIndex = parent.childIds.indexOf(target);
         dragRef.current = { mode: 'al-reorder', childId: target, containerId: parent.id,
-          startDocX: doc.x, startDocY: doc.y, currentDocX: doc.x, currentDocY: doc.y, originalIndex, insertionIndex: originalIndex };
+          startDocX: doc.x, startDocY: doc.y, currentDocX: doc.x, currentDocY: doc.y,
+          originalIndex, insertionIndex: originalIndex, moved: false };
         setIsDragging(true);
         setCursor('move');
         return;
@@ -2930,12 +3003,24 @@ export default function Canvas() {
       case 'text-create':
         dragRef.current = { ...drag, currentDocX: doc.x, currentDocY: doc.y };
         break;
+      case 'pencil': {
+        const last = drag.pts[drag.pts.length - 1];
+        // Drop sub-pixel jitter: at high zoom a still hand still emits events.
+        if (!last || Math.hypot(doc.x - last.x, doc.y - last.y) > 0.5 / vp.zoom) {
+          drag.pts.push({ x: doc.x, y: doc.y });
+        }
+        break;
+      }
       case 'al-reorder': {
         if (!page) break;
         const container = page.objects[drag.containerId];
         if (!container?.autoLayout) break;
+        const slop = AL_REORDER_SLOP_PX / vp.zoom;
+        const moved = drag.moved
+          || Math.abs(doc.x - drag.startDocX) > slop
+          || Math.abs(doc.y - drag.startDocY) > slop;
         const { index } = alReorderSlot(container, drag.childId, page, doc.x, doc.y);
-        dragRef.current = { ...drag, currentDocX: doc.x, currentDocY: doc.y, insertionIndex: index };
+        dragRef.current = { ...drag, currentDocX: doc.x, currentDocY: doc.y, insertionIndex: index, moved };
         break;
       }
       case 'none': {
@@ -3075,7 +3160,10 @@ export default function Canvas() {
         // Text: resizing the WIDTH switches it to fixed-width and the text wraps
         // (Figma behaviour). Height then auto-grows to fit the wrapped lines instead of
         // overflowing the box. Vertical-only handles (TC=1, BC=5) don't change width.
-        if (drag.original.type === 'text') {
+        // Text on a path is excluded: both of its axes are geometry (they define the
+        // baseline curve), so a resize must take the dragged size verbatim rather than
+        // snapping the height back to whatever the string happens to measure.
+        if (drag.original.type === 'text' && !isTextOnPath(drag.original)) {
           const widthChanged = ![1, 5].includes(drag.handleIndex);
           if (widthChanged) {
             const newWidth = Math.round(nb.width);
@@ -3163,6 +3251,42 @@ export default function Canvas() {
         }
         break;
       }
+      case 'pencil': {
+        // A tap is not a stroke.
+        const simplified = simplifyPoints(drag.pts, 1.5 / vpRef.current.zoom);
+        if (simplified.length < 2) break;
+        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+        for (const pt of simplified) {
+          if (pt.x < minX) minX = pt.x;
+          if (pt.x > maxX) maxX = pt.x;
+          if (pt.y < minY) minY = pt.y;
+          if (pt.y > maxY) maxY = pt.y;
+        }
+        const px = Math.round(minX), py = Math.round(minY);
+        // A perfectly straight or flat stroke is legitimate, so only reject a true dot.
+        if (maxX - minX < 2 && maxY - minY < 2) break;
+        const local = simplified.map(pt => ({ x: pt.x - px, y: pt.y - py }));
+        const newId = genId();
+        const placement = placementForPoint(page, px, py, 'path');
+        const shape = makeDefaultShape({
+          id: newId,
+          type: 'path',
+          name: 'Drawing',
+          frameId: placement.frameId,
+          parentId: placement.parentId,
+          x: px, y: py,
+          width: Math.max(1, Math.round(maxX - minX)),
+          height: Math.max(1, Math.round(maxY - minY)),
+          content: pointsToSmoothPath(local),
+          fills: [],
+          strokes: [{ color: '#1A1A1A', opacity: 1, width: 2, align: 'center', cap: 'round', style: 'solid' }],
+          selrect: { x: px, y: py, width: Math.max(1, Math.round(maxX - minX)), height: Math.max(1, Math.round(maxY - minY)) },
+        });
+        const resP = await api.applyChanges({ pageId: page.id, ops: [{ op: 'add', shape }] });
+        if (resP.ok && resP.data) { setFile(resP.data); setSelectedIds([newId]); }
+        // The pencil stays armed, like Figma - drawing is usually repeated.
+        break;
+      }
       case 'text-create': {
         const dx = Math.abs(drag.currentDocX - drag.startDocX);
         if (dx >= 4) {
@@ -3177,7 +3301,7 @@ export default function Canvas() {
         break;
       }
       case 'al-reorder': {
-        if (drag.insertionIndex === drag.originalIndex) break;
+        if (!drag.moved || drag.insertionIndex === drag.originalIndex) break;
         const res = await api.applyChanges({
           pageId: page.id,
           ops: [{ op: 'move', id: drag.childId, parentId: drag.containerId, index: drag.insertionIndex }],
@@ -3196,20 +3320,74 @@ export default function Canvas() {
         const y = Math.round(Math.min(drag.startDocY, endY));
         const w = Math.round(Math.abs(endX - drag.startDocX));
         const h = Math.round(Math.abs(endY - drag.startDocY));
+        // Text on path, clicked rather than dragged: run the text along whatever shape is
+        // under the cursor. Dragging makes its own ellipse (above); this is the secondary
+        // gesture for putting text on a curve that already exists.
+        if (drag.tool === 'text-path' && w < 4 && h < 4) {
+          const hitId = hitTestPoint(page, drag.startDocX, drag.startDocY);
+          const host = hitId ? page.objects[hitId] : null;
+          const abs = host && host.type !== 'frame' ? shapeToSegments(host, page.objects) : [];
+          const hb = abs.length ? segmentsBounds(abs) : null;
+          if (host && hb && hb.width + hb.height > 0) {
+            const aId = genId();
+            const aShape = makeDefaultShape({
+              id: aId, type: 'text', name: 'Text on path',
+              frameId: host.frameId, parentId: host.parentId,
+              x: hb.x, y: hb.y, width: Math.max(1, hb.width), height: Math.max(1, hb.height),
+              fills: [],
+              textStyle: DEFAULT_TEXT_STYLE,
+              textPath: toLocal(abs, hb.x, hb.y),
+              paragraphs: [{ align: 'center', spans: [{ text: '' }] }],
+              selrect: { x: hb.x, y: hb.y, width: Math.max(1, hb.width), height: Math.max(1, hb.height) },
+            });
+            const aRes = await api.applyChanges({ pageId: page.id, ops: [{ op: 'add', shape: aShape }] });
+            if (aRes.ok && aRes.data) { setFile(aRes.data); setSelectedIds([aId]); setEditingTextId(aId); }
+          }
+          setActiveTool('select');
+          break;
+        }
+
         // A line can legitimately be zero-height (or zero-width), so it only needs one axis.
-        if (drag.tool === 'line' ? (w < 4 && h < 4) : (w < 4 || h < 4)) break;
+        if (isLineTool(drag.tool) ? (w < 4 && h < 4) : (w < 4 || h < 4)) break;
+
+        // Text on path is self-contained: the drag defines its own elliptical baseline,
+        // and because the curve is derived from w/h the result stays resizable.
+        if (drag.tool === 'text-path') {
+          const tId = genId();
+          const tp = placementForPoint(page, x, y, 'text');
+          const tShape = makeDefaultShape({
+            id: tId, type: 'text', name: 'Text on path',
+            frameId: tp.frameId, parentId: tp.parentId,
+            x, y, width: w, height: h,
+            fills: [],
+            textStyle: DEFAULT_TEXT_STYLE,
+            textPathShape: 'ellipse',
+            // Empty, like a new text box - the renderer shows the dashed baseline until
+            // something is typed, so the curve you just dragged is visible.
+            paragraphs: [{ align: 'center', spans: [{ text: '' }] }],
+            selrect: { x, y, width: w, height: h },
+          });
+          const tRes = await api.applyChanges({ pageId: page.id, ops: [{ op: 'add', shape: tShape }] });
+          if (tRes.ok && tRes.data) {
+            setFile(tRes.data);
+            setSelectedIds([tId]);
+            setEditingTextId(tId);
+          }
+          setActiveTool('select');
+          break;
+        }
 
         const type: Shape['type'] =
           drag.tool === 'frame' ? 'frame'
           : drag.tool === 'ellipse' ? 'circle'
-          : (drag.tool === 'line' || drag.tool === 'polygon' || drag.tool === 'star') ? 'path'
+          : (isLineTool(drag.tool) || drag.tool === 'polygon' || drag.tool === 'star') ? 'path'
           : 'rect';
         const newId = genId();
         const placement = placementForPoint(page, x, y, type);
         // The three path tools generate their geometry from the dragged box. A line is
         // stroke-only (a fill on a two-point path would render nothing).
         const content =
-          drag.tool === 'line' ? [
+          isLineTool(drag.tool) ? [
             // Follow the actual drag direction, so a diagonal drag draws a diagonal line.
             { verb: 'M' as const, coords: [Math.round(drag.startDocX) - x, Math.round(drag.startDocY) - y] },
             { verb: 'L' as const, coords: [Math.round(endX) - x, Math.round(endY) - y] },
@@ -3223,6 +3401,7 @@ export default function Canvas() {
           name: drag.tool === 'frame' ? 'Frame'
             : drag.tool === 'ellipse' ? 'Ellipse'
             : drag.tool === 'line' ? 'Line'
+            : drag.tool === 'arrow' ? 'Arrow'
             : drag.tool === 'polygon' ? 'Polygon'
             : drag.tool === 'star' ? 'Star'
             : 'Rectangle',
@@ -3232,12 +3411,13 @@ export default function Canvas() {
           content,
           fills: drag.tool === 'frame'
             ? [{ type: 'solid', color: '#FFFFFF', opacity: 1 }]
-            : drag.tool === 'line'
+            : isLineTool(drag.tool)
             ? []
             : [{ type: 'solid', color: '#5C7CFA', opacity: 1 }],
-          strokes: drag.tool === 'line'
-            ? [{ color: '#1A1A1A', opacity: 1, width: 1, align: 'center', cap: 'none', style: 'solid' }]
+          strokes: isLineTool(drag.tool)
+            ? [{ color: '#1A1A1A', opacity: 1, width: drag.tool === 'arrow' ? 2 : 1, align: 'center', cap: 'none', style: 'solid' }]
             : [],
+          strokeCapEnd: drag.tool === 'arrow' ? 'arrow' : undefined,
           clipContent: drag.tool === 'frame',
           selrect: { x, y, width: w, height: h },
         });

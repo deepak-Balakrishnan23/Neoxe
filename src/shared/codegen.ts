@@ -39,6 +39,17 @@ function shadowToCss(s: Shadow): string {
   return `${inset}${s.offsetX}px ${s.offsetY}px ${s.blur}px ${s.spread}px ${cssColor(s.color, s.opacity)}`;
 }
 
+/**
+ * Extra attributes / inline style to stamp onto an emitted element. The prototype uses it
+ * to tag variant groups (so a "Change to" action can toggle a whole subtree) and to swap a
+ * baked colour for a CSS custom property (so "Set variable mode" can retheme live).
+ * `style` is appended AFTER the generated declarations, so it wins.
+ */
+export interface ElementDecoration {
+  attrs?: string;
+  style?: string;
+}
+
 // ── CSS generation ────────────────────────────────────────────────────────────
 
 export function shapeToCssProps(shape: Shape, page?: Page): Record<string, string> {
@@ -52,6 +63,60 @@ export function shapeToCssProps(shape: Shape, page?: Page): Record<string, strin
   props['top'] = `${round(shape.y - (parent?.y ?? 0))}px`;
   props['width'] = `${round(shape.width)}px`;
   props['height'] = `${round(shape.height)}px`;
+
+  // A child of an auto-layout container is placed by flexbox/grid, not by coordinates —
+  // and its size on each axis is a RULE (fill / hug / fixed), not a number. Emitting
+  // left/top plus a hard width for it yields CSS that matches the design at exactly one
+  // viewport and nowhere else, which defeats the point of having built it responsively.
+  if (parent?.autoLayout && shape.layoutPositioning !== 'absolute') {
+    const dir = parent.autoLayout.direction;
+    delete props['position'];
+    delete props['left'];
+    delete props['top'];
+
+    const fill = (prop: 'width' | 'height', isMain: boolean) => {
+      const declared = prop === 'width' ? shape.width : shape.height;
+      delete props[prop];
+      if (dir === 'grid') { props[prop] = '100%'; return; }
+      if (!isMain) { props['align-self'] = 'stretch'; return; }
+      if (dir === 'wrap') {
+        // Inside a wrap container the basis decides where rows BREAK, and the engine breaks
+        // on the child's declared width. A zero basis always fits, so `flex:1 1 0` here
+        // gives a row that never wraps — the hero would stay side-by-side on a phone.
+        //
+        // Shrink stays ENABLED: flexbox breaks lines from the flex BASE size, before any
+        // shrinking, so the declared basis still decides the break — and then a lone item
+        // on a narrow row can come back down to the row's width instead of overflowing it,
+        // which is what the engine does when a Fill child fills the row it landed on.
+        props['flex'] = `1 1 ${round(declared)}px`;
+        props[prop === 'width' ? 'min-width' : 'min-height'] = '0';
+        return;
+      }
+      // Grow and shrink from a zero basis, with CSS's automatic minimum size defeated —
+      // the flexbox spelling of Figma's Fill on a non-wrapping axis.
+      props['flex'] = '1 1 0';
+      props[prop === 'width' ? 'min-width' : 'min-height'] = '0';
+    };
+    // wrap and horizontal both flow along the inline axis; vertical flows down the block axis.
+    const widthIsMain = dir !== 'vertical';
+    const apply = (mode: Shape['widthMode'], prop: 'width' | 'height', isMain: boolean) => {
+      if (mode === 'fill') fill(prop, isMain);
+      else if (mode === 'hug') props[prop] = 'fit-content';
+    };
+    apply(shape.widthMode, 'width', widthIsMain);
+    apply(shape.heightMode, 'height', !widthIsMain);
+
+    // Figma's Fixed children never shrink; a CSS flex item shrinks by default. Pin it so
+    // a row that runs out of room overflows the way the editor showed it.
+    const mainMode = widthIsMain ? shape.widthMode : shape.heightMode;
+    if (dir !== 'grid' && mainMode !== 'fill') props['flex-shrink'] = '0';
+
+    // Written last so a real bound wins over the min-*:0 that Fill needs.
+    if (shape.minWidth != null) props['min-width'] = `${round(shape.minWidth)}px`;
+    if (shape.maxWidth != null) props['max-width'] = `${round(shape.maxWidth)}px`;
+    if (shape.minHeight != null) props['min-height'] = `${round(shape.minHeight)}px`;
+    if (shape.maxHeight != null) props['max-height'] = `${round(shape.maxHeight)}px`;
+  }
 
   if (shape.rotation) props['transform'] = `rotate(${shape.rotation}deg)`;
   if (shape.opacity < 1) props['opacity'] = String(round(shape.opacity, 2));
@@ -398,21 +463,26 @@ function textToHtml(shape: Shape): string {
   }).join('');
 }
 
-function shapeToHtmlEl(s: Shape, page: Page, images: Record<string, string> | undefined, ox: number, oy: number): string {
+function shapeToHtmlEl(
+  s: Shape, page: Page, images: Record<string, string> | undefined,
+  ox: number, oy: number, deco?: ElementDecoration,
+): string {
   const left = round(s.x - ox), top = round(s.y - oy);
   const w = round(s.width), h = round(s.height);
   // Identity for the prototype runtime: `data-layer` is what Smart Animate matches
   // between two screens, exactly as Figma matches on layer name.
-  const ident = ` data-id="${escapeXml(s.id)}" data-layer="${escapeXml(s.name)}"`;
+  const ident = ` data-id="${escapeXml(s.id)}" data-layer="${escapeXml(s.name)}"`
+    + (deco?.attrs ? ` ${deco.attrs}` : '');
+  const sfx = deco?.style ? `;${deco.style}` : '';
 
   // Vector / path / bool → inline SVG positioned over the box (viewBox = page coords).
   if (s.type === 'path' || s.type === 'bool' || s.type === 'vector') {
-    const style = `position:absolute;left:${left}px;top:${top}px;width:${w}px;height:${h}px;overflow:visible`;
+    const style = `position:absolute;left:${left}px;top:${top}px;width:${w}px;height:${h}px;overflow:visible${sfx}`;
     return `<svg${ident} style="${style}" viewBox="${round(s.x)} ${round(s.y)} ${w} ${h}">${renderSvgShape(s, page)}</svg>`;
   }
   // Imported SVG markup → embed, scaled into the box.
   if (s.type === 'svg' && (s.svgInnerHTML || s.svgContent)) {
-    const style = `position:absolute;left:${left}px;top:${top}px;width:${w}px;height:${h}px`;
+    const style = `position:absolute;left:${left}px;top:${top}px;width:${w}px;height:${h}px${sfx}`;
     if (s.svgInnerHTML) {
       const vb = s.svgOriginalWidth && s.svgOriginalHeight ? `0 0 ${s.svgOriginalWidth} ${s.svgOriginalHeight}` : `0 0 ${w} ${h}`;
       return `<svg${ident} style="${style}" viewBox="${vb}" preserveAspectRatio="none">${s.svgInnerHTML}</svg>`;
@@ -443,6 +513,20 @@ function shapeToHtmlEl(s: Shape, page: Page, images: Record<string, string> | un
   props['position'] = 'absolute';
   // Borders must not grow the box beyond the shape's stored width/height.
   if (props['border']) props['box-sizing'] = 'border-box';
+  return htmlElement(s, props, images, ident, '', deco?.style);
+}
+
+/**
+ * Paints, radius, clipping, image fills and text content — identical whichever HTML mode
+ * emitted the box, so both the flat snapshot and the responsive tree share it. `children`
+ * is the already-rendered inner markup (empty for the flat model, which has no nesting).
+ */
+function htmlElement(
+  s: Shape, props: Record<string, string>,
+  images: Record<string, string> | undefined, ident: string, children = '',
+  styleSuffix?: string,
+): string {
+  const sfx = styleSuffix ? `;${styleSuffix}` : '';
   // The canvas never paints fills behind text glyphs — don't paint them here either.
   if (s.type === 'text') delete props['background'];
   const cr = cornerRadiusCss(s);
@@ -459,22 +543,28 @@ function shapeToHtmlEl(s: Shape, page: Page, images: Record<string, string> | un
       : 'cover';
     props['background-position'] = 'center';
     props['background-repeat'] = imgPaint.scaleMode === 'tile' ? 'repeat' : 'no-repeat';
-    return `<div${ident} style="${propsToInline(props)}"></div>`;
+    return `<div${ident} style="${propsToInline(props)}${sfx}">${children}</div>`;
   }
   if (s.type === 'image' && s.imageId && images?.[s.imageId]) {
     props['background-image'] = `url(${images[s.imageId]})`;
     props['background-size'] = '100% 100%';
     props['background-repeat'] = 'no-repeat';
-    return `<div${ident} style="${propsToInline(props)}"></div>`;
+    return `<div${ident} style="${propsToInline(props)}${sfx}">${children}</div>`;
   }
   if (s.type === 'text') {
-    return `<div${ident} style="${propsToInline(props)}">${textToHtml(s)}</div>`;
+    // `children` carries the responsive mode's nested hotspot. Dropping it here made every
+    // text layer unclickable in the prototype — which is most of a website's links.
+    return `<div${ident} style="${propsToInline(props)}${sfx}">${textToHtml(s)}${children}</div>`;
   }
   // rect / frame / group / circle / fallback
-  return `<div${ident} style="${propsToInline(props)}"></div>`;
+  return `<div${ident} style="${propsToInline(props)}${sfx}">${children}</div>`;
 }
 
-export function frameToHtml(frame: Shape, page: Page, images?: Record<string, string>): string {
+export function frameToHtml(
+  frame: Shape, page: Page, images?: Record<string, string>,
+  /** Per-shape attributes/style, used by the prototype for variant groups and theme vars. */
+  decorate?: (s: Shape) => ElementDecoration | undefined,
+): string {
   const ox = frame.x, oy = frame.y;
   const flat: Shape[] = [];
   const seen = new Set<string>();
@@ -503,8 +593,108 @@ export function frameToHtml(frame: Shape, page: Page, images?: Record<string, st
     if (scx >= cx0 && scx <= cx1 && scy >= cy0 && scy <= cy1) collect(id);
   }
 
-  const body = flat.map(s => shapeToHtmlEl(s, page, images, ox, oy)).join('\n        ');
+  const body = flat.map(s => shapeToHtmlEl(s, page, images, ox, oy, decorate?.(s))).join('\n        ');
   return `<div class="frame-root" style="position:relative;width:${round(frame.width)}px;height:${round(frame.height)}px;overflow:hidden">\n        ${body}\n      </div>`;
+}
+
+/**
+ * Emit one shape's subtree as flat absolutely-positioned elements, offset so it lands
+ * wherever the caller wants. The prototype uses this to render a component's OTHER variant
+ * on top of an instance's position, hidden, so a "Change to" action has something to swap
+ * in — the variant's master lives elsewhere on the canvas, so its coordinates have to be
+ * translated onto the instance.
+ */
+export function subtreeToHtml(
+  rootId: string, page: Page, images: Record<string, string> | undefined,
+  ox: number, oy: number,
+  decorate?: (s: Shape) => ElementDecoration | undefined,
+): string {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const walk = (id: string) => {
+    if (seen.has(id)) return;
+    const s = page.objects[id];
+    if (!s || s.hidden) return;
+    seen.add(id);
+    out.push(shapeToHtmlEl(s, page, images, ox, oy, decorate?.(s)));
+    exportChildIds(s).forEach(walk);
+  };
+  walk(rootId);
+  return out.join('\n        ');
+}
+
+/**
+ * The responsive counterpart to `frameToHtml`.
+ *
+ * `frameToHtml` is a pixel-faithful SNAPSHOT: every layer is pinned at the coordinate the
+ * layout engine computed, so the page matches the artboard at exactly one width. That is
+ * the right output for a prototype, and wrong for a website — a design built out of Fill,
+ * Hug and Wrap reflows on the canvas but can only be scaled, never reflowed, from a
+ * flattened snapshot.
+ *
+ * This walks the shape TREE instead and hands the layout back to the browser: auto-layout
+ * frames become nested flex/grid containers and their children carry sizing RULES
+ * (`flex:1 1 0`, `fit-content`, …) rather than pixel widths. Containers that position
+ * their children by coordinate keep absolute children, inside a relative box.
+ *
+ * Vectors, booleans and imported SVG have no flow representation, so they keep the flat
+ * absolute markup — they still paint, they just don't participate in reflow.
+ */
+export function frameToResponsiveHtml(
+  frame: Shape, page: Page, images?: Record<string, string>,
+  /**
+   * Extra markup to nest inside a shape's own element — the prototype uses it for click
+   * hotspots. A reflowing layout has no stable coordinates to pin an overlay to, so a
+   * hotspot has to ride INSIDE the element it belongs to (`position:absolute;inset:0`)
+   * instead of being positioned next to it.
+   */
+  innerFor?: (s: Shape) => string,
+): string {
+  const renderNode = (s: Shape, isRoot: boolean): string => {
+    const ident = ` data-id="${escapeXml(s.id)}" data-layer="${escapeXml(s.name)}"`;
+
+    // Shapes with no flow representation fall back to the flat, absolutely-pinned markup.
+    if (s.type === 'path' || s.type === 'bool' || s.type === 'vector'
+      || (s.type === 'svg' && (s.svgInnerHTML || s.svgContent))) {
+      const parent = s.parentId ? page.objects[s.parentId] : null;
+      return shapeToHtmlEl(s, page, images, parent?.x ?? 0, parent?.y ?? 0);
+    }
+
+    const kids = exportChildIds(s)
+      .map(id => page.objects[id])
+      .filter((c): c is Shape => !!c && !c.hidden);
+    const extra = innerFor?.(s) ?? '';
+    const children = kids.map(c => renderNode(c, false)).join('\n') + extra;
+
+    // page-aware: a child of an auto-layout parent comes back with flow CSS and no
+    // left/top, a child of a coordinate parent comes back absolutely pinned to it.
+    const props = shapeToCssProps(s, page);
+
+    if (isRoot) {
+      // The screen becomes the document: full width, height driven by its content, and
+      // never clipped — the artboard's own fold has no meaning in a browser window.
+      delete props['position'];
+      delete props['left'];
+      delete props['top'];
+      delete props['height'];
+      props['width'] = '100%';
+      props['min-height'] = '100%';
+    }
+    // The artboard's fold is a canvas convention, not a page one: clipping the root would
+    // cut the document off at the screen height it happened to be drawn at.
+    const self = isRoot && s.clipContent ? { ...s, clipContent: false } : s;
+
+    // A container whose children are placed by coordinate has to be their containing
+    // block, and so does any element hosting an inset hotspot. A flex item can be
+    // `position:relative` without leaving the flow.
+    if ((children && !s.autoLayout || extra) && props['position'] !== 'absolute') {
+      props['position'] = 'relative';
+    }
+
+    return htmlElement(self, props, images, ident, children);
+  };
+
+  return renderNode(frame, true);
 }
 
 // Full-page SVG export
